@@ -1,0 +1,19 @@
+{
+  "name": "cold-emailer-stress-tests",
+  "version": "1.0.0",
+  "description": "Stress testing suite for AI Cold Emailer",
+  "scripts": {
+    "stress:light": "k6 run k6-load-test.js",
+    "stress:medium": "k6 run k6-load-test-medium.js",
+    "stress:heavy": "k6 run k6-load-test-heavy.js",
+    "concurrency": "node concurrency-test.js",
+    "large-input": "node large-input-test.js",
+    "memory-leak": "node memory-leak-test.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2"
+  },
+  "devDependencies": {
+    "k6": "^0.0.0"
+  }
+}
