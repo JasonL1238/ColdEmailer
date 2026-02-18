@@ -23,6 +23,31 @@ function CSVManager() {
   const [editingCell, setEditingCell] = useState(null)
   const [hasChanges, setHasChanges] = useState(false)
   const [activeTab, setActiveTab] = useState('emailed') // 'emailed', 'generated', 'no_emails'
+  const [viewingEmail, setViewingEmail] = useState(null) // Email being viewed
+  const [sendingEmail, setSendingEmail] = useState(false)
+  const [sortBy, setSortBy] = useState('sent_at_desc') // 'sent_at_desc', 'sent_at_asc', 'name'
+  const [filterFollowUps, setFilterFollowUps] = useState('all') // 'all', 'unsent_followups'
+  const [allEmails, setAllEmails] = useState([]) // All emails including follow-ups
+
+  const handleTabChange = (tab) => {
+    // #region agent log
+    try {
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleTabChange:start','message':'Tab change initiated','data':{fromTab:activeTab,toTab:tab},timestamp:Date.now(),runId:'tab-change',hypothesisId:'A'})}).catch(()=>{});
+    } catch (e) {}
+    // #endregion
+    try {
+      setActiveTab(tab)
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleTabChange:success','message':'Tab changed successfully','data':{newTab:tab},timestamp:Date.now(),runId:'tab-change',hypothesisId:'B'})}).catch(()=>{});
+      // #endregion
+    } catch (error) {
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleTabChange:error','message':'Tab change failed','data':{error:error.message,stack:error.stack},timestamp:Date.now(),runId:'tab-change',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
+      console.error('Tab change error:', error)
+      throw error
+    }
+  }
   
   // User info for follow-up generation
   const [userName] = useState(localStorage.getItem('userName') || 'Jason Li')
@@ -164,6 +189,29 @@ function CSVManager() {
     }
   }
 
+  const handleViewEmail = (email) => {
+    setViewingEmail(email)
+  }
+
+  const handleSendEmail = async (emailId) => {
+    if (!window.confirm('Send this email now?')) {
+      return
+    }
+    
+    try {
+      setSendingEmail(true)
+      const response = await emailAPI.send([emailId])
+      toast.success('Email sent!')
+      await loadCategorizedContacts()
+      setViewingEmail(null) // Close email view
+    } catch (error) {
+      const message = error.response?.data?.detail || 'Failed to send email'
+      toast.error(message)
+    } finally {
+      setSendingEmail(false)
+    }
+  }
+
   const handleDeleteEmail = async (contactId) => {
     const email = getEmailForContact(contactId)
     if (!email) {
@@ -178,6 +226,7 @@ function CSVManager() {
     try {
       await emailAPI.delete(email.id)
       await loadCategorizedContacts()
+      setViewingEmail(null) // Close email view if open
       toast.success('Email deleted. Contact moved to "No Emails Generated" section.')
     } catch (error) {
       toast.error('Failed to delete email')
@@ -196,21 +245,6 @@ function CSVManager() {
       toast.success('Contact deleted')
     } catch (error) {
       toast.error('Failed to delete contact')
-      console.error(error)
-    }
-  }
-
-  const handleGenerateFollowUp = async (emailId) => {
-    try {
-      const response = await contactsAPI.generateFollowUp(emailId, {
-        user_name: userName,
-        user_background: userBackground,
-        user_email: userEmail
-      })
-      toast.success('Follow-up email generated! Check Email Review section.')
-      // Optionally navigate to email review or show the generated email
-    } catch (error) {
-      toast.error('Failed to generate follow-up email')
       console.error(error)
     }
   }
@@ -262,6 +296,11 @@ function CSVManager() {
     return emailsByContact[contactId]
   }
 
+  const getFollowUpEmail = (contactId) => {
+    // Get follow-up email for this contact (if exists)
+    return allEmails.find(e => e.contact_id === contactId && e.is_follow_up)
+  }
+
   const needsFollowUp = (contactId) => {
     return followUpReminders.some(reminder => reminder.contact.id === contactId)
   }
@@ -270,16 +309,351 @@ function CSVManager() {
     return followUpReminders.find(reminder => reminder.contact.id === contactId)
   }
 
-  const renderContactTable = (contacts, showTracking = false, showDeleteEmail = false) => {
+  const formatTimeAgo = (dateString) => {
+    if (!dateString) return '—'
+    const date = new Date(dateString)
+    const now = new Date()
+    const diffMs = now - date
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+    const diffHours = Math.floor(diffMs / (1000 * 60 * 60))
+    const diffMinutes = Math.floor(diffMs / (1000 * 60))
+    
+    if (diffDays > 0) {
+      return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`
+    } else if (diffHours > 0) {
+      return `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`
+    } else if (diffMinutes > 0) {
+      return `${diffMinutes} minute${diffMinutes !== 1 ? 's' : ''} ago`
+    } else {
+      return 'Just now'
+    }
+  }
+
+  const handleGenerateFollowUp = async (emailId) => {
+    try {
+      const userInfo = getUserInfo()
+      const response = await contactsAPI.generateFollowUp(emailId, userInfo)
+      toast.success('Follow-up email generated!')
+      await loadCategorizedContacts()
+    } catch (error) {
+      const message = error.response?.data?.detail || 'Failed to generate follow-up'
+      toast.error(message)
+      console.error(error)
+    }
+  }
+
+  const handleSendFollowUp = async (followUpEmailId) => {
+    if (!window.confirm('Send this follow-up email now?')) {
+      return
+    }
+    
+    try {
+      setSendingEmail(true)
+      const response = await emailAPI.send([followUpEmailId])
+      toast.success('Follow-up email sent!')
+      await loadCategorizedContacts()
+    } catch (error) {
+      const message = error.response?.data?.detail || 'Failed to send follow-up'
+      toast.error(message)
+    } finally {
+      setSendingEmail(false)
+    }
+  }
+
+  const renderEmailedSection = () => {
+    // #region agent log
+    try {
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderEmailedSection:start','message':'Rendering emailed section','data':{contactsCount:categorizedContacts.emailed?.length,isArray:Array.isArray(categorizedContacts.emailed)},timestamp:Date.now(),runId:'render-section',hypothesisId:'L'})}).catch(()=>{});
+    } catch (e) {}
+    // #endregion
+    try {
+      // Get all emails for these contacts (including follow-ups)
+      const contactsWithEmails = (categorizedContacts.emailed || []).map(contact => {
+        const email = getEmailForContact(contact.id)
+        const followUp = getFollowUpEmail(contact.id)
+        return { contact, email, followUp }
+      })
+
+      // Filter for unsent follow-ups if requested
+      let filtered = contactsWithEmails
+      if (filterFollowUps === 'unsent_followups') {
+        filtered = contactsWithEmails.filter(({ followUp }) => 
+          followUp && followUp.status !== 'sent' && !followUp.follow_up_sent_at
+        )
+      }
+
+      // Sort contacts
+      const sorted = [...filtered].sort((a, b) => {
+        if (sortBy === 'sent_at_desc') {
+          const aDate = a.email?.sent_at || a.followUp?.sent_at || ''
+          const bDate = b.email?.sent_at || b.followUp?.sent_at || ''
+          return new Date(bDate) - new Date(aDate)
+        } else if (sortBy === 'sent_at_asc') {
+          const aDate = a.email?.sent_at || a.followUp?.sent_at || ''
+          const bDate = b.email?.sent_at || b.followUp?.sent_at || ''
+          return new Date(aDate) - new Date(bDate)
+        } else if (sortBy === 'name') {
+          return (a.contact.name || '').localeCompare(b.contact.name || '')
+        }
+        return 0
+      })
+
+      return (
+        <section className="section-emailed">
+          <div className="section-toolbar">
+            <h3>Emailed ({filtered.length})</h3>
+            <div className="section-filters">
+              <label className="filters-row">
+                <span>Sort:</span>
+                <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+                  <option value="sent_at_desc">Newest First</option>
+                  <option value="sent_at_asc">Oldest First</option>
+                  <option value="name">Name</option>
+                </select>
+              </label>
+              <label className="filters-row">
+                <span>Filter:</span>
+                <select value={filterFollowUps} onChange={(e) => setFilterFollowUps(e.target.value)}>
+                  <option value="all">All Emails</option>
+                  <option value="unsent_followups">Unsent Follow-ups</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div className="table-container">
+            <table className="contacts-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Company</th>
+                  <th>Email</th>
+                  <th className="table-numeric">Time Ago</th>
+                  <th>Response</th>
+                  <th>Follow-Up</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(({ contact, email, followUp }) => {
+                  const sentEmail = email?.status === 'sent' ? email : null
+                  const sentDate = sentEmail?.sent_at || followUp?.sent_at
+                  
+                  return (
+                    <tr key={contact.id}>
+                      <td>{contact.name}</td>
+                      <td>{contact.company}</td>
+                      <td>{contact.email}</td>
+                      <td>
+                        {sentDate ? (
+                          <span className="sent-date" title={new Date(sentDate).toLocaleString()}>
+                            {formatTimeAgo(sentDate)}
+                          </span>
+                        ) : (
+                          <span className="text-muted">—</span>
+                        )}
+                      </td>
+                      <td>
+                        {sentEmail?.has_response ? (
+                          <span className="response-badge response-yes">
+                            ✓ Responded {sentEmail.response_date ? formatTimeAgo(sentEmail.response_date) : ''}
+                          </span>
+                        ) : sentEmail ? (
+                          <span className="response-badge response-no">No response</span>
+                        ) : (
+                          <span className="text-muted">—</span>
+                        )}
+                      </td>
+                      <td>
+                        {followUp ? (
+                          <div className="follow-up-section">
+                            {followUp.status === 'sent' ? (
+                              <span className="follow-up-badge">Follow-up sent</span>
+                            ) : (
+                              <>
+                                <span className="follow-up-badge">Follow-up generated</span>
+                                <button
+                                  className="btn btn-small btn-success"
+                                  onClick={() => handleSendFollowUp(followUp.id)}
+                                  disabled={sendingEmail}
+                                  title="Send follow-up email"
+                                >
+                                  {sendingEmail ? 'Sending...' : 'Send Follow-up'}
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        ) : sentEmail && !sentEmail.has_response ? (
+                          <button
+                            className="btn btn-small btn-primary"
+                            onClick={() => handleGenerateFollowUp(sentEmail.id)}
+                            title="Generate follow-up email"
+                          >
+                            Generate Follow-up
+                          </button>
+                        ) : (
+                          <span className="text-muted">—</span>
+                        )}
+                      </td>
+                      <td>
+                        <select
+                          value={contact.status}
+                          onChange={(e) => handleCellEdit(contact.id, 'status', e.target.value)}
+                          className="status-select"
+                        >
+                          <option value="pending">Pending</option>
+                          <option value="trashed">Trashed</option>
+                          <option value="sent">Sent</option>
+                        </select>
+                      </td>
+                      <td>
+                        <div className="action-buttons">
+                          {followUp && (
+                            <button
+                              className="btn btn-small btn-primary"
+                              onClick={() => setViewingEmail(followUp)}
+                              title="View follow-up email"
+                            >
+                              View Follow-up
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="btn btn-small btn-icon"
+                            onClick={() => handleDelete(contact.id)}
+                            title="Delete contact"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )
+    } catch (error) {
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderEmailedSection:error','message':'Error rendering emailed section','data':{error:error.message,stack:error.stack},timestamp:Date.now(),runId:'render-section',hypothesisId:'M'})}).catch(()=>{});
+      // #endregion
+      console.error('Error rendering emailed section:', error)
+      return <div>Error loading emailed contacts: {error.message}</div>
+    }
+  }
+
+  const renderGeneratedSection = () => {
+    // #region agent log
+    try {
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderGeneratedSection:start','message':'Rendering generated section','data':{contactsCount:categorizedContacts.emails_generated?.length,isArray:Array.isArray(categorizedContacts.emails_generated)},timestamp:Date.now(),runId:'render-section',hypothesisId:'N'})}).catch(()=>{});
+    } catch (e) {}
+    // #endregion
+    try {
+      return (
+        <section className="section-emails-generated">
+          <h3>Emails Generated - Not Sent ({categorizedContacts.emails_generated?.length || 0})</h3>
+          <p className="section-description">
+            Includes pending, accepted, and trashed emails. Click "View Email" to see the email content, then send or delete it.
+          </p>
+          <div className="table-container">
+            <table className="contacts-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Company</th>
+                  <th>Email</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {renderContactTable(categorizedContacts.emails_generated || [], false, true, true)}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )
+    } catch (error) {
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderGeneratedSection:error','message':'Error rendering generated section','data':{error:error.message,stack:error.stack},timestamp:Date.now(),runId:'render-section',hypothesisId:'O'})}).catch(()=>{});
+      // #endregion
+      console.error('Error rendering generated section:', error)
+      return <div>Error loading generated contacts: {error.message}</div>
+    }
+  }
+
+  const renderNoEmailsSection = () => {
+    // #region agent log
+    try {
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderNoEmailsSection:start','message':'Rendering no_emails section','data':{contactsCount:categorizedContacts.no_emails?.length,isArray:Array.isArray(categorizedContacts.no_emails)},timestamp:Date.now(),runId:'render-section',hypothesisId:'P'})}).catch(()=>{});
+    } catch (e) {}
+    // #endregion
+    try {
+      return (
+        <section className="section-no-emails">
+          <h3>No Emails Generated ({categorizedContacts.no_emails?.length || 0})</h3>
+          <p className="section-description">
+            These contacts don't have generated emails yet. 
+            Click "Generate Emails" in the Review Emails tab to select and generate emails for contacts.
+          </p>
+          <div className="table-container">
+            <table className="contacts-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Company</th>
+                  <th>Email</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {renderContactTable(categorizedContacts.no_emails || [], false, false, false)}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )
+    } catch (error) {
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderNoEmailsSection:error','message':'Error rendering no_emails section','data':{error:error.message,stack:error.stack},timestamp:Date.now(),runId:'render-section',hypothesisId:'Q'})}).catch(()=>{});
+      // #endregion
+      console.error('Error rendering no_emails section:', error)
+      return <div>Error loading no_emails contacts: {error.message}</div>
+    }
+  }
+
+  const renderContactTable = (contacts, showTracking = false, showDeleteEmail = false, showEmailActions = false) => {
+    // #region agent log
+    try {
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderContactTable:start','message':'Rendering contact table','data':{contactsCount:contacts?.length,showTracking,showDeleteEmail,showEmailActions},timestamp:Date.now(),runId:'render',hypothesisId:'D'})}).catch(()=>{});
+    } catch (e) {}
+    // #endregion
+    
+    if (!contacts || !Array.isArray(contacts)) {
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderContactTable:invalid','message':'Invalid contacts array','data':{contacts},timestamp:Date.now(),runId:'render',hypothesisId:'E'})}).catch(()=>{});
+      // #endregion
+      return (
+        <tr>
+          <td colSpan={5} className="empty-state">
+            Error: Invalid contacts data
+          </td>
+        </tr>
+      )
+    }
+    
     const filtered = searchTerm
       ? contacts.filter(c => 
-          c.name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+          c && (c.name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
           c.company?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-          c.email?.toLowerCase().includes(searchTerm.toLowerCase())
+          c.email?.toLowerCase().includes(searchTerm.toLowerCase()))
         )
       : contacts
 
-    const colSpan = showTracking ? 7 : (showDeleteEmail ? 6 : 5)
+    const colSpan = showTracking ? 7 : (showDeleteEmail || showEmailActions ? 6 : 5)
     
     if (filtered.length === 0) {
       return (
@@ -292,6 +666,10 @@ function CSVManager() {
     }
 
     return filtered.map((contact) => {
+      if (!contact || !contact.id) {
+        return null // Skip invalid contacts
+      }
+      
       const email = getEmailForContact(contact.id)
       const followUpInfo = getFollowUpInfo(contact.id)
       const needsFollowUpBadge = needsFollowUp(contact.id)
@@ -379,7 +757,43 @@ function CSVManager() {
           </td>
           <td>
             <div className="action-buttons">
-              {showDeleteEmail && email && (
+              {showEmailActions && email && (
+                <>
+                  <button
+                    className="btn btn-small btn-primary"
+                    onClick={() => {
+                      // #region agent log
+                      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:viewEmail:click','message':'View email button clicked','data':{emailId:email?.id,hasEmail:!!email},timestamp:Date.now(),runId:'view-email',hypothesisId:'G'})}).catch(()=>{});
+                      // #endregion
+                      handleViewEmail(email)
+                    }}
+                    title="View email content"
+                  >
+                    View Email
+                  </button>
+                  <button
+                    className="btn btn-small btn-success"
+                    onClick={() => {
+                      // #region agent log
+                      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:sendEmail:click','message':'Send email button clicked','data':{emailId:email?.id},timestamp:Date.now(),runId:'send-email',hypothesisId:'H'})}).catch(()=>{});
+                      // #endregion
+                      handleSendEmail(email.id)
+                    }}
+                    title="Send this email"
+                    disabled={sendingEmail}
+                  >
+                    Send
+                  </button>
+                  <button
+                    className="btn btn-small btn-danger"
+                    onClick={() => handleDeleteEmail(contact.id)}
+                    title="Delete email (moves contact to 'No Emails Generated')"
+                  >
+                    Delete
+                  </button>
+                </>
+              )}
+              {showDeleteEmail && email && !showEmailActions && (
                 <button
                   className="btn btn-small btn-danger"
                   onClick={() => handleDeleteEmail(contact.id)}
@@ -389,11 +803,12 @@ function CSVManager() {
                 </button>
               )}
               <button
-                className="btn-icon"
+                type="button"
+                className="btn btn-small btn-icon"
                 onClick={() => handleDelete(contact.id)}
                 title="Delete contact"
               >
-                🗑️
+                Delete
               </button>
             </div>
           </td>
@@ -403,7 +818,26 @@ function CSVManager() {
   }
 
   if (loading) {
-    return <div className="loading">Loading contacts...</div>
+    return (
+      <div className="loading-skeleton">
+        <div className="loading-spinner-wrap">
+          <div className="spinner" aria-hidden="true" />
+          <span>Loading contacts</span>
+        </div>
+        <div className="loading-skeleton-row">
+          <div className="skeleton loading-skeleton-cell loading-skeleton-cell--md" />
+          <div className="skeleton loading-skeleton-cell loading-skeleton-cell--md" />
+          <div className="skeleton loading-skeleton-cell loading-skeleton-cell--lg" />
+        </div>
+        {[1, 2, 3, 4, 5].map((i) => (
+          <div key={i} className="loading-skeleton-row">
+            <div className="skeleton loading-skeleton-cell loading-skeleton-cell--md" />
+            <div className="skeleton loading-skeleton-cell loading-skeleton-cell--md" />
+            <div className="skeleton loading-skeleton-cell loading-skeleton-cell--lg" />
+          </div>
+        ))}
+      </div>
+    )
   }
 
   return (
@@ -417,7 +851,7 @@ function CSVManager() {
                 type="file"
                 accept=".csv"
                 onChange={handleFileUpload}
-                style={{ display: 'none' }}
+                className="input-file-hidden"
                 id="csv-upload"
               />
               <label htmlFor="csv-upload" className="btn btn-secondary">
@@ -446,9 +880,13 @@ function CSVManager() {
       </div>
 
       <div className="search-bar">
+        <label htmlFor="search-contacts" className="input-label">
+          Search contacts
+        </label>
         <input
-          type="text"
-          placeholder="Search contacts..."
+          id="search-contacts"
+          type="search"
+          placeholder="Filter by name, company, or email"
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
           className="search-input"
@@ -459,19 +897,40 @@ function CSVManager() {
       <div className="section-tabs">
         <button
           className={`tab ${activeTab === 'emailed' ? 'active' : ''}`}
-          onClick={() => setActiveTab('emailed')}
+          onClick={(e) => {
+            // #region agent log
+            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:tab:emailed:click','message':'Emailed tab clicked','data':{currentTab:activeTab},timestamp:Date.now(),runId:'tab-click',hypothesisId:'X'})}).catch(()=>{});
+            // #endregion
+            e.preventDefault()
+            e.stopPropagation()
+            handleTabChange('emailed')
+          }}
         >
           Emailed ({categorizedContacts.emailed.length})
         </button>
         <button
           className={`tab ${activeTab === 'generated' ? 'active' : ''}`}
-          onClick={() => setActiveTab('generated')}
+          onClick={(e) => {
+            // #region agent log
+            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:tab:generated:click','message':'Generated tab clicked','data':{currentTab:activeTab},timestamp:Date.now(),runId:'tab-click',hypothesisId:'V'})}).catch(()=>{});
+            // #endregion
+            e.preventDefault()
+            e.stopPropagation()
+            handleTabChange('generated')
+          }}
         >
           Emails Generated - Not Sent ({categorizedContacts.emails_generated.length})
         </button>
         <button
           className={`tab ${activeTab === 'no_emails' ? 'active' : ''}`}
-          onClick={() => setActiveTab('no_emails')}
+          onClick={(e) => {
+            // #region agent log
+            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:tab:no_emails:click','message':'No emails tab clicked','data':{currentTab:activeTab},timestamp:Date.now(),runId:'tab-click',hypothesisId:'W'})}).catch(()=>{});
+            // #endregion
+            e.preventDefault()
+            e.stopPropagation()
+            handleTabChange('no_emails')
+          }}
         >
           No Emails Generated ({categorizedContacts.no_emails.length})
         </button>
@@ -479,83 +938,79 @@ function CSVManager() {
 
       {/* Contacts sections */}
       <div className="contacts-sections">
-        {activeTab === 'emailed' && (
-          <section className="section-emailed">
-            <h3>Emailed ({categorizedContacts.emailed.length})</h3>
-            <div className="table-container">
-              <table className="contacts-table">
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Company</th>
-                    <th>Email</th>
-                    <th>Sent Date</th>
-                    <th>Response</th>
-                    <th>Follow-Up</th>
-                    <th>Status</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {renderContactTable(categorizedContacts.emailed, true)}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        )}
-
-        {activeTab === 'generated' && (
-          <section className="section-emails-generated">
-            <h3>Emails Generated - Not Sent ({categorizedContacts.emails_generated.length})</h3>
-            <p className="section-description">
-              Includes pending, accepted, and trashed emails (trashed emails are kept but not sent). 
-              Use "Delete Email" to remove the email and move the contact to "No Emails Generated" section.
-            </p>
-            <div className="table-container">
-              <table className="contacts-table">
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Company</th>
-                    <th>Email</th>
-                    <th>Status</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {renderContactTable(categorizedContacts.emails_generated, false, true, false)}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        )}
-
-        {activeTab === 'no_emails' && (
-          <section className="section-no-emails">
-            <h3>No Emails Generated ({categorizedContacts.no_emails.length})</h3>
-            <p className="section-description">
-              These contacts don't have generated emails yet. 
-              Click "Generate Emails" in the Review Emails tab to select and generate emails for contacts.
-            </p>
-            <div className="table-container">
-              <table className="contacts-table">
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Company</th>
-                    <th>Email</th>
-                    <th>Status</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {renderContactTable(categorizedContacts.no_emails, false, false, false)}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        )}
+        {(() => {
+          // #region agent log
+          try {
+            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:render:sections:start','message':'Rendering sections container','data':{activeTab},timestamp:Date.now(),runId:'render-sections',hypothesisId:'R'})}).catch(()=>{});
+          } catch (e) {}
+          // #endregion
+          try {
+            if (activeTab === 'emailed') {
+              return renderEmailedSection()
+            } else if (activeTab === 'generated') {
+              // #region agent log
+              fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:render:sections:generated','message':'About to render generated section','data':{activeTab},timestamp:Date.now(),runId:'render-sections',hypothesisId:'S'})}).catch(()=>{});
+              // #endregion
+              return renderGeneratedSection()
+            } else if (activeTab === 'no_emails') {
+              // #region agent log
+              fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:render:sections:no_emails','message':'About to render no_emails section','data':{activeTab},timestamp:Date.now(),runId:'render-sections',hypothesisId:'T'})}).catch(()=>{});
+              // #endregion
+              return renderNoEmailsSection()
+            }
+            return null
+          } catch (error) {
+            // #region agent log
+            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:render:sections:error','message':'Error rendering sections','data':{error:error.message,stack:error.stack,activeTab},timestamp:Date.now(),runId:'render-sections',hypothesisId:'U'})}).catch(()=>{});
+            // #endregion
+            console.error('Error rendering section:', error)
+            return <div className="section-error">Error rendering section: {error.message}</div>
+          }
+        })()}
       </div>
+
+      {/* Email View Modal */}
+      {viewingEmail && (
+        <div className="settings-modal email-preview-modal">
+          <div className="settings-content email-preview-content">
+            <h3>Email Preview</h3>
+            <div className="email-preview-meta">
+              <div className="email-preview-row">
+                <strong>To:</strong> {viewingEmail.contact_email}
+              </div>
+              <div className="email-preview-row">
+                <strong>Subject:</strong> {viewingEmail.subject}
+              </div>
+              <div className="email-preview-body">
+                {viewingEmail.body}
+              </div>
+            </div>
+            <div className="settings-actions">
+              <button 
+                className="btn btn-success" 
+                onClick={() => handleSendEmail(viewingEmail.id)}
+                disabled={sendingEmail}
+              >
+                {sendingEmail ? 'Sending...' : 'Send Email'}
+              </button>
+              <button 
+                className="btn btn-danger" 
+                onClick={() => handleDeleteEmail(viewingEmail.contact_id)}
+                disabled={sendingEmail}
+              >
+                Delete Email
+              </button>
+              <button 
+                className="btn btn-secondary" 
+                onClick={() => setViewingEmail(null)}
+                disabled={sendingEmail}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

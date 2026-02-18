@@ -127,11 +127,20 @@ function EmailReview() {
 
   const handleAccept = async (emailId) => {
     try {
+      // First accept the email
       await emailAPI.updateStatus(emailId, 'accepted')
+      
+      // Then automatically send it
+      setSending(true)
+      const response = await emailAPI.send([emailId])
+      toast.success('Email accepted and sent!')
       await loadEmails()
-      toast.success('Email accepted')
+      await loadUsageStats()
+      setSending(false)
     } catch (error) {
-      toast.error('Failed to update email')
+      setSending(false)
+      const message = error.response?.data?.detail || 'Failed to send email'
+      toast.error(message)
     }
   }
 
@@ -226,7 +235,7 @@ function EmailReview() {
             className="btn btn-secondary"
             onClick={() => setShowSettings(!showSettings)}
           >
-            ⚙️ Settings
+            Settings
           </button>
           <button
             className="btn btn-secondary"
@@ -247,54 +256,54 @@ function EmailReview() {
 
       {showContactSelection && (
         <div className="settings-modal">
-          <div className="settings-content" style={{ maxWidth: '800px' }}>
+          <div className="settings-content contact-selection-content">
             <h3>Select Contacts to Generate Emails</h3>
-            <div style={{ marginBottom: '1rem', display: 'flex', gap: '0.5rem' }}>
-              <button className="btn btn-secondary" onClick={handleSelectAll}>
+            <div className="contact-selection-actions">
+              <button type="button" className="btn btn-secondary" onClick={handleSelectAll}>
                 Select All
               </button>
-              <button className="btn btn-secondary" onClick={handleDeselectAll}>
+              <button type="button" className="btn btn-secondary" onClick={handleDeselectAll}>
                 Deselect All
               </button>
-              <span style={{ marginLeft: 'auto', alignSelf: 'center' }}>
+              <span className="contact-selection-count">
                 {selectedContactIds.size} of {availableContacts.length} selected
               </span>
             </div>
-            <div style={{ maxHeight: '400px', overflowY: 'auto', border: '1px solid #ddd', borderRadius: '4px', padding: '0.5rem' }}>
+            <div className="contact-list-wrap">
               {availableContacts.length === 0 ? (
-                <p style={{ padding: '1rem', textAlign: 'center', color: '#666' }}>
+                <p className="contact-list-empty">
                   No contacts available. Add contacts in the "No Emails Generated" section.
                 </p>
               ) : (
-                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <table className="contact-table">
                   <thead>
-                    <tr style={{ borderBottom: '2px solid #ddd' }}>
-                      <th style={{ padding: '0.5rem', textAlign: 'left', width: '40px' }}>Select</th>
-                      <th style={{ padding: '0.5rem', textAlign: 'left' }}>Name</th>
-                      <th style={{ padding: '0.5rem', textAlign: 'left' }}>Company</th>
-                      <th style={{ padding: '0.5rem', textAlign: 'left' }}>Email</th>
+                    <tr>
+                      <th className="contact-table-col-select">Select</th>
+                      <th>Name</th>
+                      <th>Company</th>
+                      <th>Email</th>
                     </tr>
                   </thead>
                   <tbody>
                     {availableContacts.map((contact) => (
-                      <tr key={contact.id} style={{ borderBottom: '1px solid #eee' }}>
-                        <td style={{ padding: '0.5rem' }}>
+                      <tr key={contact.id}>
+                        <td>
                           <input
                             type="checkbox"
                             checked={selectedContactIds.has(contact.id)}
                             onChange={() => handleToggleContact(contact.id)}
                           />
                         </td>
-                        <td style={{ padding: '0.5rem' }}>{contact.name || '(No name)'}</td>
-                        <td style={{ padding: '0.5rem' }}>{contact.company || '(No company)'}</td>
-                        <td style={{ padding: '0.5rem' }}>{contact.email || '(No email)'}</td>
+                        <td>{contact.name || '(No name)'}</td>
+                        <td>{contact.company || '(No company)'}</td>
+                        <td>{contact.email || '(No email)'}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               )}
             </div>
-            <div className="settings-actions" style={{ marginTop: '1rem' }}>
+            <div className="settings-actions">
               <button 
                 className="btn btn-primary" 
                 onClick={handleGenerate}
@@ -319,26 +328,26 @@ function EmailReview() {
           <div className="settings-content">
             <h3>Email Generation Settings</h3>
             <div className="settings-form">
-              <label>
-                Your Name:
+              <label className="settings-form-field">
+                <span className="input-label">Your Name</span>
                 <input
                   type="text"
                   value={userName}
                   onChange={(e) => setUserName(e.target.value)}
-                  placeholder="Jason Li"
+                  placeholder="e.g. Jason Li"
                 />
               </label>
-              <label>
-                Your Email:
+              <label className="settings-form-field">
+                <span className="input-label">Your Email</span>
                 <input
                   type="email"
                   value={userEmail}
                   onChange={(e) => setUserEmail(e.target.value)}
-                  placeholder="jason.ye.li.7@gmail.com"
+                  placeholder="e.g. you@example.com"
                 />
               </label>
-              <label>
-                Your Background/Qualifications:
+              <label className="settings-form-field">
+                <span className="input-label">Your Background / Qualifications</span>
                 <textarea
                   value={userBackground}
                   onChange={(e) => setUserBackground(e.target.value)}
@@ -346,18 +355,17 @@ function EmailReview() {
                   rows={4}
                 />
               </label>
-              <label>
-                Resume File Path (on server):
+              <label className="settings-form-field">
+                <span className="input-label">Resume File Path (on server)</span>
                 <input
                   type="text"
                   value={resumePath}
                   onChange={(e) => setResumePath(e.target.value)}
                   placeholder="resume.pdf (relative to project root or absolute path)"
                 />
-                <small style={{ display: 'block', marginTop: '0.25rem', color: '#666' }}>
-                  Place your resume file in the project directory and enter the path here.
-                  Also set RESUME_PATH in your .env file.
-                </small>
+                <span className="input-helper">
+                  Place your resume file in the project directory and enter the path here. Also set RESUME_PATH in your .env file.
+                </span>
               </label>
               <div className="settings-actions">
                 <button className="btn btn-primary" onClick={handleSaveSettings}>
@@ -419,16 +427,18 @@ function EmailReview() {
 
             <div className="email-actions">
               <button
+                type="button"
                 className="btn btn-danger"
                 onClick={() => handleTrash(currentEmail.id)}
               >
-                🗑️ Trash (T)
+                Trash (T)
               </button>
               <button
+                type="button"
                 className="btn btn-success"
                 onClick={() => handleAccept(currentEmail.id)}
               >
-                ✓ Accept (A)
+                Accept (A)
               </button>
             </div>
 

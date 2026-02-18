@@ -1,3 +1,58 @@
+/* Design tokens — professional polished tech */
+:root {
+  /* Palette: neutral base + one accent */
+  --bg-page: #f8f9fa;
+  --bg-surface: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-subtle: #f1f3f5;
+  --text-primary: #1a1d21;
+  --text-secondary: #5c6166;
+  --text-muted: #868e96;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-muted: rgba(79, 70, 229, 0.08);
+  --border: #e1e4e8;
+  --border-light: #eaecef;
+  --error: #991b1b;
+  --error-bg: #fef2f2;
+  --success-bg: #ecfdf5;
+  --success-text: #065f46;
+  --warning-bg: #fffbeb;
+  --warning-text: #92400e;
+
+  /* Typography: hierarchy with size and weight */
+  --text-h1: 1.375rem;
+  --text-h2: 1.125rem;
+  --text-body: 0.9375rem;
+  --text-small: 0.8125rem;
+  --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  --letter-spacing-tight: -0.01em;
+
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-8: 48px;
+
+  /* Border radius */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  /* Focus */
+  --focus-ring: 2px solid var(--accent);
+  --focus-offset: 2px;
+
+  /* Shadow levels: soft depth */
+  --shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.06), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 12px 24px rgba(0, 0, 0, 0.08), 0 4px 8px rgba(0, 0, 0, 0.04);
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -5,12 +60,13 @@
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  font-family: var(--font-family);
+  font-size: var(--text-body);
+  color: var(--text-primary);
+  background-color: var(--bg-page);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #f5f5f5;
+  line-height: 1.5;
 }
 
 code {
@@ -20,4 +76,14 @@ code {
 
 #root {
   min-height: 100vh;
+}
+
+/* Focus visible for accessibility */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-offset);
 }

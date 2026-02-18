@@ -35,6 +35,10 @@ class EmailStorage:
                     email_data['sent_at'] = datetime.fromisoformat(email_data['sent_at'])
                 if 'response_date' in email_data and email_data['response_date']:
                     email_data['response_date'] = datetime.fromisoformat(email_data['response_date'])
+                if 'follow_up_generated_at' in email_data and email_data['follow_up_generated_at']:
+                    email_data['follow_up_generated_at'] = datetime.fromisoformat(email_data['follow_up_generated_at'])
+                if 'follow_up_sent_at' in email_data and email_data['follow_up_sent_at']:
+                    email_data['follow_up_sent_at'] = datetime.fromisoformat(email_data['follow_up_sent_at'])
                 
                 emails[email_id] = GeneratedEmail(**email_data)
             
@@ -56,6 +60,10 @@ class EmailStorage:
                     email_dict['sent_at'] = email.sent_at.isoformat()
                 if email_dict.get('response_date'):
                     email_dict['response_date'] = email.response_date.isoformat()
+                if email_dict.get('follow_up_generated_at'):
+                    email_dict['follow_up_generated_at'] = email.follow_up_generated_at.isoformat()
+                if email_dict.get('follow_up_sent_at'):
+                    email_dict['follow_up_sent_at'] = email.follow_up_sent_at.isoformat()
                 data[email_id] = email_dict
             
             with open(self.storage_path, 'w', encoding='utf-8') as f:

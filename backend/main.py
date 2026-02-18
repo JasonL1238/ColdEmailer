@@ -491,6 +491,9 @@ async def send_emails(request: EmailSendRequest):
                 email.status = "sent"
                 email.sent_at = datetime.now()
                 email.gmail_message_id = result.get('gmail_message_id') or result.get('message_id')
+                # Track follow-up sent time
+                if email.is_follow_up:
+                    email.follow_up_sent_at = datetime.now()
                 email_storage.save(email)
                 sent_contact_ids.append(email.contact_id)
                 rate_limiter.record_email_sent()
@@ -576,9 +579,11 @@ async def generate_follow_up(request: dict):
         user_email=request.get('user_email')
     )
     
-    # Link to original
+    # Link to original - follow-up stays in "emailed" section but with pending status
     follow_up.original_email_id = original_email.id
-    follow_up.status = "pending"
+    follow_up.status = "pending"  # Generated but not sent yet
+    follow_up.is_follow_up = True
+    follow_up.follow_up_generated_at = datetime.now()
     
     email_storage.save(follow_up)
     return follow_up
@@ -607,14 +612,17 @@ async def get_categorized_contacts():
                 email_by_contact[contact_id] = email
     
     # Categorize contacts
-    emailed = []  # email.status == "sent"
-    emails_generated = []  # has email but status != "sent" (includes pending, accepted, trashed)
+    emailed = []  # email.status == "sent" OR is_follow_up (follow-ups stay in emailed section)
+    emails_generated = []  # has email but status != "sent" and not a follow-up (includes pending, accepted, trashed)
     no_emails = []  # no email exists
+    
+    # Build set of contact IDs that have sent emails (for follow-up detection)
+    sent_email_contact_ids = {e.contact_id for e in all_emails if e.status == "sent"}
     
     for contact in all_contacts:
         email = email_by_contact.get(contact.id)
-        if email and email.status == "sent":
-            # Only "sent" emails go to emailed section
+        if email and (email.status == "sent" or email.is_follow_up):
+            # Sent emails OR follow-ups (even if not sent yet) go to emailed section
             emailed.append(contact)
         elif email:
             # All other email statuses (pending, accepted, trashed) go here
@@ -635,6 +643,10 @@ async def get_categorized_contacts():
             email_dict['sent_at'] = email.sent_at.isoformat() if email.sent_at else None
         if email_dict.get('response_date'):
             email_dict['response_date'] = email.response_date.isoformat() if email.response_date else None
+        if email_dict.get('follow_up_generated_at'):
+            email_dict['follow_up_generated_at'] = email.follow_up_generated_at.isoformat() if email.follow_up_generated_at else None
+        if email_dict.get('follow_up_sent_at'):
+            email_dict['follow_up_sent_at'] = email.follow_up_sent_at.isoformat() if email.follow_up_sent_at else None
         emails_dict[email.contact_id] = email_dict
     
     return {

@@ -16,7 +16,34 @@ function App() {
 
   return (
     <div className="app">
-      <Toaster position="top-right" />
+      <Toaster
+        position="top-center"
+        toastOptions={{
+          success: {
+            style: {
+              background: '#ecfdf5',
+              color: '#065f46',
+              border: '1px solid rgba(6, 95, 70, 0.2)',
+            },
+            iconTheme: {
+              primary: '#065f46',
+              secondary: '#ecfdf5',
+            },
+          },
+          error: {
+            style: {
+              background: '#fef2f2',
+              color: '#991b1b',
+              border: '1px solid rgba(153, 27, 27, 0.2)',
+            },
+            iconTheme: {
+              primary: '#991b1b',
+              secondary: '#fef2f2',
+            },
+          },
+          duration: 4000,
+        }}
+      />
       <header className="app-header">
         <h1>AI Cold Emailer</h1>
         <nav className="nav-tabs">

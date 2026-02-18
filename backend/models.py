@@ -38,6 +38,9 @@ class GeneratedEmail(BaseModel):
     has_response: bool = False  # Whether recipient replied
     response_date: Optional[datetime] = None  # When response was received
     original_email_id: Optional[str] = None  # For follow-ups, link to original email
+    is_follow_up: bool = False  # Whether this is a follow-up email
+    follow_up_generated_at: Optional[datetime] = None  # When follow-up was generated
+    follow_up_sent_at: Optional[datetime] = None  # When follow-up was sent (None if not sent yet)
 
 
 class EmailGenerationRequest(BaseModel):

@@ -9,5 +9,38 @@
     "hook_sentence": null,
     "confidence_score": null,
     "cached_at": "2026-02-17T17:22:15.921590"
+  },
+  "scout robotics": {
+    "company_name": "Scout Robotics",
+    "url": null,
+    "summary": null,
+    "industry": null,
+    "product": null,
+    "why_engineers_care": null,
+    "hook_sentence": null,
+    "confidence_score": null,
+    "cached_at": "2026-02-17T17:24:51.909915"
+  },
+  "mindx sciences": {
+    "company_name": "MindX Sciences",
+    "url": null,
+    "summary": null,
+    "industry": null,
+    "product": null,
+    "why_engineers_care": null,
+    "hook_sentence": null,
+    "confidence_score": null,
+    "cached_at": "2026-02-17T18:11:41.745541"
+  },
+  "lume ai": {
+    "company_name": "lume ai",
+    "url": null,
+    "summary": null,
+    "industry": null,
+    "product": null,
+    "why_engineers_care": null,
+    "hook_sentence": null,
+    "confidence_score": null,
+    "cached_at": "2026-02-17T18:17:59.301363"
   }
 }

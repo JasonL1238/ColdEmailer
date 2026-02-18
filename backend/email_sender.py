@@ -317,7 +317,57 @@ class EmailSender:
             message = MIMEMultipart()
             message['to'] = email.contact_email
             message['subject'] = email.subject
+            
+            # Convert plain text to HTML with proper formatting
+            # Replace newlines with <br> and wrap in proper HTML structure
+            # Split body into paragraphs (double newlines) for better formatting
+            paragraphs = email.body.split('\n\n')
+            html_paragraphs = []
+            for para in paragraphs:
+                if para.strip():
+                    # Replace single newlines within paragraph with <br>
+                    para_html = para.strip().replace('\n', '<br>')
+                    html_paragraphs.append(f'<p style="margin: 0 0 1em 0;">{para_html}</p>')
+            
+            html_body = '\n'.join(html_paragraphs)
+            
+            html_body = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {{
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #333;
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            max-width: 100%;
+        }}
+        .email-container {{
+            width: 100%;
+            max-width: 100%;
+            margin: 0;
+            padding: 20px;
+        }}
+        p {{
+            margin: 0 0 1em 0;
+        }}
+    </style>
+</head>
+<body>
+<div class="email-container">
+{html_body}
+</div>
+</body>
+</html>"""
+            
+            # Create both plain text and HTML versions
             message.attach(MIMEText(email.body, 'plain'))
+            message.attach(MIMEText(html_body, 'html'))
             
             # Attach resume if provided and file exists
             if resume_path and os.path.exists(resume_path):
