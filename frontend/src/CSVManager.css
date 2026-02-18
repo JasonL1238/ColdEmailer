@@ -1,11 +1,8 @@
-/* CSVManager — card layout, layered sections */
+/* CSVManager — Spotify-style dark cards and list hovers */
 
 .csv-manager {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-lg);
-  padding: var(--space-6);
-  box-shadow: var(--shadow-sm);
+  background: transparent;
+  padding: 0;
 }
 
 .csv-manager-header {
@@ -14,7 +11,7 @@
   align-items: center;
   margin-bottom: var(--space-5);
   padding-bottom: var(--space-4);
-  border-bottom: 1px solid var(--border-light);
+  border-bottom: 1px solid var(--border);
 }
 
 .csv-manager-header h2 {
@@ -69,8 +66,21 @@
 
 .table-container {
   overflow-x: auto;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  padding: var(--space-2);
+  animation: tableFadeIn 0.35s var(--ease-out-smooth);
+}
+
+@keyframes tableFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .contacts-table {
@@ -79,13 +89,13 @@
 }
 
 .contacts-table th {
-  background: var(--bg-subtle);
-  padding: var(--space-3) var(--space-4);
+  background: transparent;
+  padding: var(--space-2) var(--space-4);
   text-align: left;
   font-weight: 500;
   font-size: var(--text-small);
-  color: var(--text-secondary);
-  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  border: none;
 }
 
 .contacts-table th.table-numeric {
@@ -94,13 +104,19 @@
 
 .contacts-table td {
   padding: var(--space-3) var(--space-4);
-  border-bottom: 1px solid var(--border-light);
+  border: none;
   font-size: var(--text-body);
+  color: var(--text-primary);
   transition: background-color 0.15s ease;
 }
 
+.contacts-table tbody tr {
+  border-radius: var(--radius-md);
+  transition: background-color 0.2s var(--ease-out-smooth);
+}
+
 .contacts-table tbody tr:hover {
-  background: var(--bg-subtle);
+  background: var(--bg-hover);
 }
 
 .contacts-table tbody tr:last-child td {
@@ -116,7 +132,8 @@
 }
 
 .editable-cell:hover {
-  background: var(--border-light);
+  background: var(--bg-hover);
+  border-radius: var(--radius-sm);
 }
 
 .editable-input {
@@ -143,37 +160,37 @@
   font-size: var(--text-small);
 }
 
-/* Section tabs */
+/* Section tabs — Spotify-style pill/underline */
 .section-tabs {
   display: flex;
-  gap: var(--space-1);
+  gap: var(--space-2);
   margin-bottom: var(--space-5);
-  padding-bottom: 0;
-  border-bottom: 1px solid var(--border);
 }
 
 .tab {
-  padding: var(--space-3) var(--space-4);
+  padding: var(--space-2) var(--space-4);
   border: none;
   background: none;
   cursor: pointer;
   font-size: var(--text-body);
+  font-weight: 500;
   color: var(--text-secondary);
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  transition: color 0.2s ease, background-color 0.2s ease;
+  border-radius: var(--radius-pill);
+  transition: color 0.2s var(--ease-out-smooth), background-color 0.2s var(--ease-out-smooth), transform 0.15s var(--ease-out-smooth);
+}
+
+.tab:active {
+  transform: scale(0.98);
 }
 
 .tab:hover {
   color: var(--text-primary);
-  background: var(--bg-subtle);
+  background: var(--bg-hover);
 }
 
 .tab.active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
 }
 
 .contacts-sections {
@@ -186,8 +203,8 @@
 }
 
 .contacts-sections section:not(:first-child) {
-  border-top: 1px solid var(--border-light);
-  margin-top: var(--space-2);
+  border-top: 1px solid var(--border);
+  margin-top: var(--space-4);
   padding-top: var(--space-5);
 }
 
@@ -284,8 +301,7 @@
 .email-preview-body {
   margin-top: var(--space-4);
   padding: var(--space-4);
-  background: var(--bg-subtle);
-  border: 1px solid var(--border-light);
+  background: var(--bg-elevated);
   border-radius: var(--radius-md);
   white-space: pre-wrap;
   font-size: var(--text-body);

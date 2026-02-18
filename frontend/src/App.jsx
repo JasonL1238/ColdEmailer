@@ -15,55 +15,61 @@ function App() {
   const [activeTab, setActiveTab] = useState('contacts')
 
   return (
-    <div className="app">
+    <div className="app app--spotify">
       <Toaster
-        position="top-center"
+        position="top-right"
         toastOptions={{
           success: {
             style: {
-              background: '#ecfdf5',
-              color: '#065f46',
-              border: '1px solid rgba(6, 95, 70, 0.2)',
+              background: '#282828',
+              color: '#1db954',
+              border: '1px solid #404040',
             },
             iconTheme: {
-              primary: '#065f46',
-              secondary: '#ecfdf5',
+              primary: '#1db954',
+              secondary: '#282828',
             },
           },
           error: {
             style: {
-              background: '#fef2f2',
-              color: '#991b1b',
-              border: '1px solid rgba(153, 27, 27, 0.2)',
+              background: '#282828',
+              color: '#e91429',
+              border: '1px solid #404040',
             },
             iconTheme: {
-              primary: '#991b1b',
-              secondary: '#fef2f2',
+              primary: '#e91429',
+              secondary: '#282828',
             },
           },
           duration: 4000,
         }}
       />
-      <header className="app-header">
-        <h1>AI Cold Emailer</h1>
-        <nav className="nav-tabs">
+      <aside className="sidebar">
+        <div className="sidebar-brand">
+          <span className="sidebar-logo">Cold Emailer</span>
+        </div>
+        <nav className="sidebar-nav">
           <button
-            className={activeTab === 'contacts' ? 'active' : ''}
+            type="button"
+            className={`sidebar-nav-item ${activeTab === 'contacts' ? 'active' : ''}`}
             onClick={() => setActiveTab('contacts')}
           >
-            Contacts
+            <span className="sidebar-nav-label">Contacts</span>
           </button>
           <button
-            className={activeTab === 'review' ? 'active' : ''}
+            type="button"
+            className={`sidebar-nav-item ${activeTab === 'review' ? 'active' : ''}`}
             onClick={() => setActiveTab('review')}
           >
-            Review Emails
+            <span className="sidebar-nav-label">Review Emails</span>
           </button>
         </nav>
-      </header>
+      </aside>
       <main className="app-main">
-        {activeTab === 'contacts' && <CSVManager />}
-        {activeTab === 'review' && <EmailReview />}
+        <div key={activeTab} className="app-main-content">
+          {activeTab === 'contacts' && <CSVManager />}
+          {activeTab === 'review' && <EmailReview />}
+        </div>
       </main>
     </div>
   )

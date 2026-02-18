@@ -1,11 +1,8 @@
-/* EmailReview — card layout, elevation, structured hierarchy */
+/* EmailReview — Spotify-style dark layout and list feel */
 
 .email-review {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-lg);
-  padding: var(--space-6);
-  box-shadow: var(--shadow-sm);
+  background: transparent;
+  padding: 0;
 }
 
 .email-review-header {
@@ -14,7 +11,7 @@
   align-items: center;
   margin-bottom: var(--space-5);
   padding-bottom: var(--space-4);
-  border-bottom: 1px solid var(--border-light);
+  border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
   gap: var(--space-4);
 }
@@ -36,9 +33,8 @@
   padding: var(--space-2) var(--space-4);
   font-size: var(--text-small);
   color: var(--text-muted);
-  background: var(--bg-subtle);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-pill);
 }
 
 .email-review-content {
@@ -51,10 +47,9 @@
   align-items: center;
   margin-bottom: var(--space-5);
   padding: var(--space-3) var(--space-4);
-  background: var(--bg-subtle);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-subtle);
+  background: var(--bg-surface);
+  border-radius: var(--radius-lg);
+  transition: background-color 0.2s var(--ease-out-smooth);
 }
 
 .email-counter {
@@ -64,17 +59,26 @@
 }
 
 .email-card {
-  border: 1px solid var(--border-light);
   border-radius: var(--radius-lg);
   padding: var(--space-6);
   background: var(--bg-surface);
-  box-shadow: var(--shadow-sm);
-  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+  animation: cardFadeIn 0.35s var(--ease-out-smooth);
+  transition: background-color 0.25s var(--ease-out-smooth), transform 0.2s var(--ease-out-smooth);
 }
 
 .email-card:hover {
-  box-shadow: var(--shadow-md);
-  border-color: var(--border);
+  background: var(--bg-elevated);
+}
+
+@keyframes cardFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .email-header {
@@ -83,7 +87,7 @@
   align-items: flex-start;
   margin-bottom: var(--space-4);
   padding-bottom: var(--space-4);
-  border-bottom: 1px solid var(--border-light);
+  border-bottom: 1px solid var(--border);
 }
 
 .email-contact {
@@ -106,9 +110,8 @@
 .company-badge {
   display: inline-block;
   padding: var(--space-1) var(--space-2);
-  background: var(--bg-subtle);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-pill);
   font-size: var(--text-small);
   margin-top: var(--space-1);
   color: var(--text-secondary);
@@ -147,8 +150,7 @@
   font-size: var(--text-body);
   margin-bottom: var(--space-4);
   padding: var(--space-4);
-  background: var(--bg-subtle);
-  border: 1px solid var(--border-light);
+  background: var(--bg-elevated);
   border-radius: var(--radius-md);
   color: var(--text-primary);
 }
@@ -169,7 +171,7 @@
   justify-content: flex-end;
   margin-top: var(--space-5);
   padding-top: var(--space-4);
-  border-top: 1px solid var(--border-light);
+  border-top: 1px solid var(--border);
 }
 
 .keyboard-hints {
@@ -200,11 +202,9 @@
 .contact-list-wrap {
   max-height: 400px;
   overflow-y: auto;
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   padding: var(--space-2);
-  background: var(--bg-subtle);
-  box-shadow: var(--shadow-subtle);
+  background: var(--bg-surface);
 }
 
 .contact-list-empty {
@@ -224,20 +224,26 @@
   text-align: left;
   font-weight: 500;
   font-size: var(--text-small);
-  color: var(--text-secondary);
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-surface);
+  color: var(--text-muted);
+  border: none;
+  background: transparent;
 }
 
 .contact-table td {
   padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--border-light);
+  border: none;
   font-size: var(--text-body);
+  color: var(--text-primary);
   transition: background-color 0.15s ease;
 }
 
+.contact-table tbody tr {
+  border-radius: var(--radius-md);
+  transition: background-color 0.2s var(--ease-out-smooth);
+}
+
 .contact-table tbody tr:hover {
-  background: var(--bg-surface);
+  background: var(--bg-hover);
 }
 
 .contact-table .contact-table-col-select {
