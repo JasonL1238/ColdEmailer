@@ -382,6 +382,16 @@ function CSVManager() {
         )
       }
 
+      // Filter by search term (name, company, email)
+      if (searchTerm && searchTerm.trim()) {
+        const term = searchTerm.trim().toLowerCase()
+        filtered = filtered.filter(({ contact }) =>
+          (contact.name || '').toLowerCase().includes(term) ||
+          (contact.company || '').toLowerCase().includes(term) ||
+          (contact.email || '').toLowerCase().includes(term)
+        )
+      }
+
       // Sort contacts
       const sorted = [...filtered].sort((a, b) => {
         if (sortBy === 'sent_at_desc') {

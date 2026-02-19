@@ -19,15 +19,11 @@
   font-size: var(--text-body);
   font-family: var(--font-family);
   font-weight: 600;
-  transition: transform 0.15s var(--ease-out-smooth), background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
 }
 
 .btn:hover:not(:disabled) {
   opacity: 0.95;
-}
-
-.btn:active:not(:disabled) {
-  transform: scale(0.98);
 }
 
 .btn:disabled {
@@ -125,10 +121,6 @@
   border-color: var(--text-muted);
 }
 
-.btn-nav:active:not(:disabled) {
-  transform: scale(0.98);
-}
-
 .btn-nav:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -162,8 +154,19 @@ select {
   font-size: var(--text-body);
   font-family: var(--font-family);
   color: var(--text-primary);
-  background: var(--bg-surface);
+  background-color: var(--bg-surface);
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+/* Dropdown list: opaque background so it doesn't merge with page */
+select {
+  background-color: var(--bg-elevated);
+  appearance: auto;
+}
+
+select option {
+  background-color: #282828;
+  color: #ffffff;
 }
 
 input:focus,

@@ -62,6 +62,13 @@
 .section-filters select {
   padding: var(--space-1) var(--space-2);
   min-width: 140px;
+  background-color: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.section-filters select option {
+  background-color: #282828;
+  color: #ffffff;
 }
 
 .table-container {
@@ -158,6 +165,13 @@
   border: 1px solid var(--border);
   border-radius: 4px;
   font-size: var(--text-small);
+  background-color: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.status-select option {
+  background-color: #282828;
+  color: #ffffff;
 }
 
 /* Section tabs — Spotify-style pill/underline */
@@ -176,11 +190,7 @@
   font-weight: 500;
   color: var(--text-secondary);
   border-radius: var(--radius-pill);
-  transition: color 0.2s var(--ease-out-smooth), background-color 0.2s var(--ease-out-smooth), transform 0.15s var(--ease-out-smooth);
-}
-
-.tab:active {
-  transform: scale(0.98);
+  transition: color 0.2s var(--ease-out-smooth), background-color 0.2s var(--ease-out-smooth);
 }
 
 .tab:hover {
