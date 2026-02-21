@@ -1,6 +1,5 @@
 import axios from 'axios'
-
-const API_BASE_URL = '/api'
+import { API_BASE_URL, sendTelemetry } from './config'
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -12,15 +11,11 @@ const api = axios.create({
 // Add request interceptor to log all API calls
 api.interceptors.request.use(
   (config) => {
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.js:interceptor:request','message':'API request','data':{url:config.url,method:config.method,baseURL:config.baseURL},timestamp:Date.now(),runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
+    sendTelemetry('api.js:interceptor:request', 'API request', { url: config.url, method: config.method, baseURL: config.baseURL })
     return config
   },
   (error) => {
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.js:interceptor:request:error','message':'API request error','data':{error:error.message},timestamp:Date.now(),runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
+    sendTelemetry('api.js:interceptor:request:error', 'API request error', { error: error.message })
     return Promise.reject(error)
   }
 )
@@ -28,35 +23,30 @@ api.interceptors.request.use(
 // Add response interceptor to log API responses
 api.interceptors.response.use(
   (response) => {
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.js:interceptor:response','message':'API response','data':{url:response.config.url,status:response.status},timestamp:Date.now(),runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
+    sendTelemetry('api.js:interceptor:response', 'API response', { url: response.config.url, status: response.status })
     return response
   },
   (error) => {
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.js:interceptor:response:error','message':'API response error','data':{url:error.config?.url,status:error.response?.status,message:error.message,code:error.code},timestamp:Date.now(),runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
+    sendTelemetry('api.js:interceptor:response:error', 'API response error', {
+      url: error.config?.url,
+      status: error.response?.status,
+      message: error.message,
+      code: error.code,
+    })
     return Promise.reject(error)
   }
 )
 
-// #region agent log
-fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.js:init','message':'API client initialized','data':{baseURL:API_BASE_URL},timestamp:Date.now(),runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-// #endregion
+sendTelemetry('api.js:init', 'API client initialized', { baseURL: API_BASE_URL })
 
 // Contacts API
 export const contactsAPI = {
   getAll: (status) => {
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.js:getAll','message':'API call attempt','data':{endpoint:'/contacts',status},timestamp:Date.now(),runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-    // #endregion
+    sendTelemetry('api.js:getAll', 'API call attempt', { endpoint: '/contacts', status })
     return api.get('/contacts', { params: { status } }).catch(err => {
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.js:getAll:error','message':'API call failed','data':{endpoint:'/contacts',error:err.message,code:err.code},timestamp:Date.now(),runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-      // #endregion
-      throw err;
-    });
+      sendTelemetry('api.js:getAll:error', 'API call failed', { endpoint: '/contacts', error: err.message, code: err.code })
+      throw err
+    })
   },
   create: (contact) => api.post('/contacts', contact),
   update: (id, updates) => api.put(`/contacts/${id}`, updates),

@@ -62,10 +62,11 @@ async def stress_test_middleware(request, call_next):
     response = await call_next(request)
     return response
 
-# CORS middleware
+# CORS middleware (origins from env, comma-separated)
+_cors_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5173,http://localhost:3000').strip().split(',')
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -84,8 +85,8 @@ email_generator = EmailGenerator(
 )
 # Get project root (parent of backend directory)
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-credentials_path = os.path.join(project_root, 'credentials.json')
-token_path = os.path.join(project_root, 'token.json')
+credentials_path = os.getenv('CREDENTIALS_JSON_PATH') or os.path.join(project_root, 'credentials.json')
+token_path = os.getenv('TOKEN_JSON_PATH') or os.path.join(project_root, 'token.json')
 # #region agent log
 import json
 import time

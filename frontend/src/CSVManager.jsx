@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import toast from 'react-hot-toast'
 import { contactsAPI, emailAPI } from './api'
+import { sendTelemetry } from './config'
 import './CSVManager.css'
 
 // Get user info for email generation
@@ -30,20 +31,14 @@ function CSVManager() {
   const [allEmails, setAllEmails] = useState([]) // All emails including follow-ups
 
   const handleTabChange = (tab) => {
-    // #region agent log
     try {
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleTabChange:start','message':'Tab change initiated','data':{fromTab:activeTab,toTab:tab},timestamp:Date.now(),runId:'tab-change',hypothesisId:'A'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:handleTabChange:start', 'Tab change initiated', { fromTab: activeTab, toTab: tab })
     } catch (e) {}
-    // #endregion
     try {
       setActiveTab(tab)
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleTabChange:success','message':'Tab changed successfully','data':{newTab:tab},timestamp:Date.now(),runId:'tab-change',hypothesisId:'B'})}).catch(()=>{});
-      // #endregion
+      sendTelemetry('CSVManager.jsx:handleTabChange:success', 'Tab changed successfully', { newTab: tab })
     } catch (error) {
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleTabChange:error','message':'Tab change failed','data':{error:error.message,stack:error.stack},timestamp:Date.now(),runId:'tab-change',hypothesisId:'C'})}).catch(()=>{});
-      // #endregion
+      sendTelemetry('CSVManager.jsx:handleTabChange:error', 'Tab change failed', { error: error.message, stack: error.stack })
       console.error('Tab change error:', error)
       throw error
     }
@@ -147,15 +142,11 @@ function CSVManager() {
   }
 
   const handleAddContact = async () => {
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleAddContact:start','message':'Add contact called','data':{activeTab},timestamp:Date.now(),runId:'add-contact',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
+    sendTelemetry('CSVManager.jsx:handleAddContact:start', 'Add contact called', { activeTab })
     
     // Only allow adding contacts in "No Emails Generated" section
     if (activeTab !== 'no_emails') {
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleAddContact:wrongTab','message':'Add contact blocked - wrong tab','data':{activeTab},timestamp:Date.now(),runId:'add-contact',hypothesisId:'B'})}).catch(()=>{});
-      // #endregion
+      sendTelemetry('CSVManager.jsx:handleAddContact:wrongTab', 'Add contact blocked - wrong tab', { activeTab })
       toast.error('You can only add contacts in the "No Emails Generated" section')
       return
     }
@@ -167,23 +158,17 @@ function CSVManager() {
       status: 'pending',
     }
     
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleAddContact:beforeAPI','message':'About to call API','data':{newContact},timestamp:Date.now(),runId:'add-contact',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
+    sendTelemetry('CSVManager.jsx:handleAddContact:beforeAPI', 'About to call API', { newContact })
     
     try {
       const response = await contactsAPI.create(newContact)
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleAddContact:success','message':'API call successful','data':{contactId:response.data?.id},timestamp:Date.now(),runId:'add-contact',hypothesisId:'D'})}).catch(()=>{});
-      // #endregion
+      sendTelemetry('CSVManager.jsx:handleAddContact:success', 'API call successful', { contactId: response.data?.id })
       const contactId = response.data.id
       toast.success('Contact added and saved')
       await loadCategorizedContacts()
       setEditingCell({ id: contactId, field: 'name' })
     } catch (error) {
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:handleAddContact:error','message':'API call failed','data':{error:error.message,response:error.response?.data,status:error.response?.status},timestamp:Date.now(),runId:'add-contact',hypothesisId:'E'})}).catch(()=>{});
-      // #endregion
+      sendTelemetry('CSVManager.jsx:handleAddContact:error', 'API call failed', { error: error.message, response: error.response?.data, status: error.response?.status })
       toast.error('Failed to save contact')
       console.error(error)
     }
@@ -363,7 +348,7 @@ function CSVManager() {
   const renderEmailedSection = () => {
     // #region agent log
     try {
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderEmailedSection:start','message':'Rendering emailed section','data':{contactsCount:categorizedContacts.emailed?.length,isArray:Array.isArray(categorizedContacts.emailed)},timestamp:Date.now(),runId:'render-section',hypothesisId:'L'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:renderEmailedSection:start', 'Rendering emailed section', { contactsCount: categorizedContacts.emailed?.length, isArray: Array.isArray(categorizedContacts.emailed) })
     } catch (e) {}
     // #endregion
     try {
@@ -547,7 +532,7 @@ function CSVManager() {
       )
     } catch (error) {
       // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderEmailedSection:error','message':'Error rendering emailed section','data':{error:error.message,stack:error.stack},timestamp:Date.now(),runId:'render-section',hypothesisId:'M'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:renderEmailedSection:error', 'Error rendering emailed section', { error: error.message, stack: error.stack })
       // #endregion
       console.error('Error rendering emailed section:', error)
       return <div>Error loading emailed contacts: {error.message}</div>
@@ -557,7 +542,7 @@ function CSVManager() {
   const renderGeneratedSection = () => {
     // #region agent log
     try {
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderGeneratedSection:start','message':'Rendering generated section','data':{contactsCount:categorizedContacts.emails_generated?.length,isArray:Array.isArray(categorizedContacts.emails_generated)},timestamp:Date.now(),runId:'render-section',hypothesisId:'N'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:renderGeneratedSection:start', 'Rendering generated section', { contactsCount: categorizedContacts.emails_generated?.length, isArray: Array.isArray(categorizedContacts.emails_generated) })
     } catch (e) {}
     // #endregion
     try {
@@ -587,7 +572,7 @@ function CSVManager() {
       )
     } catch (error) {
       // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderGeneratedSection:error','message':'Error rendering generated section','data':{error:error.message,stack:error.stack},timestamp:Date.now(),runId:'render-section',hypothesisId:'O'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:renderGeneratedSection:error', 'Error rendering generated section', { error: error.message, stack: error.stack })
       // #endregion
       console.error('Error rendering generated section:', error)
       return <div>Error loading generated contacts: {error.message}</div>
@@ -597,7 +582,7 @@ function CSVManager() {
   const renderNoEmailsSection = () => {
     // #region agent log
     try {
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderNoEmailsSection:start','message':'Rendering no_emails section','data':{contactsCount:categorizedContacts.no_emails?.length,isArray:Array.isArray(categorizedContacts.no_emails)},timestamp:Date.now(),runId:'render-section',hypothesisId:'P'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:renderNoEmailsSection:start', 'Rendering no_emails section', { contactsCount: categorizedContacts.no_emails?.length, isArray: Array.isArray(categorizedContacts.no_emails) })
     } catch (e) {}
     // #endregion
     try {
@@ -628,7 +613,7 @@ function CSVManager() {
       )
     } catch (error) {
       // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderNoEmailsSection:error','message':'Error rendering no_emails section','data':{error:error.message,stack:error.stack},timestamp:Date.now(),runId:'render-section',hypothesisId:'Q'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:renderNoEmailsSection:error', 'Error rendering no_emails section', { error: error.message, stack: error.stack })
       // #endregion
       console.error('Error rendering no_emails section:', error)
       return <div>Error loading no_emails contacts: {error.message}</div>
@@ -638,13 +623,13 @@ function CSVManager() {
   const renderContactTable = (contacts, showTracking = false, showDeleteEmail = false, showEmailActions = false) => {
     // #region agent log
     try {
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderContactTable:start','message':'Rendering contact table','data':{contactsCount:contacts?.length,showTracking,showDeleteEmail,showEmailActions},timestamp:Date.now(),runId:'render',hypothesisId:'D'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:renderContactTable:start', 'Rendering contact table', { contactsCount: contacts?.length, showTracking, showDeleteEmail, showEmailActions })
     } catch (e) {}
     // #endregion
     
     if (!contacts || !Array.isArray(contacts)) {
       // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:renderContactTable:invalid','message':'Invalid contacts array','data':{contacts},timestamp:Date.now(),runId:'render',hypothesisId:'E'})}).catch(()=>{});
+      sendTelemetry('CSVManager.jsx:renderContactTable:invalid', 'Invalid contacts array', { contacts })
       // #endregion
       return (
         <tr>
@@ -773,7 +758,7 @@ function CSVManager() {
                     className="btn btn-small btn-primary"
                     onClick={() => {
                       // #region agent log
-                      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:viewEmail:click','message':'View email button clicked','data':{emailId:email?.id,hasEmail:!!email},timestamp:Date.now(),runId:'view-email',hypothesisId:'G'})}).catch(()=>{});
+                      sendTelemetry('CSVManager.jsx:viewEmail:click', 'View email button clicked', { emailId: email?.id, hasEmail: !!email })
                       // #endregion
                       handleViewEmail(email)
                     }}
@@ -785,7 +770,7 @@ function CSVManager() {
                     className="btn btn-small btn-success"
                     onClick={() => {
                       // #region agent log
-                      fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:sendEmail:click','message':'Send email button clicked','data':{emailId:email?.id},timestamp:Date.now(),runId:'send-email',hypothesisId:'H'})}).catch(()=>{});
+                      sendTelemetry('CSVManager.jsx:sendEmail:click', 'Send email button clicked', { emailId: email?.id })
                       // #endregion
                       handleSendEmail(email.id)
                     }}
@@ -909,7 +894,7 @@ function CSVManager() {
           className={`tab ${activeTab === 'emailed' ? 'active' : ''}`}
           onClick={(e) => {
             // #region agent log
-            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:tab:emailed:click','message':'Emailed tab clicked','data':{currentTab:activeTab},timestamp:Date.now(),runId:'tab-click',hypothesisId:'X'})}).catch(()=>{});
+            sendTelemetry('CSVManager.jsx:tab:emailed:click', 'Emailed tab clicked', { currentTab: activeTab })
             // #endregion
             e.preventDefault()
             e.stopPropagation()
@@ -922,7 +907,7 @@ function CSVManager() {
           className={`tab ${activeTab === 'generated' ? 'active' : ''}`}
           onClick={(e) => {
             // #region agent log
-            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:tab:generated:click','message':'Generated tab clicked','data':{currentTab:activeTab},timestamp:Date.now(),runId:'tab-click',hypothesisId:'V'})}).catch(()=>{});
+            sendTelemetry('CSVManager.jsx:tab:generated:click', 'Generated tab clicked', { currentTab: activeTab })
             // #endregion
             e.preventDefault()
             e.stopPropagation()
@@ -935,7 +920,7 @@ function CSVManager() {
           className={`tab ${activeTab === 'no_emails' ? 'active' : ''}`}
           onClick={(e) => {
             // #region agent log
-            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:tab:no_emails:click','message':'No emails tab clicked','data':{currentTab:activeTab},timestamp:Date.now(),runId:'tab-click',hypothesisId:'W'})}).catch(()=>{});
+            sendTelemetry('CSVManager.jsx:tab:no_emails:click', 'No emails tab clicked', { currentTab: activeTab })
             // #endregion
             e.preventDefault()
             e.stopPropagation()
@@ -951,7 +936,7 @@ function CSVManager() {
         {(() => {
           // #region agent log
           try {
-            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:render:sections:start','message':'Rendering sections container','data':{activeTab},timestamp:Date.now(),runId:'render-sections',hypothesisId:'R'})}).catch(()=>{});
+            sendTelemetry('CSVManager.jsx:render:sections:start', 'Rendering sections container', { activeTab })
           } catch (e) {}
           // #endregion
           try {
@@ -959,19 +944,19 @@ function CSVManager() {
               return renderEmailedSection()
             } else if (activeTab === 'generated') {
               // #region agent log
-              fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:render:sections:generated','message':'About to render generated section','data':{activeTab},timestamp:Date.now(),runId:'render-sections',hypothesisId:'S'})}).catch(()=>{});
+              sendTelemetry('CSVManager.jsx:render:sections:generated', 'About to render generated section', { activeTab })
               // #endregion
               return renderGeneratedSection()
             } else if (activeTab === 'no_emails') {
               // #region agent log
-              fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:render:sections:no_emails','message':'About to render no_emails section','data':{activeTab},timestamp:Date.now(),runId:'render-sections',hypothesisId:'T'})}).catch(()=>{});
+              sendTelemetry('CSVManager.jsx:render:sections:no_emails', 'About to render no_emails section', { activeTab })
               // #endregion
               return renderNoEmailsSection()
             }
             return null
           } catch (error) {
             // #region agent log
-            fetch('http://127.0.0.1:7243/ingest/2a1d9d6c-1d59-4b37-a463-932a5a4b92a4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'CSVManager.jsx:render:sections:error','message':'Error rendering sections','data':{error:error.message,stack:error.stack,activeTab},timestamp:Date.now(),runId:'render-sections',hypothesisId:'U'})}).catch(()=>{});
+            sendTelemetry('CSVManager.jsx:render:sections:error', 'Error rendering sections', { error: error.message, stack: error.stack, activeTab })
             // #endregion
             console.error('Error rendering section:', error)
             return <div className="section-error">Error rendering section: {error.message}</div>
