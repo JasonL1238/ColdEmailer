@@ -36,6 +36,16 @@ Or see `FULL_SETUP.md` for complete setup instructions.
 
 **Already done!** All dependencies are installed. See `FULL_SETUP.md` for details.
 
+### Personal Fields Configuration
+
+Personal outreach fields are stored in `personal_profile.yaml` at the project root.
+
+Edit this file to set:
+- Name
+- Intro sentence template
+- Default sender email/background
+- Email signature lines
+
 ### Gmail API Setup (Required for sending emails)
 
 See `GMAIL_SETUP.md` for detailed step-by-step instructions.
