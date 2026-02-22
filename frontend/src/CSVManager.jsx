@@ -1,14 +1,14 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect } from 'react'
 import toast from 'react-hot-toast'
-import { contactsAPI, emailAPI } from './api'
+import { contactsAPI, emailAPI, profileAPI } from './api'
 import { sendTelemetry } from './config'
 import './CSVManager.css'
 
 // Get user info for email generation
-const getUserInfo = () => ({
-  userName: localStorage.getItem('userName') || 'Jason Li',
-  userBackground: localStorage.getItem('userBackground') || '',
-  userEmail: localStorage.getItem('userEmail') || 'jason.ye.li.7@gmail.com'
+const getUserInfo = (profileDefaults = {}) => ({
+  userName: localStorage.getItem('userName') || profileDefaults.user_name || '',
+  userBackground: localStorage.getItem('userBackground') || profileDefaults.user_background || '',
+  userEmail: localStorage.getItem('userEmail') || profileDefaults.user_email || '',
 })
 
 function CSVManager() {
@@ -29,6 +29,11 @@ function CSVManager() {
   const [sortBy, setSortBy] = useState('sent_at_desc') // 'sent_at_desc', 'sent_at_asc', 'name'
   const [filterFollowUps, setFilterFollowUps] = useState('all') // 'all', 'unsent_followups'
   const [allEmails, setAllEmails] = useState([]) // All emails including follow-ups
+  const [profileDefaults, setProfileDefaults] = useState({
+    user_name: '',
+    user_background: '',
+    user_email: ''
+  })
 
   const handleTabChange = (tab) => {
     try {
@@ -44,20 +49,33 @@ function CSVManager() {
     }
   }
   
-  // User info for follow-up generation
-  const [userName] = useState(localStorage.getItem('userName') || 'Jason Li')
-  const [userBackground] = useState(localStorage.getItem('userBackground') || '')
-  const [userEmail] = useState(localStorage.getItem('userEmail') || 'jason.ye.li.7@gmail.com')
-
   useEffect(() => {
+    loadProfileDefaults()
     loadCategorizedContacts()
     loadFollowUpReminders()
   }, [])
+
+  const loadProfileDefaults = async () => {
+    try {
+      const response = await profileAPI.getDefaults()
+      const defaults = response.data || {}
+      setProfileDefaults({
+        user_name: defaults.user_name || '',
+        user_background: defaults.user_background || '',
+        user_email: defaults.user_email || ''
+      })
+    } catch (error) {
+      console.error('Failed to load profile defaults:', error)
+    }
+  }
 
   const loadCategorizedContacts = async () => {
     try {
       setLoading(true)
       const response = await contactsAPI.getCategorized()
+      const allEmailsResponse = await emailAPI.getAll()
+      const allEmailsData = allEmailsResponse.data || []
+      setAllEmails(allEmailsData)
       setCategorizedContacts({
         emailed: response.data.emailed,
         emails_generated: response.data.emails_generated,
@@ -72,10 +90,8 @@ function CSVManager() {
         })
         setEmailsByContact(emailsMap)
       } else {
-        // Fallback: load all emails separately
-        const emailsResponse = await emailAPI.getAll()
         const emailsMap = {}
-        emailsResponse.data.forEach(email => {
+        allEmailsData.forEach(email => {
           emailsMap[email.contact_id] = email
         })
         setEmailsByContact(emailsMap)
@@ -316,7 +332,7 @@ function CSVManager() {
 
   const handleGenerateFollowUp = async (emailId) => {
     try {
-      const userInfo = getUserInfo()
+      const userInfo = getUserInfo(profileDefaults)
       const response = await contactsAPI.generateFollowUp(emailId, userInfo)
       toast.success('Follow-up email generated!')
       await loadCategorizedContacts()

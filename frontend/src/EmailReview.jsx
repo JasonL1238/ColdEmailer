@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import toast from 'react-hot-toast'
-import { emailAPI, contactsAPI, usageAPI } from './api'
+import { emailAPI, contactsAPI, usageAPI, profileAPI } from './api'
 import './EmailReview.css'
 
 function EmailReview() {
@@ -14,15 +14,35 @@ function EmailReview() {
   const [showContactSelection, setShowContactSelection] = useState(false)
   const [availableContacts, setAvailableContacts] = useState([])
   const [selectedContactIds, setSelectedContactIds] = useState(new Set())
-  const [userName, setUserName] = useState(localStorage.getItem('userName') || 'Jason Li')
+  const [userName, setUserName] = useState(localStorage.getItem('userName') || '')
   const [userBackground, setUserBackground] = useState(localStorage.getItem('userBackground') || '')
-  const [userEmail, setUserEmail] = useState(localStorage.getItem('userEmail') || 'jason.ye.li.7@gmail.com')
+  const [userEmail, setUserEmail] = useState(localStorage.getItem('userEmail') || '')
   const [resumePath, setResumePath] = useState(localStorage.getItem('resumePath') || '')
 
   useEffect(() => {
+    loadProfileDefaults()
     loadEmails()
     loadUsageStats()
   }, [])
+
+  const loadProfileDefaults = async () => {
+    try {
+      const response = await profileAPI.getDefaults()
+      const defaults = response.data || {}
+
+      if (!localStorage.getItem('userName') && defaults.user_name) {
+        setUserName(defaults.user_name)
+      }
+      if (!localStorage.getItem('userBackground') && defaults.user_background) {
+        setUserBackground(defaults.user_background)
+      }
+      if (!localStorage.getItem('userEmail') && defaults.user_email) {
+        setUserEmail(defaults.user_email)
+      }
+    } catch (error) {
+      console.error('Failed to load profile defaults', error)
+    }
+  }
 
   const loadEmails = async () => {
     try {
@@ -334,7 +354,7 @@ function EmailReview() {
                   type="text"
                   value={userName}
                   onChange={(e) => setUserName(e.target.value)}
-                  placeholder="e.g. Jason Li"
+                  placeholder="e.g. Your Name"
                 />
               </label>
               <label className="settings-form-field">

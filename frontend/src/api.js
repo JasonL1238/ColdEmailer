@@ -62,7 +62,7 @@ export const contactsAPI = {
     })
   },
   export: (section) => api.get('/contacts/export', { 
-    params: section ? { section } : {},
+    ...(section ? { params: { section } } : {}),
     responseType: 'blob' 
   }),
   getCategorized: () => api.get('/contacts/categorized'),
@@ -101,6 +101,11 @@ export const emailAPI = {
 // Usage API
 export const usageAPI = {
   getStats: () => api.get('/usage'),
+}
+
+// Personal profile defaults API
+export const profileAPI = {
+  getDefaults: () => api.get('/profile'),
 }
 
 export default api

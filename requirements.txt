@@ -1,0 +1,15 @@
+beautifulsoup4==4.14.3
+duckduckgo_search==8.1.1
+fastapi==0.129.2
+google_api_python_client==2.190.0
+google_auth_oauthlib==1.2.4
+ollama==0.6.1
+pandas==3.0.1
+protobuf==6.33.5
+pydantic==2.12.5
+pypdf==6.7.1
+pytest==9.0.2
+python-dotenv==1.2.1
+PyYAML==6.0.2
+Requests==2.32.5
+trafilatura==2.0.0

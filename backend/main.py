@@ -20,6 +20,7 @@ from email_sender import EmailSender
 from rate_limiter import RateLimiter
 from email_storage import EmailStorage
 from response_checker import ResponseChecker
+from personal_profile import load_personal_profile
 
 load_dotenv()
 
@@ -73,6 +74,18 @@ app.add_middleware(
 )
 
 # Initialize services
+# Get project root (parent of backend directory)
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+profile_path = os.getenv('PERSONAL_CONFIG_PATH', 'personal_profile.yaml')
+if profile_path and not os.path.isabs(profile_path):
+    profile_path = os.path.join(project_root, profile_path)
+personal_profile = load_personal_profile(profile_path)
+
+resume_path = os.getenv('RESUME_PATH', 'resume.pdf')
+if resume_path and not os.path.isabs(resume_path):
+    resume_path = os.path.join(project_root, resume_path)
+
 csv_processor = CSVProcessor(
     csv_path=os.getenv('CSV_FILE_PATH', 'data/contacts.csv')
 )
@@ -81,10 +94,10 @@ enrichment_service = CompanyEnrichmentService(
 )
 email_generator = EmailGenerator(
     model=os.getenv('OLLAMA_MODEL', 'llama3.2'),
-    base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
+    base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434'),
+    resume_path=resume_path,
+    profile=personal_profile,
 )
-# Get project root (parent of backend directory)
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 credentials_path = os.getenv('CREDENTIALS_JSON_PATH') or os.path.join(project_root, 'credentials.json')
 token_path = os.getenv('TOKEN_JSON_PATH') or os.path.join(project_root, 'token.json')
 # #region agent log
@@ -120,6 +133,12 @@ rate_limiter = RateLimiter()
 email_storage = EmailStorage(
     storage_path=os.getenv('EMAIL_STORAGE_PATH', 'data/generated_emails.json')
 )
+
+
+@app.get("/api/profile")
+async def get_profile_defaults():
+    """Get default personal fields for frontend settings."""
+    return personal_profile.to_frontend_defaults()
 
 
 # Contact endpoints

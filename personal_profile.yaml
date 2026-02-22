@@ -1,0 +1,12 @@
+personal:
+  full_name: "Andrew"
+  default_user_email: "andrew.qian64@gmail.com"
+  default_background: ""
+  introduction: "I'm {name}, a student at the University of Illinois Urbana-Champaign studying Electrical Engineering graduating in 2028."
+  signature:
+    closing_format: "Thanks so much, {name}"
+    lines:
+      - "University of Illinois Urbana-Champaign"
+      - "Phone: 847-370-6066"
+      - "Email: andrew.qian64@gmail.com"
+      # - "Website: https://personal-site-sooty-ten.vercel.app/"
