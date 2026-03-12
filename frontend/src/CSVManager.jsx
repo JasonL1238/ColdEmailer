@@ -29,6 +29,14 @@ function CSVManager() {
   const [sortBy, setSortBy] = useState('sent_at_desc') // 'sent_at_desc', 'sent_at_asc', 'name'
   const [filterFollowUps, setFilterFollowUps] = useState('all') // 'all', 'unsent_followups'
   const [allEmails, setAllEmails] = useState([]) // All emails including follow-ups
+  const [dragOver, setDragOver] = useState(false)
+  const [selectedGeneratedEmailIds, setSelectedGeneratedEmailIds] = useState(new Set()) // email IDs for bulk delete
+  const [selectedNoEmailContactIds, setSelectedNoEmailContactIds] = useState(new Set()) // contact IDs in "no emails" for bulk delete
+  const [showUploadModal, setShowUploadModal] = useState(false)
+  const [editingSubject, setEditingSubject] = useState('')
+  const [editingBody, setEditingBody] = useState('')
+  const [savingEmail, setSavingEmail] = useState(false)
+  const [attachResume, setAttachResume] = useState('resume28.pdf') // default 2028 resume; 'none' | 'resume28.pdf' | 'resume29.pdf'
 
   const handleTabChange = (tab) => {
     try {
@@ -53,6 +61,19 @@ function CSVManager() {
     loadCategorizedContacts()
     loadFollowUpReminders()
   }, [])
+
+  useEffect(() => {
+    const onRefresh = () => loadCategorizedContacts()
+    window.addEventListener('contacts-refresh', onRefresh)
+    return () => window.removeEventListener('contacts-refresh', onRefresh)
+  }, [])
+
+  useEffect(() => {
+    if (viewingEmail) {
+      setEditingSubject(viewingEmail.subject ?? '')
+      setEditingBody(viewingEmail.body ?? '')
+    }
+  }, [viewingEmail])
 
   const loadCategorizedContacts = async () => {
     try {
@@ -143,23 +164,23 @@ function CSVManager() {
 
   const handleAddContact = async () => {
     sendTelemetry('CSVManager.jsx:handleAddContact:start', 'Add contact called', { activeTab })
-    
+
     // Only allow adding contacts in "No Emails Generated" section
     if (activeTab !== 'no_emails') {
       sendTelemetry('CSVManager.jsx:handleAddContact:wrongTab', 'Add contact blocked - wrong tab', { activeTab })
       toast.error('You can only add contacts in the "No Emails Generated" section')
       return
     }
-    
+
     const newContact = {
       name: '',
       company: '',
       email: '',
       status: 'pending',
     }
-    
+
     sendTelemetry('CSVManager.jsx:handleAddContact:beforeAPI', 'About to call API', { newContact })
-    
+
     try {
       const response = await contactsAPI.create(newContact)
       sendTelemetry('CSVManager.jsx:handleAddContact:success', 'API call successful', { contactId: response.data?.id })
@@ -167,6 +188,9 @@ function CSVManager() {
       toast.success('Contact added and saved')
       await loadCategorizedContacts()
       setEditingCell({ id: contactId, field: 'name' })
+      setTimeout(() => {
+        document.querySelector(`tr[data-contact-id="${contactId}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      }, 100)
     } catch (error) {
       sendTelemetry('CSVManager.jsx:handleAddContact:error', 'API call failed', { error: error.message, response: error.response?.data, status: error.response?.status })
       toast.error('Failed to save contact')
@@ -178,17 +202,40 @@ function CSVManager() {
     setViewingEmail(email)
   }
 
-  const handleSendEmail = async (emailId) => {
+  const handleSaveEmailEdit = async () => {
+    if (!viewingEmail?.id) return
+    try {
+      setSavingEmail(true)
+      const response = await emailAPI.update(viewingEmail.id, {
+        subject: editingSubject,
+        body: editingBody
+      })
+      const updated = response.data?.email
+      if (updated) {
+        setViewingEmail(updated)
+        setEditingSubject(updated.subject ?? '')
+        setEditingBody(updated.body ?? '')
+      }
+      await loadCategorizedContacts()
+      toast.success('Email updated')
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to save email')
+    } finally {
+      setSavingEmail(false)
+    }
+  }
+
+  const handleSendEmail = async (emailId, resumeFile = null) => {
     if (!window.confirm('Send this email now?')) {
       return
     }
-    
+    const attach = resumeFile === 'none' || !resumeFile ? null : resumeFile
     try {
       setSendingEmail(true)
-      const response = await emailAPI.send([emailId])
+      await emailAPI.send([emailId], attach)
       toast.success('Email sent!')
       await loadCategorizedContacts()
-      setViewingEmail(null) // Close email view
+      setViewingEmail(null)
     } catch (error) {
       const message = error.response?.data?.detail || 'Failed to send email'
       toast.error(message)
@@ -212,6 +259,11 @@ function CSVManager() {
       await emailAPI.delete(email.id)
       await loadCategorizedContacts()
       setViewingEmail(null) // Close email view if open
+      setSelectedGeneratedEmailIds((prev) => {
+        const next = new Set(prev)
+        next.delete(email.id)
+        return next
+      })
       toast.success('Email deleted. Contact moved to "No Emails Generated" section.')
     } catch (error) {
       toast.error('Failed to delete email')
@@ -219,9 +271,98 @@ function CSVManager() {
     }
   }
 
+  const handleToggleGeneratedEmailSelection = (emailId) => {
+    setSelectedGeneratedEmailIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(emailId)) next.delete(emailId)
+      else next.add(emailId)
+      return next
+    })
+  }
+
+  const handleSelectAllGenerated = () => {
+    const contacts = categorizedContacts.emails_generated || []
+    const ids = new Set(contacts.map((c) => getEmailForContact(c.id)?.id).filter(Boolean))
+    setSelectedGeneratedEmailIds(ids)
+  }
+
+  const handleDeselectAllGenerated = () => {
+    setSelectedGeneratedEmailIds(new Set())
+  }
+
+  const handleBulkDeleteGenerated = async () => {
+    const count = selectedGeneratedEmailIds.size
+    if (count === 0) {
+      toast.error('Select at least one email to delete')
+      return
+    }
+    if (!window.confirm(`Delete ${count} email(s)? Those contacts will move to "No Emails Generated" section.`)) {
+      return
+    }
+    try {
+      const response = await emailAPI.bulkDelete(Array.from(selectedGeneratedEmailIds))
+      const deleted = response.data?.deleted ?? count
+      setSelectedGeneratedEmailIds(new Set())
+      await loadCategorizedContacts()
+      setViewingEmail(null)
+      toast.success(`${deleted} email(s) deleted. Contacts moved to "No Emails Generated" section.`)
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to delete emails')
+      console.error(error)
+    }
+  }
+
+  const handleToggleNoEmailContactSelection = (contactId) => {
+    setSelectedNoEmailContactIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(contactId)) next.delete(contactId)
+      else next.add(contactId)
+      return next
+    })
+  }
+
+  const handleSelectAllNoEmailContacts = () => {
+    const ids = (categorizedContacts.no_emails || []).map((c) => c.id).filter(Boolean)
+    setSelectedNoEmailContactIds(new Set(ids))
+  }
+
+  const handleDeselectAllNoEmailContacts = () => {
+    setSelectedNoEmailContactIds(new Set())
+  }
+
+  const handleBulkDeleteNoEmailContacts = async () => {
+    const count = selectedNoEmailContactIds.size
+    if (count === 0) {
+      toast.error('Select at least one contact to delete')
+      return
+    }
+    if (!window.confirm(`Delete ${count} contact(s) from the list? This cannot be undone.`)) {
+      return
+    }
+    try {
+      const response = await contactsAPI.bulkDelete(Array.from(selectedNoEmailContactIds))
+      const deleted = response.data?.deleted ?? count
+      setSelectedNoEmailContactIds(new Set())
+      await loadCategorizedContacts()
+      toast.success(`${deleted} contact(s) deleted`)
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to delete contacts')
+      console.error(error)
+    }
+  }
 
   const handleDelete = async (id) => {
-    if (!window.confirm('Are you sure you want to delete this contact?')) {
+    const allContacts = [
+      ...(categorizedContacts.no_emails || []),
+      ...(categorizedContacts.emails_generated || []),
+      ...(categorizedContacts.emailed || []),
+    ]
+    const contact = allContacts.find((c) => c.id === id)
+    const isEmpty = contact && !(contact.name || '').trim() && !(contact.email || '').trim()
+    const confirmMsg = isEmpty
+      ? 'This contact has no name or email yet (e.g. just added). Remove it from the list?'
+      : 'Are you sure you want to delete this contact?'
+    if (!window.confirm(confirmMsg)) {
       return
     }
     try {
@@ -234,18 +375,49 @@ function CSVManager() {
     }
   }
 
-  const handleFileUpload = async (e) => {
-    const file = e.target.files[0]
+  const processUploadFile = async (file) => {
     if (!file) return
-
+    const isCsv = file.name.toLowerCase().endsWith('.csv') || (file.type && file.type === 'text/csv')
+    if (!isCsv) {
+      toast.error('Please drop a CSV file')
+      return
+    }
     try {
       await contactsAPI.upload(file)
       await loadCategorizedContacts()
       toast.success('CSV uploaded successfully')
+      setShowUploadModal(false)
     } catch (error) {
-      toast.error('Failed to upload CSV')
+      const msg = error.response?.data?.detail || error.message || 'Failed to upload CSV'
+      toast.error(Array.isArray(msg) ? msg.join(' ') : msg)
       console.error(error)
     }
+  }
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0]
+    await processUploadFile(file)
+    e.target.value = ''
+  }
+
+  const handleDragOver = (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setDragOver(true)
+  }
+
+  const handleDragLeave = (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setDragOver(false)
+  }
+
+  const handleDrop = async (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setDragOver(false)
+    const file = e.dataTransfer.files?.[0]
+    await processUploadFile(file)
   }
 
   const handleExport = async () => {
@@ -546,16 +718,60 @@ function CSVManager() {
     } catch (e) {}
     // #endregion
     try {
+      const generatedContacts = categorizedContacts.emails_generated || []
+      const bulkDeleteOptions = {
+        selectedEmailIds: selectedGeneratedEmailIds,
+        onToggle: handleToggleGeneratedEmailSelection,
+        selectAll: handleSelectAllGenerated,
+        deselectAll: handleDeselectAllGenerated,
+      }
+      const allGeneratedEmailIds = generatedContacts.map((c) => getEmailForContact(c.id)?.id).filter(Boolean)
+      const allSelected = allGeneratedEmailIds.length > 0 && allGeneratedEmailIds.every((id) => selectedGeneratedEmailIds.has(id))
       return (
         <section className="section-emails-generated">
-          <h3>Emails Generated - Not Sent ({categorizedContacts.emails_generated?.length || 0})</h3>
+          <h3>Emails Generated - Not Sent ({generatedContacts.length})</h3>
           <p className="section-description">
-            Includes pending, accepted, and trashed emails. Click "View Email" to see the email content, then send or delete it.
+            Includes pending, accepted, and trashed emails. Select rows to delete in bulk, or click "View Email" to see content, then send or delete.
           </p>
+          <div className="bulk-actions generated-bulk-actions">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={(e) => (e.target.checked ? handleSelectAllGenerated() : handleDeselectAllGenerated())}
+                title="Select all"
+              />
+              <span>Select all</span>
+            </label>
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              onClick={handleDeselectAllGenerated}
+            >
+              Deselect all
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger btn-small"
+              onClick={handleBulkDeleteGenerated}
+              disabled={selectedGeneratedEmailIds.size === 0}
+              title={selectedGeneratedEmailIds.size === 0 ? 'Select emails to delete' : `Delete ${selectedGeneratedEmailIds.size} selected`}
+            >
+              Delete selected ({selectedGeneratedEmailIds.size})
+            </button>
+          </div>
           <div className="table-container">
             <table className="contacts-table">
               <thead>
                 <tr>
+                  <th className="th-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      onChange={(e) => (e.target.checked ? handleSelectAllGenerated() : handleDeselectAllGenerated())}
+                      title="Select all"
+                    />
+                  </th>
                   <th>Name</th>
                   <th>Company</th>
                   <th>Email</th>
@@ -564,7 +780,7 @@ function CSVManager() {
                 </tr>
               </thead>
               <tbody>
-                {renderContactTable(categorizedContacts.emails_generated || [], false, true, true)}
+                {renderContactTable(generatedContacts, false, true, true, bulkDeleteOptions)}
               </tbody>
             </table>
           </div>
@@ -586,17 +802,61 @@ function CSVManager() {
     } catch (e) {}
     // #endregion
     try {
+      const noEmailContacts = categorizedContacts.no_emails || []
+      const bulkContactOptions = {
+        selectedContactIds: selectedNoEmailContactIds,
+        onToggle: handleToggleNoEmailContactSelection,
+        selectAll: handleSelectAllNoEmailContacts,
+        deselectAll: handleDeselectAllNoEmailContacts,
+      }
+      const allNoEmailContactIds = noEmailContacts.map((c) => c.id).filter(Boolean)
+      const allNoEmailSelected = allNoEmailContactIds.length > 0 && allNoEmailContactIds.every((id) => selectedNoEmailContactIds.has(id))
       return (
         <section className="section-no-emails">
-          <h3>No Emails Generated ({categorizedContacts.no_emails?.length || 0})</h3>
+          <h3>No Emails Generated ({noEmailContacts.length})</h3>
           <p className="section-description">
             These contacts don't have generated emails yet. 
             Click "Generate Emails" in the Review Emails tab to select and generate emails for contacts.
           </p>
+          <div className="bulk-actions no-emails-bulk-actions">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={allNoEmailSelected}
+                onChange={(e) => (e.target.checked ? handleSelectAllNoEmailContacts() : handleDeselectAllNoEmailContacts())}
+                title="Select all"
+              />
+              <span>Select all</span>
+            </label>
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              onClick={handleDeselectAllNoEmailContacts}
+            >
+              Deselect all
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger btn-small"
+              onClick={handleBulkDeleteNoEmailContacts}
+              disabled={selectedNoEmailContactIds.size === 0}
+              title={selectedNoEmailContactIds.size === 0 ? 'Select contacts to delete' : `Delete ${selectedNoEmailContactIds.size} selected`}
+            >
+              Delete selected ({selectedNoEmailContactIds.size})
+            </button>
+          </div>
           <div className="table-container">
             <table className="contacts-table">
               <thead>
                 <tr>
+                  <th className="th-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={allNoEmailSelected}
+                      onChange={(e) => (e.target.checked ? handleSelectAllNoEmailContacts() : handleDeselectAllNoEmailContacts())}
+                      title="Select all"
+                    />
+                  </th>
                   <th>Name</th>
                   <th>Company</th>
                   <th>Email</th>
@@ -605,7 +865,7 @@ function CSVManager() {
                 </tr>
               </thead>
               <tbody>
-                {renderContactTable(categorizedContacts.no_emails || [], false, false, false)}
+                {renderContactTable(noEmailContacts, false, false, false, null, bulkContactOptions)}
               </tbody>
             </table>
           </div>
@@ -620,20 +880,24 @@ function CSVManager() {
     }
   }
 
-  const renderContactTable = (contacts, showTracking = false, showDeleteEmail = false, showEmailActions = false) => {
+  const renderContactTable = (contacts, showTracking = false, showDeleteEmail = false, showEmailActions = false, bulkDeleteOptions = null, bulkContactOptions = null) => {
     // #region agent log
     try {
       sendTelemetry('CSVManager.jsx:renderContactTable:start', 'Rendering contact table', { contactsCount: contacts?.length, showTracking, showDeleteEmail, showEmailActions })
     } catch (e) {}
     // #endregion
     
+    const hasCheckboxColumn = (bulkDeleteOptions != null && showEmailActions) || bulkContactOptions != null
+    const baseColSpan = showTracking ? 7 : (showDeleteEmail || showEmailActions ? 6 : 5)
+    const colSpan = hasCheckboxColumn ? baseColSpan + 1 : baseColSpan
+
     if (!contacts || !Array.isArray(contacts)) {
       // #region agent log
       sendTelemetry('CSVManager.jsx:renderContactTable:invalid', 'Invalid contacts array', { contacts })
       // #endregion
       return (
         <tr>
-          <td colSpan={5} className="empty-state">
+          <td colSpan={colSpan} className="empty-state">
             Error: Invalid contacts data
           </td>
         </tr>
@@ -647,8 +911,6 @@ function CSVManager() {
           c.email?.toLowerCase().includes(searchTerm.toLowerCase()))
         )
       : contacts
-
-    const colSpan = showTracking ? 7 : (showDeleteEmail || showEmailActions ? 6 : 5)
     
     if (filtered.length === 0) {
       return (
@@ -670,7 +932,28 @@ function CSVManager() {
       const needsFollowUpBadge = needsFollowUp(contact.id)
 
       return (
-        <tr key={contact.id}>
+        <tr key={contact.id} data-contact-id={contact.id}>
+          {hasCheckboxColumn && (
+            <td className="td-checkbox">
+              {bulkContactOptions ? (
+                <input
+                  type="checkbox"
+                  checked={bulkContactOptions.selectedContactIds.has(contact.id)}
+                  onChange={() => bulkContactOptions.onToggle(contact.id)}
+                  title="Select for bulk delete"
+                />
+              ) : email ? (
+                <input
+                  type="checkbox"
+                  checked={bulkDeleteOptions.selectedEmailIds.has(email.id)}
+                  onChange={() => bulkDeleteOptions.onToggle(email.id)}
+                  title="Select for bulk delete"
+                />
+              ) : (
+                <span className="text-muted">—</span>
+              )}
+            </td>
+          )}
           <td>
             <EditableCell
               value={contact.name}
@@ -836,23 +1119,15 @@ function CSVManager() {
   }
 
   return (
+    <>
     <div className="csv-manager">
       <div className="csv-manager-header">
         <h2>Contacts</h2>
         <div className="csv-manager-actions">
           {activeTab === 'no_emails' && (
-            <>
-              <input
-                type="file"
-                accept=".csv"
-                onChange={handleFileUpload}
-                className="input-file-hidden"
-                id="csv-upload"
-              />
-              <label htmlFor="csv-upload" className="btn btn-secondary">
-                Upload CSV
-              </label>
-            </>
+            <button type="button" className="btn btn-secondary" onClick={() => setShowUploadModal(true)}>
+              Upload CSV
+            </button>
           )}
           <button className="btn btn-secondary" onClick={handleExport}>
             Export CSV ({activeTab === 'emailed' ? 'Emailed' : 
@@ -974,31 +1249,78 @@ function CSVManager() {
                 <strong>To:</strong> {viewingEmail.contact_email}
               </div>
               <div className="email-preview-row">
-                <strong>Subject:</strong> {viewingEmail.subject}
+                <strong>Subject:</strong>{' '}
+                {viewingEmail.status === 'sent' ? (
+                  viewingEmail.subject
+                ) : (
+                  <input
+                    type="text"
+                    className="email-edit-subject"
+                    value={editingSubject}
+                    onChange={(e) => setEditingSubject(e.target.value)}
+                    placeholder="Subject"
+                  />
+                )}
               </div>
-              <div className="email-preview-body">
-                {viewingEmail.body}
+              <div className="email-preview-body-wrap">
+                {viewingEmail.status === 'sent' ? (
+                  <div className="email-preview-body">{viewingEmail.body}</div>
+                ) : (
+                  <textarea
+                    className="email-edit-body"
+                    value={editingBody}
+                    onChange={(e) => setEditingBody(e.target.value)}
+                    placeholder="Email body"
+                    rows={12}
+                  />
+                )}
               </div>
             </div>
+            {viewingEmail.status !== 'sent' && (
+              <div className="email-preview-attach">
+                <label htmlFor="attach-resume-modal">Attach resume:</label>
+                <select
+                  id="attach-resume-modal"
+                  value={attachResume}
+                  onChange={(e) => setAttachResume(e.target.value)}
+                  className="attach-resume-select"
+                >
+                  <option value="none">None</option>
+                  <option value="resume28.pdf">2028 resume</option>
+                  <option value="resume29.pdf">2029 resume</option>
+                </select>
+              </div>
+            )}
             <div className="settings-actions">
-              <button 
-                className="btn btn-success" 
-                onClick={() => handleSendEmail(viewingEmail.id)}
-                disabled={sendingEmail}
-              >
-                {sendingEmail ? 'Sending...' : 'Send Email'}
-              </button>
-              <button 
-                className="btn btn-danger" 
+              {viewingEmail.status !== 'sent' && (
+                <button
+                  className="btn btn-primary"
+                  onClick={handleSaveEmailEdit}
+                  disabled={savingEmail}
+                >
+                  {savingEmail ? 'Saving...' : 'Save changes'}
+                </button>
+              )}
+              {viewingEmail.status !== 'sent' && (
+                <button
+                  className="btn btn-success"
+                  onClick={() => handleSendEmail(viewingEmail.id, attachResume)}
+                  disabled={sendingEmail}
+                >
+                  {sendingEmail ? 'Sending...' : 'Send Email'}
+                </button>
+              )}
+              <button
+                className="btn btn-danger"
                 onClick={() => handleDeleteEmail(viewingEmail.contact_id)}
                 disabled={sendingEmail}
               >
                 Delete Email
               </button>
-              <button 
-                className="btn btn-secondary" 
+              <button
+                className="btn btn-secondary"
                 onClick={() => setViewingEmail(null)}
-                disabled={sendingEmail}
+                disabled={sendingEmail || savingEmail}
               >
                 Close
               </button>
@@ -1007,6 +1329,52 @@ function CSVManager() {
         </div>
       )}
     </div>
+
+    {showUploadModal && (
+      <div
+        className="upload-modal-overlay"
+        onClick={() => setShowUploadModal(false)}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="upload-modal-title"
+      >
+        <div className="upload-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="upload-modal-header">
+            <h3 id="upload-modal-title">Upload CSV</h3>
+            <button
+              type="button"
+              className="upload-modal-close"
+              onClick={() => setShowUploadModal(false)}
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <div
+            className={`csv-drop-zone csv-drop-zone-modal ${dragOver ? 'drag-over' : ''}`}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+          >
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              onChange={handleFileUpload}
+              className="input-file-hidden"
+              id="csv-upload-modal"
+            />
+            <p className="csv-drop-zone-prompt">
+              {dragOver ? 'Drop CSV here' : 'Drag and drop your CSV file here'}
+            </p>
+            <p className="csv-drop-zone-or">or</p>
+            <label htmlFor="csv-upload-modal" className="btn btn-primary csv-drop-zone-browse">
+              Find in your files
+            </label>
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   )
 }
 

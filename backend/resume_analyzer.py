@@ -1,6 +1,8 @@
 """Extract relevant background information from resume based on company context"""
 from typing import Optional
 import os
+import json
+import time
 from pypdf import PdfReader
 
 
@@ -15,6 +17,16 @@ class ResumeAnalyzer:
         """Load and extract text from resume PDF"""
         if self._resume_text:
             return self._resume_text
+        
+        # #region agent log
+        try:
+            _abs = os.path.abspath(self.resume_path)
+            _exists = os.path.exists(self.resume_path)
+            with open("/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug-6c4284.log", "a") as _f:
+                _f.write(json.dumps({"sessionId": "6c4284", "timestamp": int(time.time() * 1000), "location": "resume_analyzer.py:_load_resume", "message": "Resume path check", "data": {"resume_path": self.resume_path, "abspath": _abs, "cwd": os.getcwd(), "exists": _exists}, "runId": "startup", "hypothesisId": "rh1"}) + "\n")
+        except Exception:
+            pass
+        # #endregion
         
         if not os.path.exists(self.resume_path):
             return ""
@@ -35,7 +47,7 @@ class ResumeAnalyzer:
         """
         resume_text = self._load_resume()
         if not resume_text:
-            return "Computer Science student with experience in Python, React, and AI/ML"
+            return "Computer Science student with experience in Python and AI/ML"
         
         # Extract specific experiences and skills
         background_parts = []

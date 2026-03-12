@@ -63,9 +63,13 @@ function App() {
         </nav>
       </aside>
       <main className="app-main">
-        <div key={activeTab} className="app-main-content">
-          {activeTab === 'contacts' && <CSVManager />}
-          {activeTab === 'review' && <EmailReview />}
+        <div className="app-main-content">
+          <div className={`tab-pane ${activeTab === 'contacts' ? 'tab-pane-active' : ''}`}>
+            <CSVManager />
+          </div>
+          <div className={`tab-pane ${activeTab === 'review' ? 'tab-pane-active' : ''}`}>
+            <EmailReview />
+          </div>
         </div>
       </main>
     </div>

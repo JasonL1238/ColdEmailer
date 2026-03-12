@@ -18,6 +18,8 @@ function EmailReview() {
   const [userBackground, setUserBackground] = useState(localStorage.getItem('userBackground') || '')
   const [userEmail, setUserEmail] = useState(localStorage.getItem('userEmail') || 'jason.ye.li.7@gmail.com')
   const [resumePath, setResumePath] = useState(localStorage.getItem('resumePath') || '')
+  const [attachResume, setAttachResume] = useState('resume28.pdf') // default 2028 resume; 'none' | 'resume28.pdf' | 'resume29.pdf'
+  const [useTemplateOnly, setUseTemplateOnly] = useState(false)
 
   useEffect(() => {
     loadEmails()
@@ -50,8 +52,11 @@ function EmailReview() {
       const response = await contactsAPI.getCategorized()
       const noEmailsContacts = response.data.no_emails || []
       setAvailableContacts(noEmailsContacts)
-      // Select all contacts by default
-      setSelectedContactIds(new Set(noEmailsContacts.map(c => c.id)))
+      // Auto-select up to the max allowed by rate limits
+      const perMinute = usageStats?.generations_per_minute ?? 15
+      const remainingDaily = usageStats?.remaining_generations ?? 500
+      const maxToSelect = Math.max(1, Math.min(noEmailsContacts.length, perMinute, remainingDaily))
+      setSelectedContactIds(new Set(noEmailsContacts.slice(0, maxToSelect).map(c => c.id)))
       setShowContactSelection(true)
     } catch (error) {
       toast.error('Failed to load contacts')
@@ -93,13 +98,19 @@ function EmailReview() {
       const contactIdsArray = Array.from(selectedContactIds)
       const response = await emailAPI.generate(
         contactIdsArray,
-        userName || undefined, 
+        userName || undefined,
         userBackground || undefined,
-        userEmail || undefined
+        userEmail || undefined,
+        useTemplateOnly
       )
       setEmails(response.data)
       setCurrentIndex(0)
       toast.success(`Generated ${response.data.length} emails`)
+      const usedFallback = response.data.some((e) => e.used_template_fallback && e.fallback_reason === 'llm_unavailable')
+      if (usedFallback) {
+        toast('AI quota exceeded or unavailable. Emails used the template. Use "Use template only" to skip API calls.', { icon: 'ℹ️', duration: 6000 })
+      }
+      window.dispatchEvent(new CustomEvent('contacts-refresh'))
       await loadUsageStats()
     } catch (error) {
       const message = error.response?.data?.detail || 'Failed to generate emails'
@@ -125,6 +136,15 @@ function EmailReview() {
     }
   }
 
+  const handleDisconnectGmail = async () => {
+    try {
+      const res = await emailAPI.disconnectGmail()
+      toast.success(res.data?.message || 'Gmail disconnected. Next time you send, your browser will open to sign in again.')
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Failed to disconnect Gmail')
+    }
+  }
+
   const handleAccept = async (emailId) => {
     try {
       // First accept the email
@@ -132,7 +152,8 @@ function EmailReview() {
       
       // Then automatically send it
       setSending(true)
-      const response = await emailAPI.send([emailId])
+      const resumeFile = attachResume === 'none' ? null : attachResume
+      const response = await emailAPI.send([emailId], resumeFile, userEmail || undefined)
       toast.success('Email accepted and sent!')
       await loadEmails()
       await loadUsageStats()
@@ -155,25 +176,42 @@ function EmailReview() {
   }
 
   const handleSendAll = async () => {
-    const acceptedEmails = emails.filter((e) => e.status === 'accepted')
-    if (acceptedEmails.length === 0) {
-      toast.error('No accepted emails to send')
+    const sendableEmails = emails.filter((e) => e.status === 'accepted' || e.status === 'pending')
+    if (sendableEmails.length === 0) {
+      toast.error('No emails to send (accept or send from generated)')
       return
     }
 
-    if (!window.confirm(`Send ${acceptedEmails.length} emails?`)) {
+    if (!window.confirm(`Send ${sendableEmails.length} emails?`)) {
       return
     }
 
     try {
       setSending(true)
-      const emailIds = acceptedEmails.map((e) => e.id)
-      const response = await emailAPI.send(emailIds)
+      const emailIds = sendableEmails.map((e) => e.id)
+      const resumeFile = attachResume === 'none' ? null : attachResume
+      const response = await emailAPI.send(emailIds, resumeFile, userEmail || undefined)
       toast.success(`Sent ${response.data.sent} emails`)
       await loadEmails()
       await loadUsageStats()
     } catch (error) {
       const message = error.response?.data?.detail || 'Failed to send emails'
+      toast.error(message)
+    } finally {
+      setSending(false)
+    }
+  }
+
+  const handleSendOne = async (emailId) => {
+    try {
+      setSending(true)
+      const resumeFile = attachResume === 'none' ? null : attachResume
+      const response = await emailAPI.send([emailId], resumeFile, userEmail || undefined)
+      toast.success(response.data.sent ? 'Email sent' : 'Failed to send')
+      await loadEmails()
+      await loadUsageStats()
+    } catch (error) {
+      const message = error.response?.data?.detail || 'Failed to send email'
       toast.error(message)
     } finally {
       setSending(false)
@@ -229,6 +267,9 @@ function EmailReview() {
           {usageStats && (
             <div className="usage-stats">
               <span>Sent today: {usageStats.emails_sent_today}/{usageStats.daily_limit}</span>
+              <span className="usage-stats-ai" title="Gemini free tier limits (see Google docs for current values)">
+                AI: ~{usageStats.generations_per_minute ?? 15}/min, ~{usageStats.remaining_generations ?? '—'}/day left
+              </span>
             </div>
           )}
           <button
@@ -244,12 +285,25 @@ function EmailReview() {
           >
             Generate More
           </button>
+          <span className="attach-resume-wrap">
+            <label htmlFor="attach-resume-review">Attach resume:</label>
+            <select
+              id="attach-resume-review"
+              value={attachResume}
+              onChange={(e) => setAttachResume(e.target.value)}
+              className="attach-resume-select"
+            >
+              <option value="none">None</option>
+              <option value="resume28.pdf">2028 resume</option>
+              <option value="resume29.pdf">2029 resume</option>
+            </select>
+          </span>
           <button
             className="btn btn-success"
             onClick={handleSendAll}
-            disabled={sending || emails.filter((e) => e.status === 'accepted').length === 0}
+            disabled={sending || emails.filter((e) => e.status === 'accepted' || e.status === 'pending').length === 0}
           >
-            {sending ? 'Sending...' : 'Send All Accepted'}
+            {sending ? 'Sending...' : 'Send All'}
           </button>
         </div>
       </div>
@@ -304,6 +358,14 @@ function EmailReview() {
               )}
             </div>
             <div className="settings-actions">
+              <label className="use-template-only-wrap" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.75rem' }}>
+                <input
+                  type="checkbox"
+                  checked={useTemplateOnly}
+                  onChange={(e) => setUseTemplateOnly(e.target.checked)}
+                />
+                <span>Use template only (no AI, no API calls)</span>
+              </label>
               <button 
                 className="btn btn-primary" 
                 onClick={handleGenerate}
@@ -374,6 +436,9 @@ function EmailReview() {
                 <button className="btn btn-secondary" onClick={() => setShowSettings(false)}>
                   Cancel
                 </button>
+                <button type="button" className="btn btn-secondary" onClick={handleDisconnectGmail} title="Remove saved sign-in so next send opens browser to sign in again">
+                  Reconnect Gmail
+                </button>
               </div>
             </div>
           </div>
@@ -433,6 +498,16 @@ function EmailReview() {
               >
                 Trash (T)
               </button>
+              {(currentEmail.status === 'pending' || currentEmail.status === 'accepted') && (
+                <button
+                  type="button"
+                  className="btn btn-success"
+                  onClick={() => handleSendOne(currentEmail.id)}
+                  disabled={sending}
+                >
+                  {sending ? 'Sending...' : 'Send'}
+                </button>
+              )}
               <button
                 type="button"
                 className="btn btn-success"

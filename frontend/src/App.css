@@ -117,10 +117,16 @@
   margin: 0 auto;
 }
 
-/* Slight content fade when switching views */
-.app-main-content {
+/* Tab panes: keep both mounted so generation continues when switching tabs */
+.tab-pane {
+  display: none;
+}
+
+.tab-pane.tab-pane-active {
+  display: block;
   animation: contentFadeIn 0.3s var(--ease-out-smooth);
 }
+
 
 @keyframes contentFadeIn {
   from {

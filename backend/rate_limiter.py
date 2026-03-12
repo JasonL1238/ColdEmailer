@@ -13,6 +13,7 @@ class RateLimiter:
         self.emails_sent = []  # Timestamps
         self.daily_limits = {
             'emails_per_day': int(os.getenv('MAX_EMAILS_PER_DAY', 50)),
+            'generations_per_day': int(os.getenv('MAX_EMAIL_GENERATIONS_PER_DAY', 500)),
             'generations_per_minute': int(os.getenv('MAX_EMAIL_GENERATIONS_PER_MINUTE', 10)),
             'researches_per_minute': int(os.getenv('MAX_COMPANY_RESEARCH_PER_MINUTE', 5)),
         }
@@ -20,17 +21,14 @@ class RateLimiter:
     def can_generate_email(self) -> tuple[bool, str]:
         """Check if we can generate an email"""
         now = datetime.now()
-        
         # Check per-minute limit
         recent = [t for t in self.email_generations if (now - t).total_seconds() < 60]
         if len(recent) >= self.daily_limits['generations_per_minute']:
             return False, f"Rate limit: Max {self.daily_limits['generations_per_minute']} generations per minute"
-        
         # Check daily limit
         today = [t for t in self.email_generations if (now - t).days < 1]
-        if len(today) >= self.daily_limits['emails_per_day']:
-            return False, f"Daily limit: Max {self.daily_limits['emails_per_day']} emails per day"
-        
+        if len(today) >= self.daily_limits['generations_per_day']:
+            return False, f"Daily limit: Max {self.daily_limits['generations_per_day']} email generations per day"
         return True, ""
     
     def record_email_generation(self):
@@ -75,10 +73,17 @@ class RateLimiter:
         emails_sent_today = len([t for t in self.emails_sent if (now - t).days < 1])
         researches_today = len([t for t in self.company_researches if (now - t).days < 1])
         
+        generations_per_minute = self.daily_limits['generations_per_minute']
+        recent_generations = len([t for t in self.email_generations if (now - t).total_seconds() < 60])
+
         return {
             'emails_generated_today': emails_generated_today,
             'emails_sent_today': emails_sent_today,
             'company_researches_today': researches_today,
             'daily_limit': self.daily_limits['emails_per_day'],
-            'remaining_emails': max(0, self.daily_limits['emails_per_day'] - emails_sent_today)
+            'remaining_emails': max(0, self.daily_limits['emails_per_day'] - emails_sent_today),
+            'generations_daily_limit': self.daily_limits['generations_per_day'],
+            'remaining_generations': max(0, self.daily_limits['generations_per_day'] - emails_generated_today),
+            'generations_per_minute': generations_per_minute,
+            'remaining_generations_this_minute': max(0, generations_per_minute - recent_generations),
         }

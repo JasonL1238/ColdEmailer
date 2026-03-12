@@ -1,1 +1,20 @@
-
+id,name,company,email,status
+25563ae4-7bb7-42a9-bb4d-6f416abe556c,Ray,Dispatch Bio,ray@dispatchbio.com,trashed
+f15b4a2a-ffd0-408b-a762-24f64cc6faa3,Charlie,Burro,charlie@agrbt.com,trashed
+1cf704ca-cbcc-4148-a6d1-3dd53f946cf1,Neuralert Team,Neuralert,info@neuralert.co,trashed
+fc7023d3-f1c9-4755-ad7e-c2aeca5e6dd5,Mariana,Biobot,mariana@biobot.io,trashed
+956b0360-5e20-48af-9725-bb89ef3754e8,Newsha,Biobot,newsha@biobot.io,trashed
+ce7830bc-3b33-475e-a72d-7e80c9120f2a,AltruMed Team,AltruMed,hello@altru-med.com,trashed
+fc2cbc0d-eacd-43fc-90ea-b55c45e55a62,David,Cogwear,david@cogweartech.com,trashed
+f12e01a3-bc7d-4301-b1c9-560cf2b77eb5,Samuel,Fort Robotics,samuel@fortrobotics.com,trashed
+1ac8eec4-3b49-472a-9389-8cb71aa4091d,Nathan,Fort Robotics,nathan@fortrobotics.com,trashed
+e2de69e1-21fb-479e-a370-d2b4fc94ed89,Steven,Treeswift,steven@treeswift.com,trashed
+bbe80f1f-642a-4cb9-86a4-574c190c0004,Bria,EVBots,brian@evbot.com,trashed
+f4c4007b-8675-490a-a1d7-318e7e8b2f2a,Joseph,Infinite Machine,joseph@infinitemachine.com,trashed
+6a0acec8-d049-4bdd-875f-d8995ccd54e1,Ethan,Allium,ethan@allium.so,trashed
+6dd8b7f7-eff0-46fe-afea-abbb84e753fd,Sam,Claim,sam@claim.co,trashed
+18ccdbfe-d2e4-4fb7-aaba-b88db8cdf178,Ajay,Nala Robotics,ajay@nalarobotics.com,trashed
+7a257159-05a3-4af7-8631-5f67d49f03c9,Matt,ClearCOGS,matt@clearcogs.com,pending
+29dc3ac3-f818-4bce-bead-f7157cf8ca8d,Ada,Uptake,mcelhinney@uptake.com,pending
+d086d5a1-1150-44da-8aed-5f458720a51f,Erhan,Logiwa,erhanm@logiwa.com,pending
+ff27d094-740c-4903-9805-b9e712cfacb6,Path Test,Path Co,path@test.com,pending

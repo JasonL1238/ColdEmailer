@@ -6,6 +6,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -226,7 +227,20 @@ class EmailSender:
                         f.write(json.dumps(log_data3) + '\n')
                 except: pass
                 # #endregion
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except (RefreshError, Exception) as e:
+                    if "invalid_grant" in str(e).lower():
+                        try:
+                            if os.path.exists(self.token_path):
+                                os.remove(self.token_path)
+                        except OSError:
+                            pass
+                        raise RuntimeError(
+                            "Gmail sign-in expired. The saved token was removed. "
+                            "Try sending again; your browser will open to sign in to Google."
+                        ) from e
+                    raise
             else:
                 # #region agent log
                 log_data4 = {
@@ -279,7 +293,19 @@ class EmailSender:
         
         self.service = build('gmail', 'v1', credentials=creds)
         return self.service
-    
+
+    def disconnect(self) -> bool:
+        """Remove saved token and clear service so next send triggers OAuth. Returns True if token was removed."""
+        removed = False
+        if os.path.exists(self.token_path):
+            try:
+                os.remove(self.token_path)
+                removed = True
+            except OSError:
+                pass
+        self.service = None
+        return removed
+
     def send_email(self, email: GeneratedEmail, from_email: str, resume_path: Optional[str] = None) -> Dict[str, any]:
         """
         Send a single email via Gmail API with optional resume attachment.
@@ -317,7 +343,9 @@ class EmailSender:
             message = MIMEMultipart()
             message['to'] = email.contact_email
             message['subject'] = email.subject
-            
+            if from_email and from_email != 'me' and '@' in str(from_email):
+                message['From'] = from_email
+
             # Convert plain text to HTML with proper formatting
             # Replace newlines with <br> and wrap in proper HTML structure
             # Split body into paragraphs (double newlines) for better formatting
@@ -365,10 +393,12 @@ class EmailSender:
 </body>
 </html>"""
             
-            # Create both plain text and HTML versions
-            message.attach(MIMEText(email.body, 'plain'))
-            message.attach(MIMEText(html_body, 'html'))
-            
+            # Plain and HTML as multipart/alternative so the client shows only one (no duplicate body)
+            alternative = MIMEMultipart('alternative')
+            alternative.attach(MIMEText(email.body, 'plain'))
+            alternative.attach(MIMEText(html_body, 'html'))
+            message.attach(alternative)
+
             # Attach resume if provided and file exists
             if resume_path and os.path.exists(resume_path):
                 try:

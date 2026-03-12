@@ -8,6 +8,8 @@ beautifulsoup4==4.12.2
 requests==2.31.0
 trafilatura==1.6.3
 ollama==0.1.7
+openai>=1.0.0
+google-generativeai>=0.8.0
 duckduckgo-search==4.1.1
 google-api-python-client==2.108.0
 google-auth-httplib2==0.1.1

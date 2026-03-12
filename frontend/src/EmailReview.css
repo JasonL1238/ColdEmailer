@@ -27,6 +27,27 @@
   display: flex;
   gap: var(--space-2);
   align-items: center;
+  flex-wrap: wrap;
+}
+
+.attach-resume-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.attach-resume-wrap label {
+  font-size: var(--text-small);
+  color: var(--text-muted);
+}
+
+.attach-resume-select {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-small);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
 }
 
 .usage-stats {
@@ -35,6 +56,13 @@
   color: var(--text-muted);
   background: var(--bg-elevated);
   border-radius: var(--radius-pill);
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.usage-stats-ai {
+  color: var(--text-muted);
 }
 
 .email-review-content {

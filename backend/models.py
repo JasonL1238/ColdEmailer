@@ -9,6 +9,7 @@ class Contact(BaseModel):
     company: str = ""  # Allow empty for initial creation
     email: str = ""  # Allow empty for initial creation, validate later
     status: Optional[str] = "pending"  # pending, trashed, sent
+    role: Optional[str] = None  # Recipient role/title for personalization
 
 
 class CompanyMetadata(BaseModel):
@@ -19,6 +20,7 @@ class CompanyMetadata(BaseModel):
     product: Optional[str] = None
     why_engineers_care: Optional[str] = None
     hook_sentence: Optional[str] = None
+    recent_news: Optional[str] = None  # Recent launch, feature, or news
     confidence_score: Optional[float] = None
     cached_at: Optional[datetime] = None
 
@@ -41,6 +43,8 @@ class GeneratedEmail(BaseModel):
     is_follow_up: bool = False  # Whether this is a follow-up email
     follow_up_generated_at: Optional[datetime] = None  # When follow-up was generated
     follow_up_sent_at: Optional[datetime] = None  # When follow-up was sent (None if not sent yet)
+    used_template_fallback: Optional[bool] = None  # True if template was used (AI skipped or failed)
+    fallback_reason: Optional[str] = None  # "user_requested" | "llm_unavailable" (quota/error)
 
 
 class EmailGenerationRequest(BaseModel):
@@ -48,9 +52,21 @@ class EmailGenerationRequest(BaseModel):
     user_name: Optional[str] = None  # Your name for email signature
     user_background: Optional[str] = None  # Your background/qualifications
     user_email: Optional[str] = None  # Your email address
+    use_template_only: Optional[bool] = False  # Skip AI; generate with template only (no API calls)
 
 
 class EmailSendRequest(BaseModel):
+    email_ids: List[str]
+    attach_resume: Optional[str] = None  # e.g. "resume28.pdf", "resume29.pdf"; None = no attachment
+    from_email: Optional[str] = None  # User's email for From header (from settings)
+
+
+class EmailUpdateRequest(BaseModel):
+    subject: Optional[str] = None
+    body: Optional[str] = None
+
+
+class EmailBulkDeleteRequest(BaseModel):
     email_ids: List[str]
 
 
@@ -60,3 +76,7 @@ class UsageStats(BaseModel):
     company_researches_today: int
     daily_limit: int
     remaining_emails: int
+    generations_daily_limit: int = 500
+    remaining_generations: int = 500
+    generations_per_minute: int = 15
+    remaining_generations_this_minute: int = 15

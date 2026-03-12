@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import List, Optional
@@ -9,9 +9,18 @@ import time
 import asyncio
 from dotenv import load_dotenv
 
+# #region agent log
+def _dlog(location: str, message: str, data: dict, hypothesis_id: str = "H1"):
+    try:
+        with open("/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug-6c4284.log", "a") as f:
+            f.write(__import__("json").dumps({"sessionId": "6c4284", "timestamp": int(time.time() * 1000), "location": location, "message": message, "data": data, "runId": "startup", "hypothesisId": hypothesis_id}) + "\n")
+    except Exception:
+        pass
+# #endregion
+
 from models import (
     Contact, CompanyMetadata, GeneratedEmail, 
-    EmailGenerationRequest, EmailSendRequest, UsageStats
+    EmailGenerationRequest, EmailSendRequest, EmailUpdateRequest, EmailBulkDeleteRequest, UsageStats
 )
 from csv_processor import CSVProcessor
 from company_enrichment_service import CompanyEnrichmentService
@@ -22,6 +31,22 @@ from email_storage import EmailStorage
 from response_checker import ResponseChecker
 
 load_dotenv()
+# Load project-root .env when running from backend/ (e.g. start.sh does cd backend)
+_project_root_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.isfile(_project_root_env):
+    load_dotenv(_project_root_env)
+
+# #region agent log
+def _mask_key(k: str) -> str:
+    return (k[-4:] if k and len(k) >= 4 else "n/a")
+_dlog("main.py:after_imports", "All imports and load_dotenv done", {
+    "cwd": os.getcwd(),
+    "project_root_env": _project_root_env,
+    "project_root_env_exists": os.path.isfile(_project_root_env),
+    "GOOGLE_AI_API_KEY_last4": _mask_key(os.getenv("GOOGLE_AI_API_KEY", "")),
+    "EMAIL_LLM_PROVIDER": os.getenv("EMAIL_LLM_PROVIDER"),
+}, "H1")
+# #endregion
 
 # #region agent log
 import json
@@ -33,6 +58,9 @@ except: pass
 
 app = FastAPI(title="AI Cold Emailer API")
 
+# #region agent log
+_dlog("main.py:after_app", "FastAPI app created", {}, "H1")
+# #endregion
 # #region agent log
 import json
 try:
@@ -73,18 +101,50 @@ app.add_middleware(
 )
 
 # Initialize services
+# #region agent log
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_resume_env = os.getenv('RESUME_PATH', 'resume.pdf')
+_resume_candidate = _resume_env if os.path.isabs(_resume_env) else os.path.join(_project_root, _resume_env)
+if not os.path.exists(_resume_candidate):
+    for fallback in ("resume28.pdf", "resume29.pdf"):
+        _alt = os.path.join(_project_root, fallback)
+        if os.path.exists(_alt):
+            _resume_candidate = _alt
+            break
+_resume_for_generator = _resume_candidate
+_dlog("main.py:resume_check", "Resume path resolution", {"cwd": os.getcwd(), "project_root": _project_root, "RESUME_PATH_env": _resume_env, "resume_path_used": _resume_for_generator, "exists": os.path.exists(_resume_for_generator), "email_generator_gets_default": False}, "rh1")
+# #endregion
+project_root = _project_root
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+_csv_env = os.getenv('CSV_FILE_PATH')
+if _csv_env and os.path.isabs(_csv_env):
+    _csv_path = _csv_env
+elif _csv_env:
+    _csv_path = os.path.normpath(os.path.join(_project_root, _csv_env))
+else:
+    _csv_path = os.path.join(_backend_dir, 'data', 'contacts.csv')
 csv_processor = CSVProcessor(
-    csv_path=os.getenv('CSV_FILE_PATH', 'data/contacts.csv')
+    csv_path=_csv_path
 )
+# #region agent log
+_dlog("main.py:after_csv_processor", "CSVProcessor initialized", {}, "H2")
+# #endregion
 enrichment_service = CompanyEnrichmentService(
     cache_path=os.getenv('COMPANY_CACHE_PATH', 'data/company_cache.json')
 )
+# #region agent log
+_dlog("main.py:after_enrichment_service", "CompanyEnrichmentService initialized", {}, "H2")
+# #endregion
 email_generator = EmailGenerator(
     model=os.getenv('OLLAMA_MODEL', 'llama3.2'),
-    base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
+    base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434'),
+    resume_path=_resume_for_generator
 )
-# Get project root (parent of backend directory)
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Cloud LLM (OpenRouter/OpenAI/Gemini) is configured via env: EMAIL_LLM_PROVIDER, EMAIL_LLM_MODEL, and the corresponding API key. Keys are never logged or sent to the frontend.
+# #region agent log
+_dlog("main.py:after_email_generator", "EmailGenerator initialized", {"resume_path": _resume_for_generator}, "H2")
+# #endregion
+# Get project root (parent of backend directory) - use project_root set above
 credentials_path = os.getenv('CREDENTIALS_JSON_PATH') or os.path.join(project_root, 'credentials.json')
 token_path = os.getenv('TOKEN_JSON_PATH') or os.path.join(project_root, 'token.json')
 # #region agent log
@@ -114,12 +174,19 @@ try:
 except: pass
 # #endregion
 email_sender = EmailSender(credentials_path=credentials_path, token_path=token_path, project_root=project_root)
+# #region agent log
+_dlog("main.py:after_email_sender", "EmailSender initialized", {}, "H2")
+# #endregion
 rate_limiter = RateLimiter()
 
 # Persistent storage for generated emails
 email_storage = EmailStorage(
     storage_path=os.getenv('EMAIL_STORAGE_PATH', 'data/generated_emails.json')
 )
+
+# #region agent log
+_dlog("main.py:startup_complete", "All services initialized, module load done", {}, "H3")
+# #endregion
 
 
 # Contact endpoints
@@ -135,62 +202,8 @@ async def get_contacts(status: Optional[str] = None):
 @app.post("/api/contacts", response_model=Contact)
 async def create_contact(contact: Contact):
     """Create a new contact"""
-    # #region agent log
-    import json
-    import time
-    log_data = {
-        "location": "main.py:create_contact:start",
-        "message": "Create contact endpoint called",
-        "data": {
-            "contact_data": contact.model_dump() if hasattr(contact, 'model_dump') else str(contact),
-        },
-        "timestamp": int(time.time() * 1000),
-        "runId": "add-contact",
-        "hypothesisId": "F"
-    }
-    try:
-        with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-            f.write(json.dumps(log_data) + '\n')
-    except: pass
-    # #endregion
-    try:
-        result = csv_processor.add_contact(contact)
-        # #region agent log
-        log_data2 = {
-            "location": "main.py:create_contact:success",
-            "message": "Contact created successfully",
-            "data": {
-                "contact_id": result.id if result else None,
-            },
-            "timestamp": int(time.time() * 1000),
-            "runId": "add-contact",
-            "hypothesisId": "G"
-        }
-        try:
-            with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_data2) + '\n')
-        except: pass
-        # #endregion
-        return result
-    except Exception as e:
-        # #region agent log
-        log_data3 = {
-            "location": "main.py:create_contact:error",
-            "message": "Contact creation failed",
-            "data": {
-                "error": str(e),
-                "error_type": type(e).__name__,
-            },
-            "timestamp": int(time.time() * 1000),
-            "runId": "add-contact",
-            "hypothesisId": "H"
-        }
-        try:
-            with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_data3) + '\n')
-        except: pass
-        # #endregion
-        raise
+    _dlog("main.py:create_contact", "API create contact", {"contact_id": contact.id, "name": getattr(contact, "name", "")}, "H3")
+    return csv_processor.add_contact(contact)
 
 
 @app.put("/api/contacts/{contact_id}", response_model=Contact)
@@ -205,6 +218,7 @@ async def update_contact(contact_id: str, updates: dict):
 @app.delete("/api/contacts/{contact_id}")
 async def delete_contact(contact_id: str):
     """Delete a contact"""
+    _dlog("main.py:delete_contact", "API delete contact", {"contact_id": contact_id}, "H2")
     # #region agent log
     import json
     try:
@@ -225,12 +239,15 @@ async def delete_contact(contact_id: str):
     return {"success": True}
 
 
-@app.delete("/api/contacts/bulk")
-async def bulk_delete_contacts(contact_ids: List[str]):
-    """Bulk delete contacts"""
+@app.post("/api/contacts/bulk-delete")
+async def bulk_delete_contacts(contact_ids: List[str] = Body(..., embed=False)):
+    """Bulk delete contacts. Body: JSON array of contact IDs."""
+    _dlog("main.py:bulk_delete_contacts", "API bulk delete", {"contact_ids": contact_ids}, "H2")
+    deleted = 0
     for contact_id in contact_ids:
-        csv_processor.delete_contact(contact_id)
-    return {"success": True, "deleted": len(contact_ids)}
+        if csv_processor.delete_contact(contact_id):
+            deleted += 1
+    return {"success": True, "deleted": deleted}
 
 
 @app.put("/api/contacts/bulk")
@@ -252,27 +269,83 @@ async def save_contacts():
     return {"success": True, "message": "Contacts saved"}
 
 
+def _safe_str(val, default: str = "") -> str:
+    """Coerce value to string and strip; use default for NaN/None."""
+    if val is None:
+        return default
+    try:
+        s = str(val).strip()
+        if s.lower() == "nan":
+            return default
+        return s or default
+    except Exception:
+        return default
+
+
 @app.post("/api/upload")
 async def upload_csv(file: UploadFile = File(...)):
-    """Upload CSV file to replace or merge contacts"""
+    """Upload CSV to add contacts; merges with existing. Duplicates (by email) are skipped. Required columns: name, company, email."""
     import pandas as pd
     import io
-    
-    contents = await file.read()
-    df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-    
-    contacts = []
-    for _, row in df.iterrows():
-        contact = Contact(
-            name=str(row['name']),
-            company=str(row['company']),
-            email=str(row['email']),
-            status=str(row.get('status', 'pending'))
+    import uuid
+
+    try:
+        contents = await file.read()
+        text = contents.decode('utf-8-sig').strip()  # utf-8-sig strips BOM from Excel/Sheets
+        df = pd.read_csv(io.StringIO(text))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {str(e)}")
+
+    if df.empty or len(df.columns) == 0:
+        raise HTTPException(status_code=400, detail="CSV has no columns. Add a header row with: name, company, email")
+
+    # Normalize column names: strip whitespace, lowercase; dedupe by keeping first
+    raw_cols = [str(c).strip().lower() for c in df.columns]
+    seen = set()
+    unique_cols = []
+    for c in raw_cols:
+        if c not in seen:
+            seen.add(c)
+            unique_cols.append(c)
+    df.columns = unique_cols
+
+    required = {'name', 'company', 'email'}
+    missing = required - set(df.columns)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV is missing required column(s): {', '.join(sorted(missing))}. Required: name, company, email (header row must match)."
         )
-        contacts.append(contact)
-    
-    csv_processor.write_contacts(contacts)
-    return {"success": True, "count": len(contacts)}
+
+    try:
+        existing = csv_processor.read_contacts()
+        seen_emails = {(c.email or "").strip().lower() for c in existing if (c.email or "").strip()}
+        merged = list(existing)
+
+        for _, row in df.iterrows():
+            email_val = _safe_str(row.get("email"))
+            email_norm = email_val.strip().lower() if email_val else ""
+            if not email_norm:
+                continue  # skip rows with no email to avoid duplicate blank entries
+            if email_norm in seen_emails:
+                continue  # skip duplicate (includes contacts already in emailed)
+            contact = Contact(
+                id=str(uuid.uuid4()),
+                name=_safe_str(row.get("name")),
+                company=_safe_str(row.get("company")),
+                email=email_val,
+                status=_safe_str(row.get("status"), "pending") or "pending",
+            )
+            merged.append(contact)
+            seen_emails.add(email_norm)
+
+        csv_processor.write_contacts(merged)
+        added = len(merged) - len(existing)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+    return {"success": True, "count": len(merged), "added": added}
 
 
 @app.get("/api/contacts/export")
@@ -398,11 +471,12 @@ async def generate_emails(request: EmailGenerationRequest):
         
         # Generate email
         email = email_generator.generate(
-            contact, 
+            contact,
             metadata,
             user_name=request.user_name,
             user_background=request.user_background,
-            user_email=request.user_email
+            user_email=request.user_email,
+            use_template_only=request.use_template_only or False,
         )
         email_storage.save(email)
         generated.append(email)
@@ -439,6 +513,22 @@ async def update_email_status(email_id: str, status: str = Query(...)):
     return {"success": True}
 
 
+@app.patch("/api/emails/{email_id}")
+async def update_email_content(email_id: str, payload: EmailUpdateRequest):
+    """Update email subject and/or body (for generated, not-yet-sent emails)."""
+    email = email_storage.get(email_id)
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+    if email.status == "sent":
+        raise HTTPException(status_code=400, detail="Cannot edit an email that has already been sent")
+    if payload.subject is not None:
+        email.subject = payload.subject
+    if payload.body is not None:
+        email.body = payload.body
+    email_storage.save(email)
+    return {"success": True, "email": email}
+
+
 @app.delete("/api/emails/{email_id}")
 async def delete_email(email_id: str):
     """Delete an email (removes email, contact moves to 'no emails' section)"""
@@ -452,24 +542,47 @@ async def delete_email(email_id: str):
     return {"success": True, "message": "Email deleted. Contact moved to 'no emails' section."}
 
 
+@app.post("/api/emails/bulk-delete")
+async def bulk_delete_emails(request: EmailBulkDeleteRequest):
+    """Delete multiple generated (not sent) emails. Contacts move to 'no emails' section."""
+    deleted = 0
+    for email_id in request.email_ids:
+        email = email_storage.get(email_id)
+        if email:
+            email_storage.delete(email_id)
+            deleted += 1
+    return {"success": True, "deleted": deleted}
+
+
+# Allowed resume filenames for attachment (must exist in project root)
+# Default resume to send: resume28.pdf in project root
+ALLOWED_RESUME_FILES = ("resume28.pdf", "resume29.pdf")
+
 # Email sending endpoints
 @app.post("/api/send-emails")
 async def send_emails(request: EmailSendRequest):
-    """Send accepted emails in batch"""
-    # Get emails to send
+    """Send accepted, pending, or trashed (generated) emails in batch. Optional attach_resume: 'resume28.pdf' or 'resume29.pdf'."""
+    # Get emails to send: include accepted, pending, and trashed (so Contacts "Emails Generated - Not Sent" can send any)
     emails_to_send = []
     for email_id in request.email_ids:
         email = email_storage.get(email_id)
-        if email and email.status == "accepted":
+        if email and email.status in ("accepted", "pending", "trashed"):
             emails_to_send.append(email)
-    
+
     if not emails_to_send:
-        raise HTTPException(status_code=400, detail="No accepted emails to send")
+        raise HTTPException(status_code=400, detail="No emails to send (select accepted or pending emails)")
     
     # Check rate limit
     can_send, error = rate_limiter.can_send_email()
     if not can_send:
         raise HTTPException(status_code=429, detail=error)
+    
+    # Resolve resume path only if client requested one of the allowed files
+    resume_path = None
+    if request.attach_resume and request.attach_resume in ALLOWED_RESUME_FILES:
+        candidate = os.path.join(project_root, request.attach_resume)
+        if os.path.isfile(candidate):
+            resume_path = candidate
     
     # Authenticate if needed
     try:
@@ -478,9 +591,8 @@ async def send_emails(request: EmailSendRequest):
         raise HTTPException(status_code=500, detail=f"Gmail authentication failed: {str(e)}")
     
     # Send emails
-    from_email = "me"  # Gmail API uses 'me' for authenticated user
-    # Resume path is already resolved in EmailSender.__init__ using project_root
-    results = email_sender.send_batch(emails_to_send, from_email, email_sender.resume_path)
+    from_email = (request.from_email and request.from_email.strip()) or "me"
+    results = email_sender.send_batch(emails_to_send, from_email, resume_path)
     
     # Update email statuses and contacts
     sent_contact_ids = []
@@ -499,8 +611,9 @@ async def send_emails(request: EmailSendRequest):
                 sent_contact_ids.append(email.contact_id)
                 rate_limiter.record_email_sent()
     
-    # Remove sent contacts from CSV
-    csv_processor.remove_sent_contacts(sent_contact_ids)
+    # Mark contacts as sent in CSV so they appear in the Emailed tab (do not remove them)
+    for contact_id in sent_contact_ids:
+        csv_processor.update_contact(contact_id, {"status": "sent"})
     
     return {
         "success": True,
@@ -508,6 +621,13 @@ async def send_emails(request: EmailSendRequest):
         "failed": len([r for r in results if not r['success']]),
         "results": results
     }
+
+
+@app.post("/api/gmail-disconnect")
+async def gmail_disconnect():
+    """Remove saved Gmail token. Next time you send, the browser will open to sign in again."""
+    removed = email_sender.disconnect()
+    return {"success": True, "token_removed": removed, "message": "Gmail disconnected. Next time you send, your browser will open to sign in again."}
 
 
 # Usage stats endpoint

@@ -11,6 +11,7 @@ class TestRateLimiter:
     def limiter(self, monkeypatch):
         """Create RateLimiter with test limits"""
         monkeypatch.setenv('MAX_EMAILS_PER_DAY', '10')
+        monkeypatch.setenv('MAX_EMAIL_GENERATIONS_PER_DAY', '10')
         monkeypatch.setenv('MAX_EMAIL_GENERATIONS_PER_MINUTE', '5')
         monkeypatch.setenv('MAX_COMPANY_RESEARCH_PER_MINUTE', '3')
         return RateLimiter()

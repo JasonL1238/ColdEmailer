@@ -1,6 +1,15 @@
 import json
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import ollama
+
+
+def _ollama_response_text(response: Any) -> str:
+    """Get generated text from ollama generate() response (dict or Pydantic model)."""
+    if hasattr(response, "response"):
+        return (response.response or "").strip()
+    if isinstance(response, dict):
+        return (response.get("response") or "").strip()
+    return ""
 
 
 class MetadataExtractor:
@@ -46,10 +55,7 @@ Return ONLY valid JSON, no other text."""
                     "temperature": 0.3,  # Lower temperature for more consistent extraction
                 }
             )
-            
-            # Extract JSON from response
-            # Ollama response structure: {'model': ..., 'response': '...', 'done': ...}
-            response_text = response.get('response', '').strip()
+            response_text = _ollama_response_text(response)
             
             # Try to find JSON in the response
             json_start = response_text.find('{')
@@ -72,7 +78,11 @@ Return ONLY valid JSON, no other text."""
                 return self._empty_metadata()
                 
         except Exception as e:
-            print(f"Error extracting metadata: {e}")
+            err_msg = str(e).lower()
+            if "connection" in err_msg or "refused" in err_msg or "connect" in err_msg:
+                print(f"Ollama connection error: {e}. Is Ollama running? (e.g. run 'ollama serve')")
+            else:
+                print(f"Error extracting metadata: {e}")
             return self._empty_metadata()
     
     def _empty_metadata(self) -> Dict[str, Optional[str]]:

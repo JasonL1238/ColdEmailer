@@ -51,7 +51,7 @@ if [ -f "$SCRIPT_DIR/credentials.json" ]; then
 else
     echo "   ⚠️  Gmail credentials missing (see GMAIL_SETUP.md)"
 fi
-if [ -f "$SCRIPT_DIR/resume.pdf" ] || [ -f "$SCRIPT_DIR/Current_Resume_2 12.43.21 PM.pdf" ]; then
+if [ -f "$SCRIPT_DIR/resume.pdf" ] || [ -f "$SCRIPT_DIR/Current_Resume_2 12.43.21 PM.pdf" ] || [ -f "$SCRIPT_DIR/resume28.pdf" ] || [ -f "$SCRIPT_DIR/resume29.pdf" ]; then
     echo "   ✅ Resume file found"
 else
     echo "   ⚠️  Resume file missing"

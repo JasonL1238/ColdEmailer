@@ -1,8 +1,19 @@
 import pandas as pd
 import os
+import time
+import json
 from typing import List, Dict, Optional
 from models import Contact
 import uuid
+
+DEBUG_LOG = "/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug-6c4284.log"
+
+def _dlog(location: str, message: str, data: dict, hypothesis_id: str):
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(json.dumps({"sessionId": "6c4284", "timestamp": int(time.time() * 1000), "location": location, "message": message, "data": data, "hypothesisId": hypothesis_id}) + "\n")
+    except Exception:
+        pass
 
 
 class CSVProcessor:
@@ -17,22 +28,33 @@ class CSVProcessor:
     def read_contacts(self) -> List[Contact]:
         """Read all contacts from CSV"""
         if not os.path.exists(self.csv_path):
+            _dlog("csv_processor.py:read_contacts", "CSV missing", {"csv_path": self.csv_path, "cwd": os.getcwd()}, "H4")
             return []
-        
+
         try:
             df = pd.read_csv(self.csv_path)
             contacts = []
             for _, row in df.iterrows():
+                raw_id = row.get("id") if "id" in df.columns else None
+                if raw_id is None or (isinstance(raw_id, float) and (raw_id != raw_id or str(raw_id) == "nan")) or str(raw_id).strip() == "" or str(raw_id) == "nan":
+                    raw_id = str(uuid.uuid4())
+                else:
+                    raw_id = str(raw_id)
                 contact = Contact(
-                    id=str(uuid.uuid4()) if 'id' not in df.columns else str(row.get('id', uuid.uuid4())),
-                    name=str(row['name']),
-                    company=str(row['company']),
-                    email=str(row['email']),
-                    status=str(row.get('status', 'pending'))
+                    id=raw_id,
+                    name=str(row["name"]) if pd.notna(row.get("name")) else "",
+                    company=str(row["company"]) if pd.notna(row.get("company")) else "",
+                    email=str(row["email"]) if pd.notna(row.get("email")) else "",
+                    status=str(row.get("status", "pending")) if pd.notna(row.get("status")) else "pending",
+                    role=str(row["role"]).strip() if "role" in df.columns and pd.notna(row.get("role")) and str(row.get("role")).strip() else None,
                 )
                 contacts.append(contact)
+            ids = [c.id for c in contacts]
+            nan_like = [i for i in ids if i == "nan" or (isinstance(i, str) and not i.strip())]
+            _dlog("csv_processor.py:read_contacts", "Read contacts", {"csv_path": self.csv_path, "abs_path": os.path.abspath(self.csv_path), "cwd": os.getcwd(), "count": len(contacts), "ids_sample": ids[:10] if len(ids) <= 10 else ids[:5] + ["..."] + ids[-5:], "any_nan_or_empty": len(nan_like) > 0, "nan_count": len(nan_like)}, "H1" if nan_like else "H4")
             return contacts
         except Exception as e:
+            _dlog("csv_processor.py:read_contacts", "Exception", {"csv_path": self.csv_path, "error": str(e)}, "H5")
             print(f"Error reading CSV: {e}")
             return []
     
@@ -47,7 +69,8 @@ class CSVProcessor:
                 'name': contact.name,
                 'company': contact.company,
                 'email': contact.email,
-                'status': contact.status
+                'status': contact.status,
+                'role': getattr(contact, 'role', None) or '',
             })
         
         df = pd.DataFrame(data)
@@ -56,6 +79,7 @@ class CSVProcessor:
     def add_contact(self, contact: Contact) -> Contact:
         """Add a new contact"""
         # #region agent log
+        _dlog("csv_processor.py:add_contact:start", "Adding contact", {"contact_id": contact.id}, "H3")
         import json
         import time
         log_data = {
@@ -82,6 +106,7 @@ class CSVProcessor:
         contacts.append(contact)
         self.write_contacts(contacts)
         # #region agent log
+        _dlog("csv_processor.py:add_contact:success", "Contact added", {"contact_id": contact.id, "total_contacts": len(contacts)}, "H3")
         log_data2 = {
             "location": "csv_processor.py:add_contact:success",
             "message": "Contact added to CSV",
@@ -123,10 +148,11 @@ class CSVProcessor:
         # #endregion
         contacts = self.read_contacts()
         original_count = len(contacts)
+        contact_ids = [c.id for c in contacts]
+        _dlog("csv_processor.py:delete_contact:beforeFilter", "Delete contact", {"contact_id": contact_id, "existing_ids": contact_ids, "contact_id_in_list": contact_id in contact_ids}, "H2")
         # #region agent log
         import json
         try:
-            contact_ids = [c.id for c in contacts]
             with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
                 f.write(json.dumps({"id":f"log_{int(__import__('time').time()*1000)}","timestamp":int(__import__('time').time()*1000),"location":"csv_processor.py:delete_contact:beforeFilter","message":"Before filtering","data":{"contact_id":contact_id,"original_count":original_count,"existing_ids":contact_ids},"runId":"run1","hypothesisId":"C"}) + '\n')
         except: pass

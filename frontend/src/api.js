@@ -51,14 +51,18 @@ export const contactsAPI = {
   create: (contact) => api.post('/contacts', contact),
   update: (id, updates) => api.put(`/contacts/${id}`, updates),
   delete: (id) => api.delete(`/contacts/${id}`),
-  bulkDelete: (ids) => api.delete('/contacts/bulk', { data: ids }),
+  bulkDelete: (ids) => api.post('/contacts/bulk-delete', ids),
   bulkUpdate: (updates) => api.put('/contacts/bulk', updates),
   save: () => api.post('/contacts/save'),
   upload: (file) => {
     const formData = new FormData()
     formData.append('file', file)
+    // Omit Content-Type so browser sets multipart/form-data with boundary (required for server to parse)
     return api.post('/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      transformRequest: [(data, headers) => {
+        delete headers['Content-Type']
+        return data
+      }],
     })
   },
   export: (section) => api.get('/contacts/export', { 
@@ -83,19 +87,24 @@ export const companyAPI = {
 
 // Email API
 export const emailAPI = {
-  generate: (contactIds = null, userName = null, userBackground = null, userEmail = null) => 
-    api.post('/generate-emails', { 
+  generate: (contactIds = null, userName = null, userBackground = null, userEmail = null, useTemplateOnly = false) =>
+    api.post('/generate-emails', {
       contact_ids: contactIds,
       user_name: userName,
       user_background: userBackground,
-      user_email: userEmail
+      user_email: userEmail,
+      use_template_only: useTemplateOnly,
     }),
   getAll: (status) => api.get('/emails', { params: { status } }),
   updateStatus: (id, status) => api.put(`/emails/${id}`, null, {
     params: { status },
   }),
+  update: (id, data) => api.patch(`/emails/${id}`, data),
   delete: (id) => api.delete(`/emails/${id}`),
-  send: (emailIds) => api.post('/send-emails', { email_ids: emailIds }),
+  bulkDelete: (emailIds) => api.post('/emails/bulk-delete', { email_ids: emailIds }),
+  send: (emailIds, attachResume = null, fromEmail = null) =>
+    api.post('/send-emails', { email_ids: emailIds, attach_resume: attachResume || null, from_email: fromEmail || null }),
+  disconnectGmail: () => api.post('/gmail-disconnect'),
 }
 
 // Usage API
