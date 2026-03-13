@@ -9,15 +9,6 @@ import time
 import asyncio
 from dotenv import load_dotenv
 
-# #region agent log
-def _dlog(location: str, message: str, data: dict, hypothesis_id: str = "H1"):
-    try:
-        with open("/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug-6c4284.log", "a") as f:
-            f.write(__import__("json").dumps({"sessionId": "6c4284", "timestamp": int(time.time() * 1000), "location": location, "message": message, "data": data, "runId": "startup", "hypothesisId": hypothesis_id}) + "\n")
-    except Exception:
-        pass
-# #endregion
-
 from models import (
     Contact, CompanyMetadata, GeneratedEmail, 
     EmailGenerationRequest, EmailSendRequest, EmailUpdateRequest, EmailBulkDeleteRequest, UsageStats
@@ -36,38 +27,7 @@ _project_root_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath
 if os.path.isfile(_project_root_env):
     load_dotenv(_project_root_env)
 
-# #region agent log
-def _mask_key(k: str) -> str:
-    return (k[-4:] if k and len(k) >= 4 else "n/a")
-_dlog("main.py:after_imports", "All imports and load_dotenv done", {
-    "cwd": os.getcwd(),
-    "project_root_env": _project_root_env,
-    "project_root_env_exists": os.path.isfile(_project_root_env),
-    "GOOGLE_AI_API_KEY_last4": _mask_key(os.getenv("GOOGLE_AI_API_KEY", "")),
-    "EMAIL_LLM_PROVIDER": os.getenv("EMAIL_LLM_PROVIDER"),
-}, "H1")
-# #endregion
-
-# #region agent log
-import json
-try:
-    with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-        f.write(json.dumps({"id":f"log_{int(__import__('time').time()*1000)}","timestamp":int(__import__('time').time()*1000),"location":"main.py:startup","message":"Backend starting","data":{"port":8000},"runId":"run1","hypothesisId":"B"}) + '\n')
-except: pass
-# #endregion
-
 app = FastAPI(title="AI Cold Emailer API")
-
-# #region agent log
-_dlog("main.py:after_app", "FastAPI app created", {}, "H1")
-# #endregion
-# #region agent log
-import json
-try:
-    with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-        f.write(json.dumps({"id":f"log_{int(__import__('time').time()*1000)}","timestamp":int(__import__('time').time()*1000),"location":"main.py:app_created","message":"FastAPI app created","data":{},"runId":"run1","hypothesisId":"A"}) + '\n')
-except: pass
-# #endregion
 
 # Stress test mode - simulate slow/failing APIs
 STRESS_TEST_MODE = os.getenv('STRESS_TEST_MODE', 'false').lower() == 'true'
@@ -101,7 +61,6 @@ app.add_middleware(
 )
 
 # Initialize services
-# #region agent log
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _resume_env = os.getenv('RESUME_PATH', 'resume.pdf')
 _resume_candidate = _resume_env if os.path.isabs(_resume_env) else os.path.join(_project_root, _resume_env)
@@ -112,8 +71,6 @@ if not os.path.exists(_resume_candidate):
             _resume_candidate = _alt
             break
 _resume_for_generator = _resume_candidate
-_dlog("main.py:resume_check", "Resume path resolution", {"cwd": os.getcwd(), "project_root": _project_root, "RESUME_PATH_env": _resume_env, "resume_path_used": _resume_for_generator, "exists": os.path.exists(_resume_for_generator), "email_generator_gets_default": False}, "rh1")
-# #endregion
 project_root = _project_root
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 _csv_env = os.getenv('CSV_FILE_PATH')
@@ -126,67 +83,25 @@ else:
 csv_processor = CSVProcessor(
     csv_path=_csv_path
 )
-# #region agent log
-_dlog("main.py:after_csv_processor", "CSVProcessor initialized", {}, "H2")
-# #endregion
 enrichment_service = CompanyEnrichmentService(
     cache_path=os.getenv('COMPANY_CACHE_PATH', 'data/company_cache.json')
 )
-# #region agent log
-_dlog("main.py:after_enrichment_service", "CompanyEnrichmentService initialized", {}, "H2")
-# #endregion
 email_generator = EmailGenerator(
     model=os.getenv('OLLAMA_MODEL', 'llama3.2'),
     base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434'),
     resume_path=_resume_for_generator
 )
 # Cloud LLM (OpenRouter/OpenAI/Gemini) is configured via env: EMAIL_LLM_PROVIDER, EMAIL_LLM_MODEL, and the corresponding API key. Keys are never logged or sent to the frontend.
-# #region agent log
-_dlog("main.py:after_email_generator", "EmailGenerator initialized", {"resume_path": _resume_for_generator}, "H2")
-# #endregion
 # Get project root (parent of backend directory) - use project_root set above
 credentials_path = os.getenv('CREDENTIALS_JSON_PATH') or os.path.join(project_root, 'credentials.json')
 token_path = os.getenv('TOKEN_JSON_PATH') or os.path.join(project_root, 'token.json')
-# #region agent log
-import json
-import time
-log_data = {
-    "location": "main.py:email_sender_init",
-    "message": "Constructing email sender paths",
-    "data": {
-        "project_root": project_root,
-        "credentials_path": credentials_path,
-        "token_path": token_path,
-        "cwd": os.getcwd(),
-        "credentials_path_abs": os.path.abspath(credentials_path),
-        "token_path_abs": os.path.abspath(token_path),
-        "credentials_exists": os.path.exists(credentials_path),
-        "token_exists": os.path.exists(token_path),
-        "__file__": __file__,
-    },
-    "timestamp": int(time.time() * 1000),
-    "runId": "init",
-    "hypothesisId": "A"
-}
-try:
-    with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-        f.write(json.dumps(log_data) + '\n')
-except: pass
-# #endregion
 email_sender = EmailSender(credentials_path=credentials_path, token_path=token_path, project_root=project_root)
-# #region agent log
-_dlog("main.py:after_email_sender", "EmailSender initialized", {}, "H2")
-# #endregion
 rate_limiter = RateLimiter()
 
 # Persistent storage for generated emails
 email_storage = EmailStorage(
     storage_path=os.getenv('EMAIL_STORAGE_PATH', 'data/generated_emails.json')
 )
-
-# #region agent log
-_dlog("main.py:startup_complete", "All services initialized, module load done", {}, "H3")
-# #endregion
 
 
 # Contact endpoints
@@ -202,7 +117,6 @@ async def get_contacts(status: Optional[str] = None):
 @app.post("/api/contacts", response_model=Contact)
 async def create_contact(contact: Contact):
     """Create a new contact"""
-    _dlog("main.py:create_contact", "API create contact", {"contact_id": contact.id, "name": getattr(contact, "name", "")}, "H3")
     return csv_processor.add_contact(contact)
 
 
@@ -218,22 +132,7 @@ async def update_contact(contact_id: str, updates: dict):
 @app.delete("/api/contacts/{contact_id}")
 async def delete_contact(contact_id: str):
     """Delete a contact"""
-    _dlog("main.py:delete_contact", "API delete contact", {"contact_id": contact_id}, "H2")
-    # #region agent log
-    import json
-    try:
-        with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-            f.write(json.dumps({"id":f"log_{int(__import__('time').time()*1000)}","timestamp":int(__import__('time').time()*1000),"location":"main.py:delete_contact:start","message":"Delete contact endpoint called","data":{"contact_id":contact_id},"runId":"run1","hypothesisId":"B"}) + '\n')
-    except: pass
-    # #endregion
     success = csv_processor.delete_contact(contact_id)
-    # #region agent log
-    import json
-    try:
-        with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-            f.write(json.dumps({"id":f"log_{int(__import__('time').time()*1000)}","timestamp":int(__import__('time').time()*1000),"location":"main.py:delete_contact:result","message":"Delete contact result","data":{"contact_id":contact_id,"success":success},"runId":"run1","hypothesisId":"B"}) + '\n')
-    except: pass
-    # #endregion
     if not success:
         raise HTTPException(status_code=404, detail="Contact not found")
     return {"success": True}
@@ -242,7 +141,6 @@ async def delete_contact(contact_id: str):
 @app.post("/api/contacts/bulk-delete")
 async def bulk_delete_contacts(contact_ids: List[str] = Body(..., embed=False)):
     """Bulk delete contacts. Body: JSON array of contact IDs."""
-    _dlog("main.py:bulk_delete_contacts", "API bulk delete", {"contact_ids": contact_ids}, "H2")
     deleted = 0
     for contact_id in contact_ids:
         if csv_processor.delete_contact(contact_id):
@@ -781,11 +679,4 @@ async def get_categorized_contacts():
 @app.get("/")
 async def root():
     """Health check"""
-    # #region agent log
-    import json
-    try:
-        with open('/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug.log', 'a') as f:
-            f.write(json.dumps({"id":f"log_{int(__import__('time').time()*1000)}","timestamp":int(__import__('time').time()*1000),"location":"main.py:root","message":"Backend health check endpoint called","data":{"status":"ok"},"runId":"run1","hypothesisId":"B"}) + '\n')
-    except: pass
-    # #endregion
     return {"status": "ok", "message": "AI Cold Emailer API"}

@@ -1,7 +1,6 @@
 import { useState, useEffect, useMemo } from 'react'
 import toast from 'react-hot-toast'
 import { contactsAPI, emailAPI } from './api'
-import { sendTelemetry } from './config'
 import './CSVManager.css'
 
 // Get user info for email generation
@@ -39,17 +38,7 @@ function CSVManager() {
   const [attachResume, setAttachResume] = useState('resume28.pdf') // default 2028 resume; 'none' | 'resume28.pdf' | 'resume29.pdf'
 
   const handleTabChange = (tab) => {
-    try {
-      sendTelemetry('CSVManager.jsx:handleTabChange:start', 'Tab change initiated', { fromTab: activeTab, toTab: tab })
-    } catch (e) {}
-    try {
-      setActiveTab(tab)
-      sendTelemetry('CSVManager.jsx:handleTabChange:success', 'Tab changed successfully', { newTab: tab })
-    } catch (error) {
-      sendTelemetry('CSVManager.jsx:handleTabChange:error', 'Tab change failed', { error: error.message, stack: error.stack })
-      console.error('Tab change error:', error)
-      throw error
-    }
+    setActiveTab(tab)
   }
   
   // User info for follow-up generation
@@ -163,11 +152,7 @@ function CSVManager() {
   }
 
   const handleAddContact = async () => {
-    sendTelemetry('CSVManager.jsx:handleAddContact:start', 'Add contact called', { activeTab })
-
-    // Only allow adding contacts in "No Emails Generated" section
     if (activeTab !== 'no_emails') {
-      sendTelemetry('CSVManager.jsx:handleAddContact:wrongTab', 'Add contact blocked - wrong tab', { activeTab })
       toast.error('You can only add contacts in the "No Emails Generated" section')
       return
     }
@@ -179,11 +164,8 @@ function CSVManager() {
       status: 'pending',
     }
 
-    sendTelemetry('CSVManager.jsx:handleAddContact:beforeAPI', 'About to call API', { newContact })
-
     try {
       const response = await contactsAPI.create(newContact)
-      sendTelemetry('CSVManager.jsx:handleAddContact:success', 'API call successful', { contactId: response.data?.id })
       const contactId = response.data.id
       toast.success('Contact added and saved')
       await loadCategorizedContacts()
@@ -192,7 +174,6 @@ function CSVManager() {
         document.querySelector(`tr[data-contact-id="${contactId}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
       }, 100)
     } catch (error) {
-      sendTelemetry('CSVManager.jsx:handleAddContact:error', 'API call failed', { error: error.message, response: error.response?.data, status: error.response?.status })
       toast.error('Failed to save contact')
       console.error(error)
     }
@@ -518,11 +499,6 @@ function CSVManager() {
   }
 
   const renderEmailedSection = () => {
-    // #region agent log
-    try {
-      sendTelemetry('CSVManager.jsx:renderEmailedSection:start', 'Rendering emailed section', { contactsCount: categorizedContacts.emailed?.length, isArray: Array.isArray(categorizedContacts.emailed) })
-    } catch (e) {}
-    // #endregion
     try {
       // Get all emails for these contacts (including follow-ups)
       const contactsWithEmails = (categorizedContacts.emailed || []).map(contact => {
@@ -703,20 +679,12 @@ function CSVManager() {
         </section>
       )
     } catch (error) {
-      // #region agent log
-      sendTelemetry('CSVManager.jsx:renderEmailedSection:error', 'Error rendering emailed section', { error: error.message, stack: error.stack })
-      // #endregion
       console.error('Error rendering emailed section:', error)
       return <div>Error loading emailed contacts: {error.message}</div>
     }
   }
 
   const renderGeneratedSection = () => {
-    // #region agent log
-    try {
-      sendTelemetry('CSVManager.jsx:renderGeneratedSection:start', 'Rendering generated section', { contactsCount: categorizedContacts.emails_generated?.length, isArray: Array.isArray(categorizedContacts.emails_generated) })
-    } catch (e) {}
-    // #endregion
     try {
       const generatedContacts = categorizedContacts.emails_generated || []
       const bulkDeleteOptions = {
@@ -787,20 +755,12 @@ function CSVManager() {
         </section>
       )
     } catch (error) {
-      // #region agent log
-      sendTelemetry('CSVManager.jsx:renderGeneratedSection:error', 'Error rendering generated section', { error: error.message, stack: error.stack })
-      // #endregion
       console.error('Error rendering generated section:', error)
       return <div>Error loading generated contacts: {error.message}</div>
     }
   }
 
   const renderNoEmailsSection = () => {
-    // #region agent log
-    try {
-      sendTelemetry('CSVManager.jsx:renderNoEmailsSection:start', 'Rendering no_emails section', { contactsCount: categorizedContacts.no_emails?.length, isArray: Array.isArray(categorizedContacts.no_emails) })
-    } catch (e) {}
-    // #endregion
     try {
       const noEmailContacts = categorizedContacts.no_emails || []
       const bulkContactOptions = {
@@ -872,29 +832,17 @@ function CSVManager() {
         </section>
       )
     } catch (error) {
-      // #region agent log
-      sendTelemetry('CSVManager.jsx:renderNoEmailsSection:error', 'Error rendering no_emails section', { error: error.message, stack: error.stack })
-      // #endregion
       console.error('Error rendering no_emails section:', error)
       return <div>Error loading no_emails contacts: {error.message}</div>
     }
   }
 
   const renderContactTable = (contacts, showTracking = false, showDeleteEmail = false, showEmailActions = false, bulkDeleteOptions = null, bulkContactOptions = null) => {
-    // #region agent log
-    try {
-      sendTelemetry('CSVManager.jsx:renderContactTable:start', 'Rendering contact table', { contactsCount: contacts?.length, showTracking, showDeleteEmail, showEmailActions })
-    } catch (e) {}
-    // #endregion
-    
     const hasCheckboxColumn = (bulkDeleteOptions != null && showEmailActions) || bulkContactOptions != null
     const baseColSpan = showTracking ? 7 : (showDeleteEmail || showEmailActions ? 6 : 5)
     const colSpan = hasCheckboxColumn ? baseColSpan + 1 : baseColSpan
 
     if (!contacts || !Array.isArray(contacts)) {
-      // #region agent log
-      sendTelemetry('CSVManager.jsx:renderContactTable:invalid', 'Invalid contacts array', { contacts })
-      // #endregion
       return (
         <tr>
           <td colSpan={colSpan} className="empty-state">
@@ -1039,24 +987,14 @@ function CSVManager() {
                 <>
                   <button
                     className="btn btn-small btn-primary"
-                    onClick={() => {
-                      // #region agent log
-                      sendTelemetry('CSVManager.jsx:viewEmail:click', 'View email button clicked', { emailId: email?.id, hasEmail: !!email })
-                      // #endregion
-                      handleViewEmail(email)
-                    }}
+                    onClick={() => handleViewEmail(email)}
                     title="View email content"
                   >
                     View Email
                   </button>
                   <button
                     className="btn btn-small btn-success"
-                    onClick={() => {
-                      // #region agent log
-                      sendTelemetry('CSVManager.jsx:sendEmail:click', 'Send email button clicked', { emailId: email?.id })
-                      // #endregion
-                      handleSendEmail(email.id)
-                    }}
+                    onClick={() => handleSendEmail(email.id)}
                     title="Send this email"
                     disabled={sendingEmail}
                   >
@@ -1167,40 +1105,19 @@ function CSVManager() {
       <div className="section-tabs">
         <button
           className={`tab ${activeTab === 'emailed' ? 'active' : ''}`}
-          onClick={(e) => {
-            // #region agent log
-            sendTelemetry('CSVManager.jsx:tab:emailed:click', 'Emailed tab clicked', { currentTab: activeTab })
-            // #endregion
-            e.preventDefault()
-            e.stopPropagation()
-            handleTabChange('emailed')
-          }}
+          onClick={() => handleTabChange('emailed')}
         >
           Emailed ({categorizedContacts.emailed.length})
         </button>
         <button
           className={`tab ${activeTab === 'generated' ? 'active' : ''}`}
-          onClick={(e) => {
-            // #region agent log
-            sendTelemetry('CSVManager.jsx:tab:generated:click', 'Generated tab clicked', { currentTab: activeTab })
-            // #endregion
-            e.preventDefault()
-            e.stopPropagation()
-            handleTabChange('generated')
-          }}
+          onClick={() => handleTabChange('generated')}
         >
           Emails Generated - Not Sent ({categorizedContacts.emails_generated.length})
         </button>
         <button
           className={`tab ${activeTab === 'no_emails' ? 'active' : ''}`}
-          onClick={(e) => {
-            // #region agent log
-            sendTelemetry('CSVManager.jsx:tab:no_emails:click', 'No emails tab clicked', { currentTab: activeTab })
-            // #endregion
-            e.preventDefault()
-            e.stopPropagation()
-            handleTabChange('no_emails')
-          }}
+          onClick={() => handleTabChange('no_emails')}
         >
           No Emails Generated ({categorizedContacts.no_emails.length})
         </button>
@@ -1208,35 +1125,9 @@ function CSVManager() {
 
       {/* Contacts sections */}
       <div className="contacts-sections">
-        {(() => {
-          // #region agent log
-          try {
-            sendTelemetry('CSVManager.jsx:render:sections:start', 'Rendering sections container', { activeTab })
-          } catch (e) {}
-          // #endregion
-          try {
-            if (activeTab === 'emailed') {
-              return renderEmailedSection()
-            } else if (activeTab === 'generated') {
-              // #region agent log
-              sendTelemetry('CSVManager.jsx:render:sections:generated', 'About to render generated section', { activeTab })
-              // #endregion
-              return renderGeneratedSection()
-            } else if (activeTab === 'no_emails') {
-              // #region agent log
-              sendTelemetry('CSVManager.jsx:render:sections:no_emails', 'About to render no_emails section', { activeTab })
-              // #endregion
-              return renderNoEmailsSection()
-            }
-            return null
-          } catch (error) {
-            // #region agent log
-            sendTelemetry('CSVManager.jsx:render:sections:error', 'Error rendering sections', { error: error.message, stack: error.stack, activeTab })
-            // #endregion
-            console.error('Error rendering section:', error)
-            return <div className="section-error">Error rendering section: {error.message}</div>
-          }
-        })()}
+        {activeTab === 'emailed' && renderEmailedSection()}
+        {activeTab === 'generated' && renderGeneratedSection()}
+        {activeTab === 'no_emails' && renderNoEmailsSection()}
       </div>
 
       {/* Email View Modal */}

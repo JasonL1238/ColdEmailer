@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { API_BASE_URL, sendTelemetry } from './config'
+import { API_BASE_URL } from './config'
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -8,46 +8,9 @@ const api = axios.create({
   },
 })
 
-// Add request interceptor to log all API calls
-api.interceptors.request.use(
-  (config) => {
-    sendTelemetry('api.js:interceptor:request', 'API request', { url: config.url, method: config.method, baseURL: config.baseURL })
-    return config
-  },
-  (error) => {
-    sendTelemetry('api.js:interceptor:request:error', 'API request error', { error: error.message })
-    return Promise.reject(error)
-  }
-)
-
-// Add response interceptor to log API responses
-api.interceptors.response.use(
-  (response) => {
-    sendTelemetry('api.js:interceptor:response', 'API response', { url: response.config.url, status: response.status })
-    return response
-  },
-  (error) => {
-    sendTelemetry('api.js:interceptor:response:error', 'API response error', {
-      url: error.config?.url,
-      status: error.response?.status,
-      message: error.message,
-      code: error.code,
-    })
-    return Promise.reject(error)
-  }
-)
-
-sendTelemetry('api.js:init', 'API client initialized', { baseURL: API_BASE_URL })
-
 // Contacts API
 export const contactsAPI = {
-  getAll: (status) => {
-    sendTelemetry('api.js:getAll', 'API call attempt', { endpoint: '/contacts', status })
-    return api.get('/contacts', { params: { status } }).catch(err => {
-      sendTelemetry('api.js:getAll:error', 'API call failed', { endpoint: '/contacts', error: err.message, code: err.code })
-      throw err
-    })
-  },
+  getAll: (status) => api.get('/contacts', { params: { status } }),
   create: (contact) => api.post('/contacts', contact),
   update: (id, updates) => api.put(`/contacts/${id}`, updates),
   delete: (id) => api.delete(`/contacts/${id}`),
@@ -57,7 +20,6 @@ export const contactsAPI = {
   upload: (file) => {
     const formData = new FormData()
     formData.append('file', file)
-    // Omit Content-Type so browser sets multipart/form-data with boundary (required for server to parse)
     return api.post('/upload', formData, {
       transformRequest: [(data, headers) => {
         delete headers['Content-Type']

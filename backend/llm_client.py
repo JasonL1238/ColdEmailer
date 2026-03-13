@@ -151,14 +151,6 @@ def complete(
             last_error = None
             for model in GEMINI_MODEL_FALLBACK_ORDER:
                 try:
-                    # #region agent log
-                    try:
-                        _key_last4 = api_key[-4:] if len(api_key) >= 4 else "n/a"
-                        with open("/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug-6c4284.log", "a") as _f:
-                            _f.write(__import__("json").dumps({"sessionId": "6c4284", "timestamp": int(__import__("time").time() * 1000), "location": "llm_client.py:before_gemini_call", "message": "Gemini attempt", "data": {"key_last4": _key_last4, "model": model}, "hypothesisId": "H1,H2"}) + "\n")
-                    except Exception:
-                        pass
-                    # #endregion
                     out, was_truncated = _gemini_complete(
                         prompt=prompt,
                         system=system,
@@ -173,15 +165,6 @@ def complete(
                         return out
                 except Exception as _e:
                     last_error = _e
-                    # #region agent log
-                    try:
-                        _key_last4 = api_key[-4:] if len(api_key) >= 4 else "n/a"
-                        _is_quota = type(_e).__name__ == "ResourceExhausted" or "429" in str(_e) or "quota" in str(_e).lower()
-                        with open("/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug-6c4284.log", "a") as _f:
-                            _f.write(__import__("json").dumps({"sessionId": "6c4284", "timestamp": int(__import__("time").time() * 1000), "location": "llm_client.py:gemini_error", "message": "LLM call failed", "data": {"provider": provider, "key_last4": _key_last4, "model": model, "error_type": type(_e).__name__, "error_msg": str(_e)[:200], "quota_exhausted": _is_quota}, "hypothesisId": "H2,H4,H5"}) + "\n")
-                    except Exception:
-                        pass
-                    # #endregion
                     # Quota or other error: try next model
                     if type(_e).__name__ == "ResourceExhausted" or "quota" in str(_e).lower() or "429" in str(_e):
                         print(f"[LLM] {model} quota exceeded, trying next model.")
@@ -195,18 +178,6 @@ def complete(
                     print(f"[LLM] {type(last_error).__name__}: {last_error}")
             return None
     except Exception as _e:
-        # #region agent log
-        try:
-            _key_last4 = "n/a"
-            if provider == "gemini":
-                _k = os.getenv("GOOGLE_AI_API_KEY", "").strip()
-                _key_last4 = _k[-4:] if len(_k) >= 4 else "n/a"
-            _is_quota = type(_e).__name__ == "ResourceExhausted" or "429" in str(_e) or "quota" in str(_e).lower()
-            with open("/Users/jasonli/Documents/GitHub/ColdEmailer/.cursor/debug-6c4284.log", "a") as _f:
-                _f.write(__import__("json").dumps({"sessionId": "6c4284", "timestamp": int(__import__("time").time() * 1000), "location": "llm_client.py:gemini_error", "message": "LLM call failed", "data": {"provider": provider, "key_last4": _key_last4, "error_type": type(_e).__name__, "error_msg": str(_e)[:200], "quota_exhausted": _is_quota}, "hypothesisId": "H2,H4,H5"}) + "\n")
-        except Exception:
-            pass
-        # #endregion
         if type(_e).__name__ == "ResourceExhausted" or "quota" in str(_e).lower():
             print("[LLM] Gemini quota exceeded (free tier). Each generate attempt counts. Use a new key, enable billing, or wait for daily reset.")
         else:

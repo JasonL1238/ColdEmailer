@@ -2,13 +2,9 @@ import { useState } from 'react'
 import { Toaster } from 'react-hot-toast'
 import CSVManager from './CSVManager'
 import EmailReview from './EmailReview'
-import { sendTelemetry } from './config'
 import './App.css'
 
-sendTelemetry('App.jsx:init', 'App component loading', { windowLocation: typeof window !== 'undefined' ? window.location.href : '' })
-
 function App() {
-  sendTelemetry('App.jsx:render', 'App rendering', {})
   const [activeTab, setActiveTab] = useState('contacts')
 
   return (

@@ -1337,15 +1337,15 @@
   },
   "everest ai": {
     "company_name": "Everest AI",
-    "url": "https://www.everestai.com/",
-    "summary": null,
-    "industry": null,
-    "product": null,
-    "why_engineers_care": null,
-    "hook_sentence": null,
+    "url": "https://www.ewrestlingnews.com/news/aew/darby-allins-mother-brother-made-it-to-mount-everest-base-camp-with-him",
+    "summary": "Company does not have a clear description, but it seems to be related to Everest AI, possibly a company name or a project name.",
+    "industry": "AI/ML",
+    "product": "Not specified",
+    "why_engineers_care": "Not specified",
+    "hook_sentence": "Turning casual phone capture into production-quality scenes",
     "recent_news": null,
-    "confidence_score": null,
-    "cached_at": "2026-03-11T21:22:36.067552"
+    "confidence_score": 0.0,
+    "cached_at": "2026-03-12T12:56:44.183976"
   },
   "applied aeronautics": {
     "company_name": "Applied Aeronautics",
