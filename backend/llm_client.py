@@ -96,6 +96,36 @@ def get_cloud_llm_provider() -> Optional[str]:
     return None
 
 
+def complete_json(
+    prompt: str,
+    system: Optional[str] = None,
+    max_tokens: int = 2048,
+):
+    """Call the LLM and parse a JSON object/array out of the response.
+    Returns parsed JSON or None."""
+    import json as _json
+    import re as _re
+
+    out = complete(prompt=prompt, system=system, max_tokens=max_tokens)
+    if not out:
+        return None
+    text = out.strip()
+    # Strip markdown fences if present
+    fence = _re.search(r"```(?:json)?\s*(.*?)```", text, _re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    # Find outermost JSON object or array
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = text.find(open_ch)
+        end = text.rfind(close_ch)
+        if start >= 0 and end > start:
+            try:
+                return _json.loads(text[start:end + 1])
+            except Exception:
+                continue
+    return None
+
+
 def complete(
     prompt: str,
     system: Optional[str] = None,

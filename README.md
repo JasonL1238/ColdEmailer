@@ -1,45 +1,12 @@
-# AI Cold Emailer
+# Reach — AI cold outreach studio
 
-AI-powered cold outreach pipeline: CSV contacts → automated company research → LLM-generated personalized emails → review UI → batch send via Gmail API.
-
-## Architecture
+Find companies with an AI search, scrape their sites for contact emails and talking points, generate a tailored cold email for each one, send it from your Gmail, and track every reply — in one app.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Frontend (React + Vite)  :5173                                 │
-│  ┌──────────────┐  ┌──────────────┐                             │
-│  │  CSVManager   │  │ EmailReview  │                             │
-│  │  (contacts)   │  │ (review/send)│                             │
-│  └──────┬───────┘  └──────┬───────┘                             │
-│         └────────┬────────┘                                     │
-│                  │ axios                                        │
-├──────────────────┼──────────────────────────────────────────────┤
-│  Backend (FastAPI)  :8000                                       │
-│                  │                                              │
-│  ┌───────────────▼───────────────┐                              │
-│  │         main.py (API)         │                              │
-│  └──┬───────┬───────┬──────┬────┘                               │
-│     │       │       │      │                                    │
-│  ┌──▼──┐ ┌──▼───┐ ┌─▼──┐ ┌▼──────────────┐                     │
-│  │ CSV │ │Email │ │LLM │ │  Company       │                     │
-│  │Proc.│ │Sender│ │Gen.│ │  Enrichment    │                     │
-│  └──┬──┘ └──┬───┘ └─┬──┘ └┬──────────────┘                     │
-│     │       │       │      │                                    │
-│  contacts  Gmail   Cloud  Web Scraper                           │
-│  .csv      API     LLM   (requests +                            │
-│            OAuth2  API    trafilatura +                          │
-│                           DuckDuckGo)                           │
-└─────────────────────────────────────────────────────────────────┘
+Discover ──▶ Database ──▶ Emails ──▶ Send ──▶ Track
+ search       companies    AI drafts   Gmail    replies
+ + scrape     + contacts   by type     + resume + follow-ups
 ```
-
-## Features
-
-- **CSV contacts** — Upload, edit, add, delete; sections: Emailed, Generated (not sent), No emails yet
-- **Company research** — DuckDuckGo search → web scraping → LLM metadata extraction (summary, product, industry, news)
-- **AI email generation** — Cloud LLM (Gemini/OpenRouter/OpenAI) writes personalized cold emails using company research + your resume/skills. Template fallback if no LLM key is set.
-- **Review UI** — Accept/trash before sending; inline edit subject & body; attach resume (2028 or 2029)
-- **Batch send** — Gmail API with rate limits, response tracking, and follow-up reminders
-- **Follow-ups** — Auto-detect no-response contacts; generate and send follow-up emails
 
 ## Quick start
 
@@ -47,121 +14,121 @@ AI-powered cold outreach pipeline: CSV contacts → automated company research �
 ./start.sh
 ```
 
-Then open **http://localhost:5173**.
-Backend: http://localhost:8000 · API docs: http://localhost:8000/docs
+Opens the app at **http://localhost:5173** (API docs at http://localhost:8000/docs). First run creates the Python venv and installs dependencies automatically.
 
-## Prerequisites
+## What it does
 
-- **Python 3.12** (3.13 has compatibility issues; use `python3.12 -m venv venv` if needed)
-- **Node.js 18+**
-- **LLM API key** — At least one of: Google AI (Gemini), OpenRouter, or OpenAI. See `.env.example`.
-- **Ollama** (optional) — [ollama.ai](https://ollama.ai) for local follow-up generation: `ollama pull llama3.2`
+**Discover** — Type what you're looking for in plain English ("seed-stage fintech startups in New York"). Reach asks the LLM for real matching companies, cross-checks with a web search, finds each company's website, scrapes the homepage plus `/about`, `/contact`, `/team`, and `/careers`, and extracts both a structured company profile (what they do, product, industry, personalization hook, recent news) and any contact email addresses it finds. Runs in the background with live progress.
+
+**Database** — Every company and contact in one place. Drill into a company to see its scraped research, its contacts, and the full email history with that company. Import contacts from CSV (`name, company, email` header) or add them by hand. Re-run research on any company at any time.
+
+**Resumes** — Upload multiple PDF versions ("ML research", "Full-stack", "2029 general"). Reach extracts the text so the AI can weave your real projects into emails, and attaches the PDF you pick when sending. One is marked default.
+
+**Emails** — Pick contacts, choose an email type, and Reach writes each one individually using that company's scraped research plus your selected resume and profile:
+
+| Type | What it writes |
+|---|---|
+| **Application** | Internship/job inquiry, leaning hard on your resume to argue fit for that specific company |
+| **Coffee chat** | Warm networking ask for 15 minutes; explicitly not asking for a job |
+| **Sales / Pitch** | Product pitch framed around the recipient's problem, not your biography |
+| **Custom** | Follows your own instructions, still grounded in the scraped research |
+
+Add free-text instructions to any type ("mention I saw their Show HN post"). Review drafts side by side, edit subject and body inline, rewrite with AI, approve, then send in a batch.
+
+**Tracking** — The dashboard shows the funnel (companies → contacts → drafts → sent → replied), a 30-day sent/reply chart, per-type reply rates, and a live activity feed. "Check replies" scans your Gmail threads for genuine responses, ignoring bounces, out-of-office auto-replies, and your own follow-ups in the same thread. Anything quiet for 7+ days surfaces as a follow-up suggestion with one-click drafting; follow-ups are threaded onto the original conversation.
+
+## Guardrails
+
+Cold outreach is easy to get wrong in ways that are embarrassing rather than merely broken, so a few things are enforced rather than left to care:
+
+- **Nobody gets the same first email twice.** Anyone already emailed is skipped during generation and pointed at the follow-up flow. You can override it with a checkbox when you mean to.
+- **Scraped text can't hijack your emails.** Company research is untrusted input: it is fenced as data in the prompt, and any page that tries to inject instructions has its text dropped rather than quoted.
+- **The website has to actually be the company's.** A search result is only accepted if the domain matches the name or the page names the company; otherwise the row is marked *Wrong site found* instead of inventing a profile. Existing bad rows are cleaned up on first startup.
+- **Emails don't claim attachments they don't have.** The "resume is attached" line only appears when a real PDF will be attached, and sales emails never attach one.
+- **Sent mail is not deletable.** It is the record of what a real person received, and it is what prevents double-contacting.
+- **Addresses are validated twice** — on the way in and again at send time — so a comma or newline can never add a recipient or a `Bcc:` header.
+- **Archive, don't delete.** Archiving keeps the history and stops future outreach.
 
 ## Setup
 
-### 1. Environment
+### 1. AI provider (required for discovery and AI writing)
 
-Copy `.env.example` to `.env` and fill in your API key(s):
+Copy `.env.example` to `.env` and add one key:
 
 ```bash
 cp .env.example .env
 ```
 
-Key settings:
-- `GOOGLE_AI_API_KEY` — Gemini (recommended, free tier available). Provider auto-detected by key.
-- `OPENROUTER_API_KEY` / `OPENAI_API_KEY` — alternatives
-- `OLLAMA_BASE_URL`, `OLLAMA_MODEL` — local Ollama for follow-ups
-- Rate limits: `MAX_EMAILS_PER_DAY`, `MAX_EMAIL_GENERATIONS_PER_MINUTE`, etc.
-- `RESUME_PATH` — resume PDF for attachments (optional; app also checks `resume28.pdf` / `resume29.pdf` in project root)
+- `GOOGLE_AI_API_KEY` — Gemini, has a free tier, recommended
+- `OPENAI_API_KEY` or `OPENROUTER_API_KEY` — alternatives
 
-### 2. Gmail API (for sending)
+Without a key the app still runs: emails fall back to plain templates and discovery relies on web search alone.
 
-1. [Google Cloud Console](https://console.cloud.google.com/) → create project → enable **Gmail API**
-2. **APIs & Services** → **Credentials** → **Create credentials** → **OAuth client ID**
-3. Configure OAuth consent screen if prompted (External, app name, add scope `https://www.googleapis.com/auth/gmail.send`, add your email as test user)
-4. Application type: **Desktop app** → Create → **Download JSON**
-5. Save as `credentials.json` in **project root**
-6. First send will open the browser for sign-in; `token.json` is created automatically
+### 2. Gmail (required for sending)
 
-**Troubleshooting:** "Credentials not found" → ensure `credentials.json` is in project root. "Access denied" → add your Gmail as test user in OAuth consent screen. To switch account → delete `token.json` and send again.
+1. [Google Cloud Console](https://console.cloud.google.com/) → new project → enable **Gmail API**
+2. **Credentials** → **Create credentials** → **OAuth client ID** → **Desktop app**
+3. Download the JSON, save it as `credentials.json` in the project root
 
-### 3. Resume (optional)
+The first time you hit Send, a Google sign-in window opens on the machine running the backend. The resulting `token.json` is gitignored, and you can disconnect from Settings.
 
-Put a PDF in project root (e.g. `resume.pdf`, `resume28.pdf`, `resume29.pdf`) or set `RESUME_PATH` in `.env`. When sending, you can attach **2028 resume** (default) or **2029 resume** from the dropdown.
+### 3. Your profile
 
-## Running
+Open **Settings** and fill in your name, email, school, website, and a concrete background one-liner. The AI writes every email as you, so specifics here ("built computer-vision pipelines with OpenCV and YOLO") produce far better emails than generalities.
 
-**One command:** `./start.sh` (starts backend on 8000, frontend on 5173).
+## Architecture
 
-**Manual (two terminals):**
+```
+frontend/  React + Vite SPA
+  src/pages/   Dashboard, Discover, DatabasePage, Emails, Resumes, Settings, ComposeModal
+  src/ui.jsx   shared primitives (Modal, Drawer, Chip, job polling hook)
+  src/api.js   API client
+  src/styles.css  design system
 
-```bash
-# Terminal 1
-cd backend && source venv/bin/activate && uvicorn main:app --reload --port 8000
-
-# Terminal 2
-cd frontend && npm run dev
+backend/   FastAPI
+  main.py           all HTTP routes
+  db.py             SQLite layer + legacy migration
+  discovery.py      background company-discovery jobs
+  enrichment.py     scraping, email extraction, LLM metadata
+  generation.py     background email-generation jobs
+  email_composer.py email types, prompts, template fallbacks
+  resume_service.py PDF upload/parse/versioning
+  email_sender.py   Gmail send
+  response_checker.py  reply detection
+  llm_client.py     provider abstraction (Gemini/OpenAI/OpenRouter)
 ```
 
-Open http://localhost:5173.
+Everything lives in one SQLite database at `backend/data/coldemailer.db` — companies, contacts, resumes, emails, background jobs, settings, and an event log. Long operations (discovery, generation, sending) run as background jobs the UI polls for progress, so nothing blocks the browser.
 
-## Usage
+Data from the previous CSV/JSON version (`contacts.csv`, `generated_emails.json`, `company_cache.json`, root-level `resume*.pdf`) is imported automatically on first startup.
 
-1. **Contacts** — Upload CSV (columns: `name`, `company`, `email`) or add manually
-2. **Review Emails** — "Generate Emails" for contacts with no email; review and accept/trash
-3. **Settings** (⚙️) — Name, email, background (used in generation)
-4. **Send** — "Send Accepted Emails"; attach 2028 or 2029 resume (default 2028)
-5. **Emailed** tab — Sent dates, response status, follow-up reminders (e.g. after 1 week)
+## Configuration
 
-## How email generation works
+All optional, set in `.env`:
 
-1. **Company enrichment** — DuckDuckGo search finds the company website; `trafilatura` + `BeautifulSoup` scrape and clean the page; an LLM extracts structured metadata (summary, product, industry, recent news).
-2. **Email drafting** — The cloud LLM (Gemini by default) receives your resume/skills + company metadata and writes a personalized cold email. Falls back to a fixed template if no LLM key is configured.
-3. **Gemini model fallback** — On quota exhaustion (429), automatically cycles through: `gemini-2.5-flash` → `gemini-3-flash` → `gemini-3.1-flash-lite` → lighter Gemma models.
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAX_EMAILS_PER_DAY` | 50 | Send cap |
+| `MAX_EMAIL_GENERATIONS_PER_DAY` | 500 | Generation cap |
+| `MAX_EMAIL_GENERATIONS_PER_MINUTE` | 10 | Burst cap |
+| `MAX_COMPANY_RESEARCH_PER_MINUTE` | 5 | Scrape rate |
+| `EMAIL_SEND_DELAY_SECONDS` | 3 | Pause between sends |
+| `EMAIL_LLM_MODEL` | provider default | Override the model |
+| `CORS_ORIGINS` | localhost:5173,3000 | Allowed frontend origins |
+| `COLD_DB_PATH` | `backend/data/coldemailer.db` | Database location |
 
-## Rate limits
+## Tests
 
-Configured in `.env`; restart backend after changes.
+```bash
+cd tests && ../backend/venv/bin/python -m pytest     # 276 backend tests
+```
 
-| Limit | Default | Env variable |
-|-------|---------|--------------|
-| Emails per day (send) | 50 | `MAX_EMAILS_PER_DAY` (Gmail free tier up to 500/day) |
-| Generations per day | 500 | `MAX_EMAIL_GENERATIONS_PER_DAY` |
-| Generations per minute | 10 | `MAX_EMAIL_GENERATIONS_PER_MINUTE` |
-| Company researches per minute | 5 | `MAX_COMPANY_RESEARCH_PER_MINUTE` |
-| Delay between sends | 3 s | `EMAIL_SEND_DELAY_SECONDS` |
+```bash
+cd frontend && npm test                              # 25 frontend tests
+```
 
-## CSV format
+The backend suite runs against a throwaway database (`tests/conftest.py` sets `COLD_DB_PATH`), so it never touches your real data or Gmail credentials.
 
-- **Required:** `name`, `company`, `email`
-- **Optional:** `id`, `status` (e.g. pending, trashed, sent)
+## Notes on responsible use
 
-**Personalization:** The email body uses your `skills.md` file (project root) for the "about you" sentence. Add a `## Email one-liner` section with one sentence, or the app uses the first sentence of your first `## Experience` block.
-
-## Security
-
-- Do **not** commit `.env`, `credentials.json`, or `token.json` (they are in `.gitignore`)
-- Use `.env.example` as a template (no real secrets)
-- CORS origins: set `CORS_ORIGINS` in `.env` for production
-
-## Project layout
-
-- **backend/** — FastAPI, CSV/contact handling, LLM client, Gmail send, rate limiting
-- **frontend/** — React + Vite UI
-- **stress/** — Load/concurrency tests
-- **tests/** — Unit tests
-
-## Tech stack
-
-| Layer | Tech |
-|-------|------|
-| Frontend | React 18, Vite, react-hot-toast |
-| Backend | Python 3.12, FastAPI, Uvicorn |
-| LLM | Google Gemini (primary), OpenRouter, OpenAI, Ollama (local fallback) |
-| Email | Gmail API (OAuth2) |
-| Scraping | requests, trafilatura, BeautifulSoup4, duckduckgo-search |
-| Data | CSV (contacts), JSON (emails, company cache) |
-
-## License
-
-MIT
+Reach respects `robots.txt` when scraping and rate-limits requests per domain. Cold email is regulated in most jurisdictions (CAN-SPAM, GDPR, CASL) — send to people plausibly interested in hearing from you, keep volumes sane, and honor opt-outs.

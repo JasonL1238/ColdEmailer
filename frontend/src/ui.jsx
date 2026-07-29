@@ -1,0 +1,210 @@
+/* Shared UI primitives + hooks */
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { X } from 'lucide-react'
+import { jobsAPI } from './api'
+
+export function Button({ variant = 'secondary', size, icon: Icon, children, className = '', ...props }) {
+  return (
+    <button
+      className={`btn btn-${variant} ${size ? `btn-${size}` : ''} ${className}`}
+      {...props}
+    >
+      {Icon && <Icon size={size === 'sm' ? 13 : 15} strokeWidth={2.2} />}
+      {children}
+    </button>
+  )
+}
+
+export function Chip({ tone = 'gray', children }) {
+  return <span className={`chip chip-${tone}`}>{children}</span>
+}
+
+export function Spinner({ lg }) {
+  return <div className={`spinner ${lg ? 'lg' : ''}`} />
+}
+
+export function ProgressBar({ current, total, indeterminate }) {
+  const pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0
+  return (
+    <div className="progress">
+      <div
+        className={`progress-fill ${indeterminate ? 'indeterminate' : ''}`}
+        style={{ width: `${indeterminate ? 30 : pct}%` }}
+      />
+    </div>
+  )
+}
+
+export function Modal({ title, onClose, footer, children, large }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === 'Escape' && onClose?.()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  return (
+    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose?.()}>
+      <div className={`modal ${large ? 'modal-lg' : ''}`}>
+        <div className="modal-head">
+          <div className="modal-title">{title}</div>
+          <button className="icon-btn" onClick={onClose} aria-label="Close">
+            <X size={17} />
+          </button>
+        </div>
+        <div className="modal-body">{children}</div>
+        {footer && <div className="modal-foot">{footer}</div>}
+      </div>
+    </div>
+  )
+}
+
+export function Drawer({ title, subtitle, onClose, children, actions }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === 'Escape' && onClose?.()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  return (
+    <>
+      <div className="drawer-overlay" onMouseDown={onClose} />
+      <div className="drawer">
+        <div className="drawer-head">
+          <div>
+            <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.01em' }}>{title}</div>
+            {subtitle && <div className="small muted mt-8" style={{ marginTop: 3 }}>{subtitle}</div>}
+          </div>
+          <div className="row">
+            {actions}
+            <button className="icon-btn" onClick={onClose} aria-label="Close">
+              <X size={17} />
+            </button>
+          </div>
+        </div>
+        <div className="drawer-body">{children}</div>
+      </div>
+    </>
+  )
+}
+
+export function EmptyState({ icon: Icon, title, desc, action }) {
+  return (
+    <div className="empty">
+      {Icon && (
+        <div className="empty-icon">
+          <Icon size={21} />
+        </div>
+      )}
+      <div className="empty-title">{title}</div>
+      {desc && <div className="empty-desc">{desc}</div>}
+      {action}
+    </div>
+  )
+}
+
+export function Segmented({ options, value, onChange }) {
+  return (
+    <div className="segmented">
+      {options.map((o) => (
+        <button key={o.value} className={value === o.value ? 'active' : ''} onClick={() => onChange(o.value)}>
+          {o.label}
+          {o.count != null && <span className="count">{o.count}</span>}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/* ---------- hooks ---------- */
+
+/** Poll a background job until it reaches a terminal state.
+ *  Gives up after `maxFailures` consecutive errors and reports a synthetic
+ *  failed job, so a backend blip cannot leave the caller polling forever with
+ *  a modal stuck open. */
+export function useJobPolling(onUpdate, interval = 1500, maxFailures = 8) {
+  const [job, setJob] = useState(null)
+  const timer = useRef(null)
+  const cbRef = useRef(onUpdate)
+  cbRef.current = onUpdate
+
+  const stop = useCallback(() => {
+    if (timer.current) clearInterval(timer.current)
+    timer.current = null
+  }, [])
+
+  const track = useCallback((initialJob) => {
+    stop()
+    setJob(initialJob)
+    if (!initialJob?.id) return
+    let failures = 0
+    timer.current = setInterval(async () => {
+      try {
+        const { data } = await jobsAPI.get(initialJob.id)
+        failures = 0
+        setJob(data)
+        cbRef.current?.(data)
+        if (['done', 'failed', 'cancelled'].includes(data.status)) stop()
+      } catch {
+        if (++failures >= maxFailures) {
+          stop()
+          const lost = {
+            ...initialJob,
+            status: 'failed',
+            error: 'Lost contact with the backend while tracking this job. '
+              + 'It may still be running — reload to see the result.',
+          }
+          setJob(lost)
+          cbRef.current?.(lost)
+        }
+      }
+    }, interval)
+  }, [interval, maxFailures, stop])
+
+  useEffect(() => stop, [stop])
+  return { job, track, clear: () => { stop(); setJob(null) } }
+}
+
+/* ---------- utils ---------- */
+
+export function timeAgo(iso) {
+  if (!iso) return ''
+  const then = new Date(iso)
+  if (isNaN(then)) return ''
+  const sec = Math.floor((Date.now() - then.getTime()) / 1000)
+  if (sec < 45) return 'just now'
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`
+  if (sec < 86400 * 30) return `${Math.floor(sec / 86400)}d ago`
+  return then.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+export function fmtDate(iso) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (isNaN(d)) return '—'
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+export const EMAIL_TYPE_META = {
+  application: { label: 'Application', tone: 'accent' },
+  coffee_chat: { label: 'Coffee chat', tone: 'sky' },
+  sales: { label: 'Sales', tone: 'green' },
+  custom: { label: 'Custom', tone: 'violet' },
+  follow_up: { label: 'Follow-up', tone: 'amber' },
+}
+
+export const CONTACT_STATUS_META = {
+  new: { label: 'New', tone: 'gray' },
+  drafted: { label: 'Drafted', tone: 'accent' },
+  sent: { label: 'Sent', tone: 'sky' },
+  replied: { label: 'Replied', tone: 'green' },
+  archived: { label: 'Archived', tone: 'gray' },
+}
+
+export function initials(name) {
+  return (name || '?')
+    .split(/\s+/)
+    .map((w) => w[0])
+    .filter(Boolean)
+    .slice(0, 2)
+    .join('')
+    .toUpperCase()
+}

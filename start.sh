@@ -1,69 +1,64 @@
 #!/bin/bash
+# Start Reach — backend (FastAPI :8000) + frontend (Vite :5173)
+set -e
 
-# Start script for AI Cold Emailer
-# Run this to start both backend and frontend
-
-echo "🚀 Starting AI Cold Emailer..."
-echo ""
-
-# Check if Ollama is running
-if ! pgrep -x "ollama" > /dev/null; then
-    echo "⚠️  Starting Ollama..."
-    ollama serve > /dev/null 2>&1 &
-    sleep 2
-fi
-
-# Get absolute script directory first (before any cd commands)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BACKEND_LOG=/tmp/reach_backend.log
+FRONTEND_LOG=/tmp/reach_frontend.log
 
-# Start backend
-echo "📦 Starting backend server..."
+echo "🚀 Starting Reach…"
+echo ""
+
+# --- backend ---
 cd "$SCRIPT_DIR/backend"
-source venv/bin/activate
-uvicorn main:app --reload --port 8000 > /tmp/coldemailer_backend.log 2>&1 &
+if [ ! -d venv ]; then
+    echo "📦 Creating Python venv (first run)…"
+    python3.12 -m venv venv 2>/dev/null || python3 -m venv venv
+    ./venv/bin/pip install -q --upgrade pip
+    ./venv/bin/pip install -q -r requirements.txt
+fi
+./venv/bin/python -m uvicorn main:app --reload --port 8000 > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
-echo "✅ Backend started (PID: $BACKEND_PID)"
-echo "   API: http://localhost:8000"
-echo ""
 
-# Wait for backend to start
-sleep 3
-
-# Start frontend
-echo "🎨 Starting frontend server..."
-FRONTEND_DIR="$SCRIPT_DIR/frontend"
-(cd "$FRONTEND_DIR" && npm run dev > /tmp/coldemailer_frontend.log 2>&1) &
+# --- frontend ---
+cd "$SCRIPT_DIR/frontend"
+if [ ! -d node_modules ]; then
+    echo "📦 Installing frontend dependencies (first run)…"
+    npm install --silent
+fi
+npm run dev > "$FRONTEND_LOG" 2>&1 &
 FRONTEND_PID=$!
-echo "✅ Frontend started (PID: $FRONTEND_PID)"
-echo "   App: http://localhost:5173"
+
+# --- wait for backend to answer ---
+printf "⏳ Waiting for backend"
+for _ in $(seq 1 30); do
+    if curl -sf http://localhost:8000/ > /dev/null 2>&1; then break; fi
+    printf "."
+    sleep 1
+done
 echo ""
 
-echo "✨ Application is running!"
 echo ""
-echo "📝 Access the app at: http://localhost:5173"
+echo "✨ Reach is running"
+echo "   App:      http://localhost:5173"
+echo "   API docs: http://localhost:8000/docs"
 echo ""
-echo "📋 Setup Checklist:"
-echo "   ✅ Backend running on port 8000"
-echo "   ✅ Frontend running on port 5173"
-# Check files from project root, not backend directory
+
+# --- setup checklist ---
 if [ -f "$SCRIPT_DIR/credentials.json" ]; then
     echo "   ✅ Gmail credentials found"
 else
-    echo "   ⚠️  Gmail credentials missing (see GMAIL_SETUP.md)"
+    echo "   ⚠️  No credentials.json — sending is disabled until you add it (see README)"
 fi
-if [ -f "$SCRIPT_DIR/resume.pdf" ] || [ -f "$SCRIPT_DIR/Current_Resume_2 12.43.21 PM.pdf" ] || [ -f "$SCRIPT_DIR/resume28.pdf" ] || [ -f "$SCRIPT_DIR/resume29.pdf" ]; then
-    echo "   ✅ Resume file found"
+if grep -qE '^(GOOGLE_AI_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY)=.+' "$SCRIPT_DIR/.env" 2>/dev/null; then
+    echo "   ✅ AI provider key found"
 else
-    echo "   ⚠️  Resume file missing"
+    echo "   ⚠️  No AI key in .env — discovery and AI writing are disabled (template mode only)"
 fi
 echo ""
-echo "📋 Logs:"
-echo "   Backend: tail -f /tmp/coldemailer_backend.log"
-echo "   Frontend: tail -f /tmp/coldemailer_frontend.log"
-echo ""
-echo "🛑 To stop: Press Ctrl+C or run: kill $BACKEND_PID $FRONTEND_PID"
+echo "   Logs: tail -f $BACKEND_LOG   |   tail -f $FRONTEND_LOG"
+echo "   Stop: Ctrl+C"
 echo ""
 
-# Wait for user interrupt
 trap "kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit" INT TERM
 wait

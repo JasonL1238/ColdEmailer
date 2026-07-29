@@ -1,82 +1,156 @@
-from pydantic import BaseModel, EmailStr
-from typing import Optional, Dict, Any, List
-from datetime import datetime
+"""Pydantic request models for the API. Responses are plain dicts from the DB layer."""
+import re
+from typing import List, Optional
+from urllib.parse import urlparse
+
+from pydantic import BaseModel, Field, field_validator
+
+# Strict single-address pattern: no commas/semicolons/angle-brackets/whitespace,
+# so a stored address can never smuggle extra recipients into a To: header.
+EMAIL_ADDRESS_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+")
 
 
-class Contact(BaseModel):
-    id: Optional[str] = None
-    name: str = ""  # Allow empty for initial creation
-    company: str = ""  # Allow empty for initial creation
-    email: str = ""  # Allow empty for initial creation, validate later
-    status: Optional[str] = "pending"  # pending, trashed, sent
-    role: Optional[str] = None  # Recipient role/title for personalization
+def validate_email_address(value: Optional[str]) -> Optional[str]:
+    """Empty/None pass through; anything else must be one plain address."""
+    if value is None:
+        return value
+    value = value.strip()
+    if value and not EMAIL_ADDRESS_RE.fullmatch(value):
+        raise ValueError(f"Invalid email address: {value}")
+    return value
 
 
-class CompanyMetadata(BaseModel):
-    company_name: str
+def validate_http_url(value: Optional[str]) -> Optional[str]:
+    """Company URLs must be plain http(s) on a standard port (SSRF guard;
+    the scraper additionally rejects hosts resolving to private IPs)."""
+    if value is None:
+        return value
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("URL has an invalid port")
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL must be a full http:// or https:// address")
+    if port not in (None, 80, 443):
+        raise ValueError("URL must use a standard http/https port")
+    return value
+
+
+class ProfileUpdate(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    school: Optional[str] = None
+    website: Optional[str] = None
+    background: Optional[str] = None
+    signature: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _check_email(cls, v):
+        # This becomes the From address on every send.
+        return validate_email_address(v)
+
+
+class DiscoveryRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=300)
+    count: int = Field(10, ge=1, le=25)
+
+
+class CompanyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    url: Optional[str] = None
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, v):
+        return validate_http_url(v)
+
+
+class CompanyUpdate(BaseModel):
+    name: Optional[str] = None
     url: Optional[str] = None
     summary: Optional[str] = None
     industry: Optional[str] = None
     product: Optional[str] = None
-    why_engineers_care: Optional[str] = None
-    hook_sentence: Optional[str] = None
-    recent_news: Optional[str] = None  # Recent launch, feature, or news
-    confidence_score: Optional[float] = None
-    cached_at: Optional[datetime] = None
+    hook: Optional[str] = None
+    location: Optional[str] = None
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, v):
+        return validate_http_url(v)
 
 
-class GeneratedEmail(BaseModel):
-    id: Optional[str] = None
-    contact_id: str
-    contact_name: str
-    contact_email: EmailStr
-    company: str
-    subject: str
-    body: str
-    status: str = "pending"  # pending, accepted, trashed, sent
-    created_at: Optional[datetime] = None
-    sent_at: Optional[datetime] = None  # When email was actually sent
-    gmail_message_id: Optional[str] = None  # Gmail API message ID for tracking
-    has_response: bool = False  # Whether recipient replied
-    response_date: Optional[datetime] = None  # When response was received
-    original_email_id: Optional[str] = None  # For follow-ups, link to original email
-    is_follow_up: bool = False  # Whether this is a follow-up email
-    follow_up_generated_at: Optional[datetime] = None  # When follow-up was generated
-    follow_up_sent_at: Optional[datetime] = None  # When follow-up was sent (None if not sent yet)
-    used_template_fallback: Optional[bool] = None  # True if template was used (AI skipped or failed)
-    fallback_reason: Optional[str] = None  # "user_requested" | "llm_unavailable" (quota/error)
+class ContactCreate(BaseModel):
+    name: str = ""
+    email: str = ""
+    role: Optional[str] = None
+    company_id: Optional[str] = None
+    company_name: Optional[str] = None  # create/link company by name
+    notes: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _check_email(cls, v):
+        return validate_email_address(v)
 
 
-class EmailGenerationRequest(BaseModel):
-    contact_ids: Optional[List[str]] = None  # None means all pending contacts
-    user_name: Optional[str] = None  # Your name for email signature
-    user_background: Optional[str] = None  # Your background/qualifications
-    user_email: Optional[str] = None  # Your email address
-    use_template_only: Optional[bool] = False  # Skip AI; generate with template only (no API calls)
+class ContactUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    role: Optional[str] = None
+    company_id: Optional[str] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _check_email(cls, v):
+        return validate_email_address(v)
 
 
-class EmailSendRequest(BaseModel):
-    email_ids: List[str]
-    attach_resume: Optional[str] = None  # e.g. "resume28.pdf", "resume29.pdf"; None = no attachment
-    from_email: Optional[str] = None  # User's email for From header (from settings)
+class BulkIds(BaseModel):
+    ids: List[str]
 
 
-class EmailUpdateRequest(BaseModel):
+class GenerateRequest(BaseModel):
+    contact_ids: List[str] = Field(..., min_length=1)
+    email_type: str = "application"
+    resume_id: Optional[str] = None
+    custom_instructions: Optional[str] = Field(None, max_length=2000)
+    use_template_only: bool = False
+    # Opt in to drafting another first-contact email for someone already emailed
+    allow_recontact: bool = False
+
+
+class EmailUpdate(BaseModel):
     subject: Optional[str] = None
     body: Optional[str] = None
+    status: Optional[str] = None  # draft | approved | trashed
 
 
-class EmailBulkDeleteRequest(BaseModel):
+class BulkStatus(BaseModel):
     email_ids: List[str]
+    status: str
 
 
-class UsageStats(BaseModel):
-    emails_generated_today: int
-    emails_sent_today: int
-    company_researches_today: int
-    daily_limit: int
-    remaining_emails: int
-    generations_daily_limit: int = 500
-    remaining_generations: int = 500
-    generations_per_minute: int = 15
-    remaining_generations_this_minute: int = 15
+class SendRequest(BaseModel):
+    email_ids: List[str] = Field(..., min_length=1)
+    attach_resume: bool = True
+    resume_id: Optional[str] = None  # override; default = email's own resume or default resume
+    from_email: Optional[str] = None
+
+    @field_validator("from_email")
+    @classmethod
+    def _check_from(cls, v):
+        return validate_email_address(v)
+
+
+class ResumeUpdate(BaseModel):
+    label: Optional[str] = None
+    is_default: Optional[bool] = None

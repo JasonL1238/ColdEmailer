@@ -1,34 +1,24 @@
 # Tests
 
-Unit tests for backend (pytest) and frontend (Vitest).
-
-## Layout
-
-- `unit/backend/` — Python (e.g. `test_csv_processor.py`, `test_rate_limiter.py`, `test_text_cleaner.py`)
-- `unit/frontend/` — JS (e.g. `api.test.js`)
-
 ## Backend (pytest)
 
 ```bash
-# From project root
-pytest tests/
-
-# Specific file
-pytest tests/unit/backend/test_csv_processor.py
-
-# With coverage
-pytest tests/ --cov=backend --cov-report=html
+cd tests && ../backend/venv/bin/python -m pytest
 ```
 
-Requires backend venv activated and deps installed.
+| File | Covers |
+|---|---|
+| `test_db.py` | SQLite layer: CRUD, cascades, follow-up candidate selection, job lifecycle, settings |
+| `test_email_composer.py` | LLM output parsing, template fallbacks per email type, prompt construction |
+| `test_enrichment.py` | Email extraction and ranking, domain parsing, heuristic metadata |
+| `test_security.py` | SSRF guards, recipient validation, reply-check failure handling |
+| `test_rate_limiter.py` | Send/generation/research caps |
+| `test_text_cleaner.py` | Scraped-text normalization |
 
 ## Frontend (Vitest)
 
 ```bash
-cd frontend
-npm run test
+cd frontend && npm test
 ```
 
-## Conftest
-
-`tests/conftest.py` adjusts Python path so `backend` is importable when running pytest from root.
+Covers the API client's request shapes and error normalization.

@@ -1,77 +1,94 @@
 import axios from 'axios'
 import { API_BASE_URL } from './config'
 
-const api = axios.create({
-  baseURL: API_BASE_URL,
-  headers: {
-    'Content-Type': 'application/json',
-  },
-})
+const api = axios.create({ baseURL: API_BASE_URL })
 
-// Contacts API
+// Normalize backend errors into readable messages
+export function errMessage(error, fallback = 'Something went wrong') {
+  const detail = error?.response?.data?.detail
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail) && detail[0]?.msg) return detail[0].msg
+  if (error?.message === 'Network Error') return 'Cannot reach the backend — is it running?'
+  return error?.message || fallback
+}
+
+export const settingsAPI = {
+  get: () => api.get('/settings'),
+  update: (profile) => api.put('/settings', profile),
+}
+
+export const discoveryAPI = {
+  start: (query, count) => api.post('/discovery', { query, count }),
+  list: () => api.get('/discovery'),
+  get: (id) => api.get(`/discovery/${id}`),
+  cancel: (id) => api.post(`/discovery/${id}/cancel`),
+}
+
+export const jobsAPI = {
+  get: (id) => api.get(`/jobs/${id}`),
+}
+
+export const companiesAPI = {
+  list: (search) => api.get('/companies', { params: search ? { search } : {} }),
+  get: (id) => api.get(`/companies/${id}`),
+  create: (name, url) => api.post('/companies', { name, url: url || null }),
+  update: (id, data) => api.put(`/companies/${id}`, data),
+  enrich: (id) => api.post(`/companies/${id}/enrich`),
+  delete: (id) => api.delete(`/companies/${id}`),
+}
+
 export const contactsAPI = {
-  getAll: (status) => api.get('/contacts', { params: { status } }),
-  create: (contact) => api.post('/contacts', contact),
-  update: (id, updates) => api.put(`/contacts/${id}`, updates),
-  delete: (id) => api.delete(`/contacts/${id}`),
-  bulkDelete: (ids) => api.post('/contacts/bulk-delete', ids),
-  bulkUpdate: (updates) => api.put('/contacts/bulk', updates),
-  save: () => api.post('/contacts/save'),
-  upload: (file) => {
-    const formData = new FormData()
-    formData.append('file', file)
-    return api.post('/upload', formData, {
-      transformRequest: [(data, headers) => {
-        delete headers['Content-Type']
-        return data
-      }],
-    })
+  list: (params = {}) => api.get('/contacts', { params }),
+  create: (data) => api.post('/contacts', data),
+  update: (id, data) => api.put(`/contacts/${id}`, data),
+  delete: (id, force = false) => api.delete(`/contacts/${id}`, { params: { force } }),
+  bulkDelete: (ids, force = false) => api.post('/contacts/bulk-delete', { ids }, { params: { force } }),
+  import: (file) => {
+    const form = new FormData()
+    form.append('file', file)
+    return api.post('/contacts/import', form)
   },
-  export: (section) => api.get('/contacts/export', { 
-    params: section ? { section } : {},
-    responseType: 'blob' 
-  }),
-  getCategorized: () => api.get('/contacts/categorized'),
-  getFollowUpReminders: () => api.get('/follow-up-reminders'),
-  generateFollowUp: (emailId, userInfo) => api.post('/generate-follow-up', {
-    email_id: emailId,
-    ...userInfo
-  }),
+  exportUrl: () => `${API_BASE_URL}/contacts/export`,
 }
 
-// Company API
-export const companyAPI = {
-  enrich: (companyName, url) => api.post('/enrich-company', null, {
-    params: { company_name: companyName, ...(url && { url }) },
-  }),
-  getMetadata: (companyName) => api.get(`/company-metadata/${companyName}`),
+export const resumesAPI = {
+  list: () => api.get('/resumes'),
+  upload: (file, label) => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('label', label || '')
+    return api.post('/resumes', form)
+  },
+  update: (id, data) => api.put(`/resumes/${id}`, data),
+  delete: (id, force = false) => api.delete(`/resumes/${id}`, { params: { force } }),
+  fileUrl: (id) => `${API_BASE_URL}/resumes/${id}/file`,
 }
 
-// Email API
-export const emailAPI = {
-  generate: (contactIds = null, userName = null, userBackground = null, userEmail = null, useTemplateOnly = false) =>
-    api.post('/generate-emails', {
-      contact_ids: contactIds,
-      user_name: userName,
-      user_background: userBackground,
-      user_email: userEmail,
-      use_template_only: useTemplateOnly,
-    }),
-  getAll: (status) => api.get('/emails', { params: { status } }),
-  updateStatus: (id, status) => api.put(`/emails/${id}`, null, {
-    params: { status },
-  }),
+export const emailsAPI = {
+  types: () => api.get('/email-types'),
+  generate: (payload) => api.post('/emails/generate', payload),
+  cancelGeneration: (jobId) => api.post(`/emails/generate/${jobId}/cancel`),
+  list: (status) => api.get('/emails', { params: status ? { status } : {} }),
+  get: (id) => api.get(`/emails/${id}`),
   update: (id, data) => api.patch(`/emails/${id}`, data),
+  bulkStatus: (emailIds, status) => api.post('/emails/bulk-status', { email_ids: emailIds, status }),
   delete: (id) => api.delete(`/emails/${id}`),
-  bulkDelete: (emailIds) => api.post('/emails/bulk-delete', { email_ids: emailIds }),
-  send: (emailIds, attachResume = null, fromEmail = null) =>
-    api.post('/send-emails', { email_ids: emailIds, attach_resume: attachResume || null, from_email: fromEmail || null }),
-  disconnectGmail: () => api.post('/gmail-disconnect'),
+  bulkDelete: (ids) => api.post('/emails/bulk-delete', { ids }),
+  regenerate: (id) => api.post(`/emails/${id}/regenerate`),
+  send: (payload) => api.post('/emails/send', payload),
+  cancelSend: (jobId) => api.post(`/emails/send/${jobId}/cancel`),
+  followUps: (days = 7) => api.get('/follow-ups', { params: { days } }),
+  generateFollowUp: (emailId) => api.post(`/emails/${emailId}/follow-up`),
+  checkReplies: (recheck = false) => api.post('/emails/check-replies', null, { params: { recheck } }),
 }
 
-// Usage API
-export const usageAPI = {
-  getStats: () => api.get('/usage'),
+export const dashboardAPI = {
+  get: () => api.get('/dashboard'),
+}
+
+export const gmailAPI = {
+  status: () => api.get('/gmail/status'),
+  disconnect: () => api.post('/gmail/disconnect'),
 }
 
 export default api

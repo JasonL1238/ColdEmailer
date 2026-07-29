@@ -1,682 +1,1151 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Body
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from typing import List, Optional
-from datetime import datetime
+"""
+Cold Emailer API — discovery, database, resumes, generation, sending, tracking.
+"""
+import io
+import json
 import os
-import random
-import time
-import asyncio
-from dotenv import load_dotenv
+import threading
+from datetime import datetime, timedelta
+from typing import Optional
 
-from models import (
-    Contact, CompanyMetadata, GeneratedEmail, 
-    EmailGenerationRequest, EmailSendRequest, EmailUpdateRequest, EmailBulkDeleteRequest, UsageStats
-)
-from csv_processor import CSVProcessor
-from company_enrichment_service import CompanyEnrichmentService
-from email_generator import EmailGenerator
-from email_sender import EmailSender
-from rate_limiter import RateLimiter
-from email_storage import EmailStorage
-from response_checker import ResponseChecker
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 load_dotenv()
-# Load project-root .env when running from backend/ (e.g. start.sh does cd backend)
-_project_root_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-if os.path.isfile(_project_root_env):
-    load_dotenv(_project_root_env)
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_BACKEND_DIR)
+_root_env = os.path.join(_PROJECT_ROOT, ".env")
+if os.path.isfile(_root_env):
+    load_dotenv(_root_env)
 
-app = FastAPI(title="AI Cold Emailer API")
+from db import (Database, migrate_legacy_data, now_iso,
+                repair_contact_reply_status, repair_delivered_email_status,
+                repair_mismatched_company_sites,
+                repair_offdomain_contact_warnings)
+from discovery import DiscoveryService
+from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
+                            TemplateUnavailable)
+from email_sender import EmailSender
+from enrichment import EnrichmentService, scrape_status_for
+from generation import GenerationService
+from models import (
+    EMAIL_ADDRESS_RE, BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
+    ContactCreate, ContactUpdate, DiscoveryRequest, EmailUpdate,
+    GenerateRequest, ProfileUpdate, ResumeUpdate, SendRequest,
+)
+from rate_limiter import RateLimiter
+from resume_service import ResumeService
+from response_checker import ResponseChecker
 
-# Stress test mode - simulate slow/failing APIs
-STRESS_TEST_MODE = os.getenv('STRESS_TEST_MODE', 'false').lower() == 'true'
+try:
+    from llm_client import get_cloud_llm_provider
+except ImportError:
+    get_cloud_llm_provider = lambda: None
 
-@app.middleware("http")
-async def stress_test_middleware(request, call_next):
-    """Middleware to simulate slow/failing APIs in stress test mode"""
-    if STRESS_TEST_MODE:
-        # Random delay (0-5 seconds)
-        delay = random.uniform(0, 5)
-        await asyncio.sleep(delay)
-        
-        # Randomly fail 10% of requests
-        if random.random() < 0.1:
-            return JSONResponse(
-                status_code=500,
-                content={"detail": "Simulated API failure for stress testing"}
-            )
-    
-    response = await call_next(request)
-    return response
+app = FastAPI(title="Cold Emailer API", version="2.0")
 
-# CORS middleware (origins from env, comma-separated)
-_cors_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5173,http://localhost:3000').strip().split(',')
+_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+_allowed_origins = {o.strip() for o in _cors_origins if o.strip()}
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
+    allow_origins=sorted(_allowed_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize services
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_resume_env = os.getenv('RESUME_PATH', 'resume.pdf')
-_resume_candidate = _resume_env if os.path.isabs(_resume_env) else os.path.join(_project_root, _resume_env)
-if not os.path.exists(_resume_candidate):
-    for fallback in ("resume28.pdf", "resume29.pdf"):
-        _alt = os.path.join(_project_root, fallback)
-        if os.path.exists(_alt):
-            _resume_candidate = _alt
-            break
-_resume_for_generator = _resume_candidate
-project_root = _project_root
-_backend_dir = os.path.dirname(os.path.abspath(__file__))
-_csv_env = os.getenv('CSV_FILE_PATH')
-if _csv_env and os.path.isabs(_csv_env):
-    _csv_path = _csv_env
-elif _csv_env:
-    _csv_path = os.path.normpath(os.path.join(_project_root, _csv_env))
-else:
-    _csv_path = os.path.join(_backend_dir, 'data', 'contacts.csv')
-csv_processor = CSVProcessor(
-    csv_path=_csv_path
-)
-enrichment_service = CompanyEnrichmentService(
-    cache_path=os.getenv('COMPANY_CACHE_PATH', 'data/company_cache.json')
-)
-email_generator = EmailGenerator(
-    model=os.getenv('OLLAMA_MODEL', 'llama3.2'),
-    base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434'),
-    resume_path=_resume_for_generator
-)
-# Cloud LLM (OpenRouter/OpenAI/Gemini) is configured via env: EMAIL_LLM_PROVIDER, EMAIL_LLM_MODEL, and the corresponding API key. Keys are never logged or sent to the frontend.
-# Get project root (parent of backend directory) - use project_root set above
-credentials_path = os.getenv('CREDENTIALS_JSON_PATH') or os.path.join(project_root, 'credentials.json')
-token_path = os.getenv('TOKEN_JSON_PATH') or os.path.join(project_root, 'token.json')
-email_sender = EmailSender(credentials_path=credentials_path, token_path=token_path, project_root=project_root)
-rate_limiter = RateLimiter()
 
-# Persistent storage for generated emails
-email_storage = EmailStorage(
-    storage_path=os.getenv('EMAIL_STORAGE_PATH', 'data/generated_emails.json')
+@app.middleware("http")
+async def _block_cross_site_writes(request: Request, call_next):
+    """CSRF guard. CORS only hides responses — it does not stop cross-site
+    'simple' requests (form posts, multipart, body-less POSTs) from executing.
+    Reject any state-changing request whose Origin header is present and not
+    an allowed frontend origin. Non-browser clients send no Origin and pass."""
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        origin = request.headers.get("origin")
+        if origin and origin not in _allowed_origins:
+            return JSONResponse(status_code=403,
+                                content={"detail": "Cross-site request blocked"})
+    return await call_next(request)
+
+# ---------- service wiring ----------
+
+db = Database()
+enrichment = EnrichmentService()
+resumes = ResumeService(db)
+composer = EmailComposer(db, resumes)
+rate_limiter = RateLimiter(db)
+discovery = DiscoveryService(db, enrichment)
+generation = GenerationService(db, composer, enrichment, rate_limiter)
+email_sender = EmailSender(
+    credentials_path=os.getenv("CREDENTIALS_JSON_PATH") or os.path.join(_PROJECT_ROOT, "credentials.json"),
+    token_path=os.getenv("TOKEN_JSON_PATH") or os.path.join(_PROJECT_ROOT, "token.json"),
+    project_root=_PROJECT_ROOT,
 )
 
-
-# Contact endpoints
-@app.get("/api/contacts", response_model=List[Contact])
-async def get_contacts(status: Optional[str] = None):
-    """Get all contacts, optionally filtered by status"""
-    contacts = csv_processor.read_contacts()
-    if status:
-        contacts = [c for c in contacts if c.status == status]
-    return contacts
+_send_lock = threading.Lock()  # one send batch at a time
 
 
-@app.post("/api/contacts", response_model=Contact)
-async def create_contact(contact: Contact):
-    """Create a new contact"""
-    return csv_processor.add_contact(contact)
+def _seed_profile_once():
+    """Seed profile from the legacy hardcoded values / skills.md so existing
+    users keep working emails; everything is editable in Settings."""
+    if db.get_setting("profile_seeded"):
+        return
+    profile = db.get_profile()
+    if not any(profile.values()):
+        background = ""
+        skills_path = os.getenv("SKILLS_FILE_PATH") or os.path.join(_PROJECT_ROOT, "skills.md")
+        if os.path.isfile(skills_path):
+            try:
+                with open(skills_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if "## Email one-liner" in content:
+                    section = content.split("## Email one-liner", 1)[-1]
+                    section = section.split("##")[0].strip()
+                    for line in section.splitlines():
+                        if line.strip() and not line.strip().startswith("#"):
+                            background = line.strip()
+                            break
+            except OSError:
+                pass
+        db.update_profile({
+            "full_name": "Jason Li",
+            "school": "University of Pennsylvania",
+            "email": "li59@seas.upenn.edu",
+            "phone": "847-907-0871",
+            "website": (os.getenv("PERSONAL_WEBSITE_URL")
+                        or "https://personal-site-sooty-ten.vercel.app/").strip(),
+            "background": background,
+        })
+    db.set_setting("profile_seeded", True)
 
 
-@app.put("/api/contacts/{contact_id}", response_model=Contact)
-async def update_contact(contact_id: str, updates: dict):
-    """Update an existing contact"""
-    contact = csv_processor.update_contact(contact_id, updates)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contact not found")
-    return contact
+def _reap_orphaned_jobs():
+    """Jobs run in threads that die with the process. Anything still marked
+    'running' at startup is a leftover from a crash or restart — leave it
+    that way and every new discovery/generation request 409s forever."""
+    orphans = db.query("SELECT id, type FROM jobs WHERE status='running'")
+    for job in orphans:
+        db.finish_job(job["id"], status="failed",
+                      error="Interrupted — the server restarted while this job was running.")
+    if orphans:
+        print(f"[startup] reaped {len(orphans)} interrupted job(s)")
+
+
+migrate_legacy_data(db, _PROJECT_ROOT, _BACKEND_DIR)
+repair_delivered_email_status(db)
+repair_contact_reply_status(db)
+repair_mismatched_company_sites(db)
+repair_offdomain_contact_warnings(db)
+resumes.migrate_legacy_resumes(_PROJECT_ROOT)
+_seed_profile_once()
+_reap_orphaned_jobs()
+
+
+def _parse_job(job: Optional[dict]) -> Optional[dict]:
+    if not job:
+        return None
+    out = dict(job)
+    for key in ("payload", "result"):
+        if out.get(key):
+            try:
+                out[key] = json.loads(out[key])
+            except Exception:
+                pass
+    return out
+
+
+# ---------- health / settings ----------
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Cold Emailer API v2"}
+
+
+@app.get("/api/settings")
+async def get_settings():
+    profile = db.get_profile()
+    # Every email is written as this person. Missing pieces don't fail loudly,
+    # they just produce weak, unsigned emails — so say so up front.
+    missing = [label for key, label in (
+        ("full_name", "your name"),
+        ("email", "your email address"),
+        ("background", "a background one-liner"),
+    ) if not (profile.get(key) or "").strip()]
+    return {
+        "profile": profile,
+        "profile_incomplete": missing,
+        "llm_provider": get_cloud_llm_provider(),
+        "gmail_connected": email_sender.is_connected(),
+        "gmail_credentials_present": os.path.isfile(email_sender.credentials_path),
+        "limits": rate_limiter.daily_limits,
+    }
+
+
+@app.put("/api/settings")
+async def update_settings(payload: ProfileUpdate):
+    profile = db.update_profile(payload.model_dump(exclude_none=True))
+    return {"success": True, "profile": profile}
+
+
+# ---------- discovery ----------
+
+@app.post("/api/discovery")
+async def start_discovery(payload: DiscoveryRequest):
+    running = [j for j in db.list_jobs("discovery", limit=5) if j["status"] == "running"]
+    if running:
+        raise HTTPException(409, "A discovery search is already running. "
+                                 "Wait for it to finish or cancel it first.")
+    job = discovery.start(payload.query.strip(), payload.count)
+    return _parse_job(db.get_job(job["id"]))
+
+
+@app.get("/api/discovery")
+async def list_discovery_jobs():
+    return [_parse_job(j) for j in db.list_jobs("discovery", limit=20)]
+
+
+@app.get("/api/discovery/{job_id}")
+async def get_discovery_job(job_id: str):
+    job = db.get_job(job_id)
+    if not job or job["type"] != "discovery":
+        raise HTTPException(404, "Discovery run not found")
+    out = _parse_job(job)
+    # Include companies found so far for live results display
+    out["companies"] = db.query(
+        """SELECT c.*,
+                  (SELECT COUNT(*) FROM contacts ct WHERE ct.company_id=c.id) AS contact_count
+           FROM companies c WHERE c.job_id=? ORDER BY c.created_at ASC""",
+        (job_id,),
+    )
+    return out
+
+
+@app.post("/api/discovery/{job_id}/cancel")
+async def cancel_discovery(job_id: str):
+    job = db.get_job(job_id)
+    if not job or job["type"] != "discovery":
+        raise HTTPException(404, "Discovery run not found")
+    if not discovery.cancel(job_id):
+        raise HTTPException(409, "That search already finished")
+    return {"success": True}
+
+
+# ---------- jobs (generic polling) ----------
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = _parse_job(db.get_job(job_id))
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+# ---------- companies ----------
+
+@app.get("/api/companies")
+async def list_companies(search: Optional[str] = None):
+    return db.list_companies(search=search)
+
+
+@app.get("/api/companies/{company_id}")
+async def get_company(company_id: str):
+    company = db.get_company(company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+    company["contacts"] = db.list_contacts(company_id=company_id)
+    company["emails"] = db.query(
+        """SELECT e.*, ct.name AS contact_name, ct.email AS contact_email
+           FROM emails e JOIN contacts ct ON e.contact_id = ct.id
+           WHERE ct.company_id=? ORDER BY e.created_at DESC""",
+        (company_id,),
+    )
+    return company
+
+
+def _enrich_company_async(company_id: str):
+    company = db.get_company(company_id)
+    if not company:
+        return
+    db.update_company(company_id, {"scrape_status": "scraping"})
+    try:
+        enriched = enrichment.enrich(company["name"], company.get("url"))
+        updates = {k: v for k, v in enriched.items()
+                   if k in ("url", "domain", "summary", "industry", "product", "hook",
+                            "recent_news", "why_care", "location", "scraped_at") and v}
+        updates["scrape_status"] = scrape_status_for(enriched)
+        db.update_company(company_id, updates)
+        # Add newly found contacts (max 2, skip duplicates)
+        from discovery import _guess_name_from_email, _role_for_email
+        from enrichment import select_outreach_emails
+        domain = (db.get_company(company_id) or {}).get("domain")
+        for addr, note in select_outreach_emails(enriched.get("emails") or [], domain):
+            if db.find_contact_by_email(addr):
+                continue
+            local = addr.split("@", 1)[0]
+            db.create_contact(company_id=company_id, email=addr,
+                              name=_guess_name_from_email(local),
+                              role=_role_for_email(local),
+                              source="discovery", status="new", notes=note)
+        # Log what actually happened — an unconditional "researched" here made
+        # the activity feed claim success for wrong-site and failed scrapes.
+        status = updates["scrape_status"]
+        if status == "scraped":
+            db.log_event("company", company_id, "enriched", company["name"])
+        elif status == "wrong_site":
+            db.log_event("company", company_id, "research_failed",
+                         f"{company['name']}: {enriched.get('mismatch') or 'wrong site'}")
+        else:
+            db.log_event("company", company_id, "research_failed",
+                         f"{company['name']}: no usable information found")
+    except Exception as e:
+        db.update_company(company_id, {"scrape_status": "scrape_failed"})
+        db.log_event("company", company_id, "research_failed", company["name"])
+        print(f"[enrich] failed for {company_id}: {e}")
+
+
+@app.post("/api/companies")
+async def create_company(payload: CompanyCreate):
+    existing = db.find_company_by_name(payload.name)
+    if existing:
+        raise HTTPException(409, f"'{payload.name}' is already in your database")
+    company = db.create_company(payload.name, url=payload.url, source="manual")
+    can, limit_msg = rate_limiter.can_research_company()
+    if can:
+        rate_limiter.record_company_research()
+        threading.Thread(target=_enrich_company_async, args=(company["id"],),
+                         daemon=True).start()
+    # Tell the caller whether research actually started; the UI used to
+    # promise "researching it now" even when the limiter silently skipped it.
+    row = db.get_company(company["id"])
+    row["research_started"] = can
+    row["research_skipped_reason"] = None if can else limit_msg
+    return row
+
+
+@app.post("/api/companies/{company_id}/enrich")
+async def enrich_company(company_id: str):
+    company = db.get_company(company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+    can, err = rate_limiter.can_research_company()
+    if not can:
+        raise HTTPException(429, err)
+    rate_limiter.record_company_research()
+    threading.Thread(target=_enrich_company_async, args=(company_id,),
+                     daemon=True).start()
+    return {"success": True, "message": "Research started"}
+
+
+@app.put("/api/companies/{company_id}")
+async def update_company(company_id: str, payload: CompanyUpdate):
+    if not db.get_company(company_id):
+        raise HTTPException(404, "Company not found")
+    db.update_company(company_id, payload.model_dump(exclude_none=True))
+    return db.get_company(company_id)
+
+
+@app.delete("/api/companies/{company_id}")
+async def delete_company(company_id: str):
+    if not db.delete_company(company_id):
+        raise HTTPException(404, "Company not found")
+    return {"success": True}
+
+
+# ---------- contacts ----------
+
+@app.get("/api/contacts")
+async def list_contacts(company_id: Optional[str] = None, search: Optional[str] = None):
+    return db.list_contacts(company_id=company_id, search=search)
+
+
+CONTACT_STATUSES = ("new", "drafted", "sent", "replied", "archived")
+
+
+@app.post("/api/contacts")
+async def create_contact(payload: ContactCreate):
+    email = (payload.email or "").strip()
+    if email and db.find_contact_by_email(email):
+        raise HTTPException(409, f"A contact with email {email} already exists")
+    company_id = payload.company_id
+    if company_id and not db.get_company(company_id):
+        raise HTTPException(404, "That company no longer exists")
+    if not company_id and payload.company_name and payload.company_name.strip():
+        existing = db.find_company_by_name(payload.company_name)
+        company_id = existing["id"] if existing else db.create_company(
+            payload.company_name, source="manual")["id"]
+    contact = db.create_contact(
+        name=payload.name, email=email, role=payload.role,
+        company_id=company_id, notes=payload.notes, source="manual",
+    )
+    return db.get_contact(contact["id"])
+
+
+@app.put("/api/contacts/{contact_id}")
+async def update_contact(contact_id: str, payload: ContactUpdate):
+    if not db.get_contact(contact_id):
+        raise HTTPException(404, "Contact not found")
+    updates = payload.model_dump(exclude_none=True)
+    if updates.get("company_id") and not db.get_company(updates["company_id"]):
+        raise HTTPException(404, "That company no longer exists")
+    if "status" in updates and updates["status"] not in CONTACT_STATUSES:
+        raise HTTPException(400, f"Status must be one of: {', '.join(CONTACT_STATUSES)}")
+    new_email = (updates.get("email") or "").strip()
+    if new_email:
+        clash = db.find_contact_by_email(new_email)
+        if clash and clash["id"] != contact_id:
+            raise HTTPException(409, f"Another contact already uses {new_email}")
+    db.update_contact(contact_id, updates)
+    return db.get_contact(contact_id)
 
 
 @app.delete("/api/contacts/{contact_id}")
-async def delete_contact(contact_id: str):
-    """Delete a contact"""
-    success = csv_processor.delete_contact(contact_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Contact not found")
+async def delete_contact(contact_id: str, force: bool = Query(False)):
+    """Deleting cascades to that contact's emails. Contacts with sent history
+    are protected unless force=true, so a stray click can't erase the record
+    of what you actually sent."""
+    contact = db.get_contact(contact_id)
+    if not contact:
+        raise HTTPException(404, "Contact not found")
+    if not force:
+        sent = db.query_one(
+            "SELECT COUNT(*) AS n FROM emails WHERE contact_id=? AND status='sent'",
+            (contact_id,))["n"]
+        if sent:
+            raise HTTPException(
+                409, f"This contact has {sent} sent email(s). Deleting removes that "
+                     f"history too — archive them instead, or confirm to delete anyway.")
+    db.delete_contact(contact_id)
     return {"success": True}
 
 
 @app.post("/api/contacts/bulk-delete")
-async def bulk_delete_contacts(contact_ids: List[str] = Body(..., embed=False)):
-    """Bulk delete contacts. Body: JSON array of contact IDs."""
-    deleted = 0
-    for contact_id in contact_ids:
-        if csv_processor.delete_contact(contact_id):
+async def bulk_delete_contacts(payload: BulkIds, force: bool = Query(False)):
+    deleted, protected = 0, []
+    for cid in payload.ids:
+        if not force:
+            row = db.query_one(
+                "SELECT COUNT(*) AS n FROM emails WHERE contact_id=? AND status='sent'",
+                (cid,))
+            if row and row["n"]:
+                contact = db.get_contact(cid)
+                protected.append((contact or {}).get("email") or cid)
+                continue
+        if db.delete_contact(cid):
             deleted += 1
-    return {"success": True, "deleted": deleted}
+    return {"success": True, "deleted": deleted, "protected": protected}
 
 
-@app.put("/api/contacts/bulk")
-async def bulk_update_contacts(updates: List[dict]):
-    """Bulk update contacts"""
-    updated = []
-    for update in updates:
-        contact_id = update.pop('id')
-        contact = csv_processor.update_contact(contact_id, update)
-        if contact:
-            updated.append(contact)
-    return {"success": True, "updated": len(updated)}
+MAX_CSV_BYTES = 5 * 1024 * 1024
 
 
-@app.post("/api/contacts/save")
-async def save_contacts():
-    """Explicitly save contacts (usually auto-saved, but this ensures persistence)"""
-    # CSV processor auto-saves, but this endpoint confirms it
-    return {"success": True, "message": "Contacts saved"}
+def _decode_csv(raw: bytes) -> str:
+    """Decode an uploaded CSV. Excel on Windows still exports cp1252 and
+    Excel on Mac exports mac_roman, so UTF-8-only decoding rejects the most
+    common real-world exports.
+
+    UTF-16 is only attempted when a BOM says so: `bytes.decode('utf-16')`
+    assumes little-endian without one and happily turns ordinary cp1252 text
+    with an even byte count into CJK mojibake instead of raising — which
+    surfaced to the user as a bogus "missing required column" error.
+    """
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except (UnicodeDecodeError, UnicodeError):
+            pass
+    for encoding in ("utf-8-sig", "cp1252", "mac_roman", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    # latin-1 accepts any byte sequence, so reaching here means empty/binary
+    raise ValueError("Could not read this file as text. Export it as CSV and try again.")
 
 
-def _safe_str(val, default: str = "") -> str:
-    """Coerce value to string and strip; use default for NaN/None."""
-    if val is None:
-        return default
+@app.post("/api/contacts/import")
+async def import_contacts_csv(file: UploadFile = File(...)):
+    """CSV import. Columns: name, company, email (header required). Extra
+    columns 'role' and 'notes' are picked up when present."""
+    import csv as _csv
     try:
-        s = str(val).strip()
-        if s.lower() == "nan":
-            return default
-        return s or default
-    except Exception:
-        return default
-
-
-@app.post("/api/upload")
-async def upload_csv(file: UploadFile = File(...)):
-    """Upload CSV to add contacts; merges with existing. Duplicates (by email) are skipped. Required columns: name, company, email."""
-    import pandas as pd
-    import io
-    import uuid
-
-    try:
-        contents = await file.read()
-        text = contents.decode('utf-8-sig').strip()  # utf-8-sig strips BOM from Excel/Sheets
-        df = pd.read_csv(io.StringIO(text))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid CSV: {str(e)}")
-
-    if df.empty or len(df.columns) == 0:
-        raise HTTPException(status_code=400, detail="CSV has no columns. Add a header row with: name, company, email")
-
-    # Normalize column names: strip whitespace, lowercase; dedupe by keeping first
-    raw_cols = [str(c).strip().lower() for c in df.columns]
-    seen = set()
-    unique_cols = []
-    for c in raw_cols:
-        if c not in seen:
-            seen.add(c)
-            unique_cols.append(c)
-    df.columns = unique_cols
-
-    required = {'name', 'company', 'email'}
-    missing = required - set(df.columns)
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"CSV is missing required column(s): {', '.join(sorted(missing))}. Required: name, company, email (header row must match)."
-        )
-
-    try:
-        existing = csv_processor.read_contacts()
-        seen_emails = {(c.email or "").strip().lower() for c in existing if (c.email or "").strip()}
-        merged = list(existing)
-
-        for _, row in df.iterrows():
-            email_val = _safe_str(row.get("email"))
-            email_norm = email_val.strip().lower() if email_val else ""
-            if not email_norm:
-                continue  # skip rows with no email to avoid duplicate blank entries
-            if email_norm in seen_emails:
-                continue  # skip duplicate (includes contacts already in emailed)
-            contact = Contact(
-                id=str(uuid.uuid4()),
-                name=_safe_str(row.get("name")),
-                company=_safe_str(row.get("company")),
-                email=email_val,
-                status=_safe_str(row.get("status"), "pending") or "pending",
+        raw = await file.read()
+        if len(raw) > MAX_CSV_BYTES:
+            raise ValueError(f"CSV is too large (max {MAX_CSV_BYTES // (1024 * 1024)} MB)")
+        text = _decode_csv(raw)
+        reader = _csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("CSV has no header row")
+        cols = {c.strip().lower(): c for c in reader.fieldnames}
+        missing = {"name", "company", "email"} - set(cols)
+        if missing:
+            raise ValueError(
+                f"Missing required column(s): {', '.join(sorted(missing))}. "
+                "Header must include: name, company, email")
+        # Report why rows were dropped separately — "duplicates skipped" is a
+        # misleading thing to tell someone whose addresses were malformed.
+        added = duplicates = invalid = 0
+        invalid_samples = []
+        for row in reader:
+            get = lambda k: (row.get(cols[k]) or "").strip() if k in cols else ""
+            email = get("email")
+            if not email or not EMAIL_ADDRESS_RE.fullmatch(email):
+                invalid += 1
+                if len(invalid_samples) < 5:
+                    invalid_samples.append(email or "(blank)")
+                continue
+            if db.find_contact_by_email(email):
+                duplicates += 1
+                continue
+            company_id = None
+            company_name = get("company")
+            if company_name:
+                existing = db.find_company_by_name(company_name)
+                company_id = existing["id"] if existing else db.create_company(
+                    company_name, source="csv")["id"]
+            db.create_contact(
+                name=get("name"), email=email, company_id=company_id,
+                role=get("role") or None, notes=get("notes") or None, source="csv",
             )
-            merged.append(contact)
-            seen_emails.add(email_norm)
-
-        csv_processor.write_contacts(merged)
-        added = len(merged) - len(existing)
-    except HTTPException:
-        raise
+            added += 1
+        db.log_event("contact", None, "imported", f"{added} contacts from CSV")
+        return {"success": True, "added": added,
+                "duplicates": duplicates, "invalid": invalid,
+                "invalid_samples": invalid_samples,
+                "skipped": duplicates + invalid}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-    return {"success": True, "count": len(merged), "added": added}
+        raise HTTPException(400, f"Invalid CSV: {e}")
+
+
+def _csv_safe(value) -> str:
+    """Neutralize spreadsheet formula injection. Scraped names and roles reach
+    this file, and Excel/Sheets execute a cell that starts with = + - @."""
+    text = "" if value is None else str(value)
+    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
 
 
 @app.get("/api/contacts/export")
-async def export_csv(section: Optional[str] = None):
-    """Download CSV file for a specific section or all contacts
-    
-    section: 'emailed', 'emails_generated', 'no_emails', or None for all
-    """
-    from fastapi.responses import Response
-    import pandas as pd
-    import io
-    
-    if section:
-        # Get categorized contacts
-        all_contacts = csv_processor.read_contacts()
-        all_emails = email_storage.get_all()
-        
-        email_by_contact = {}
-        for email in all_emails:
-            contact_id = email.contact_id
-            if contact_id not in email_by_contact:
-                email_by_contact[contact_id] = email
-            else:
-                existing = email_by_contact[contact_id]
-                if email.status == "sent" and existing.status != "sent":
-                    email_by_contact[contact_id] = email
-                elif (email.created_at and existing.created_at and 
-                      email.created_at > existing.created_at):
-                    email_by_contact[contact_id] = email
-        
-        if section == "emailed":
-            contacts = [c for c in all_contacts 
-                       if c.id in email_by_contact and email_by_contact[c.id].status == "sent"]
-            filename = "contacts_emailed.csv"
-        elif section == "emails_generated":
-            contacts = [c for c in all_contacts 
-                       if c.id in email_by_contact and email_by_contact[c.id].status != "sent"]
-            filename = "contacts_emails_generated.csv"
-        elif section == "no_emails":
-            contacts = [c for c in all_contacts if c.id not in email_by_contact]
-            filename = "contacts_no_emails.csv"
-        else:
-            contacts = all_contacts
-            filename = "contacts.csv"
-    else:
-        contacts = csv_processor.read_contacts()
-        filename = "contacts.csv"
-    
-    df = pd.DataFrame([c.model_dump() for c in contacts])
-    
+async def export_contacts_csv():
+    import csv as _csv
+    contacts = db.list_contacts()
     output = io.StringIO()
-    df.to_csv(output, index=False)
-    output.seek(0)
-    
+    writer = _csv.writer(output)
+    writer.writerow(["name", "email", "company", "role", "status", "source", "created_at"])
+    for c in contacts:
+        writer.writerow([_csv_safe(c.get(k)) for k in
+                         ("name", "email", "company_name", "role", "status",
+                          "source", "created_at")])
     return Response(
-        content=output.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        content=output.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=contacts.csv"},
     )
 
 
-# Company enrichment endpoints
-@app.post("/api/enrich-company", response_model=CompanyMetadata)
-async def enrich_company(
-    company_name: str = Query(..., alias="company_name"),
-    url: Optional[str] = Query(None)
-):
-    """Enrich a single company"""
-    can_research, error = rate_limiter.can_research_company()
-    if not can_research:
-        raise HTTPException(status_code=429, detail=error)
-    
-    rate_limiter.record_company_research()
-    metadata = enrichment_service.enrich_company(company_name, url)
-    return metadata
+# ---------- resumes ----------
+
+@app.get("/api/resumes")
+async def list_resumes():
+    return resumes.list()
 
 
-@app.get("/api/company-metadata/{company_name}", response_model=CompanyMetadata)
-async def get_company_metadata(company_name: str):
-    """Get cached company metadata"""
-    metadata = enrichment_service.cache.get(company_name)
-    if not metadata:
-        raise HTTPException(status_code=404, detail="Company not found in cache")
-    return metadata
+@app.post("/api/resumes")
+async def upload_resume(file: UploadFile = File(...), label: str = Form("")):
+    try:
+        data = await file.read()
+        row = resumes.save_upload(data, file.filename or "resume.pdf", label)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return resumes.public(row)
 
 
-# Email generation endpoints
-@app.post("/api/generate-emails", response_model=List[GeneratedEmail])
-async def generate_emails(request: EmailGenerationRequest):
-    """Generate emails for contacts
-    
-    If contact_ids provided: generates for those specific contacts
-    If contact_ids is None: generates for contacts with no emails (from 'no emails' section)
+@app.put("/api/resumes/{resume_id}")
+async def update_resume(resume_id: str, payload: ResumeUpdate):
+    row = resumes.update(resume_id, label=payload.label, is_default=payload.is_default)
+    if not row:
+        raise HTTPException(404, "Resume not found")
+    return resumes.public(row)
+
+
+@app.delete("/api/resumes/{resume_id}")
+async def delete_resume(resume_id: str, force: bool = Query(False)):
+    """Refuse by default when unsent drafts still reference this resume.
+
+    Those drafts were written around this specific PDF (and may say "my resume
+    is attached"). Deleting it silently substitutes a different file at send
+    time, so the recipient gets a resume the email was never written for.
     """
-    # Get contacts to process
-    if request.contact_ids:
-        contacts = [csv_processor.get_contact(cid) for cid in request.contact_ids]
-        contacts = [c for c in contacts if c]
-    else:
-        # Generate for contacts with no emails (from "no emails" section)
-        all_contacts = csv_processor.read_contacts()
-        all_emails = email_storage.get_all()
-        emails_by_contact = {e.contact_id: e for e in all_emails}
-        
-        # Get contacts that don't have any emails
-        contacts = [c for c in all_contacts if c.id not in emails_by_contact]
-    
-    if not contacts:
-        return []
-    
-    generated = []
-    
-    for contact in contacts:
-        # Check rate limit
-        can_generate, error = rate_limiter.can_generate_email()
-        if not can_generate:
-            raise HTTPException(status_code=429, detail=error)
-        
-        rate_limiter.record_email_generation()
-        
-        # Enrich company
-        metadata = enrichment_service.enrich_company(contact.company)
-        
-        # Generate email
-        email = email_generator.generate(
-            contact,
-            metadata,
-            user_name=request.user_name,
-            user_background=request.user_background,
-            user_email=request.user_email,
-            use_template_only=request.use_template_only or False,
-        )
-        email_storage.save(email)
-        generated.append(email)
-    
-    return generated
-
-
-# Email review endpoints
-@app.get("/api/emails", response_model=List[GeneratedEmail])
-async def get_emails(status: Optional[str] = None):
-    """Get all generated emails, optionally filtered by status"""
-    emails = email_storage.get_all()
-    if status:
-        emails = [e for e in emails if e.status == status]
-    return emails
-
-
-@app.put("/api/emails/{email_id}")
-async def update_email_status(email_id: str, status: str = Query(...)):
-    """Update email status (accept/trash)"""
-    email = email_storage.get(email_id)
-    if not email:
-        raise HTTPException(status_code=404, detail="Email not found")
-    
-    email.status = status
-    email_storage.save(email)
-    
-    # If trashed, update contact status
-    if status == "trashed":
-        contact = csv_processor.get_contact(email.contact_id)
-        if contact:
-            csv_processor.update_contact(email.contact_id, {"status": "trashed"})
-    
+    if not resumes.get(resume_id):
+        raise HTTPException(404, "Resume not found")
+    if not force:
+        row = db.query_one(
+            "SELECT COUNT(*) AS n FROM emails "
+            "WHERE resume_id = ? AND status IN ('draft', 'approved')",
+            (resume_id,))
+        pending = row["n"] if row else 0
+        if pending:
+            raise HTTPException(
+                409, f"{pending} unsent draft(s) were written around this resume. "
+                     f"Deleting it would attach a different PDF than the email "
+                     f"describes. Regenerate or send those drafts first.")
+    resumes.delete(resume_id)
     return {"success": True}
 
 
-@app.patch("/api/emails/{email_id}")
-async def update_email_content(email_id: str, payload: EmailUpdateRequest):
-    """Update email subject and/or body (for generated, not-yet-sent emails)."""
-    email = email_storage.get(email_id)
+@app.get("/api/resumes/{resume_id}/file")
+async def get_resume_file(resume_id: str):
+    row = resumes.get(resume_id)
+    if not row or not os.path.isfile(row["path"]):
+        raise HTTPException(404, "Resume file not found")
+    return FileResponse(row["path"], media_type="application/pdf",
+                        filename=row["filename"])
+
+
+# ---------- email types ----------
+
+@app.get("/api/email-types")
+async def list_email_types():
+    return [{"id": key, "label": spec["label"], "goal": spec["goal"]}
+            for key, spec in EMAIL_TYPES.items()]
+
+
+# ---------- email generation / review ----------
+
+@app.post("/api/emails/generate")
+async def generate_emails(payload: GenerateRequest):
+    running = [j for j in db.list_jobs("generation", limit=5) if j["status"] == "running"]
+    if running:
+        raise HTTPException(409, "Email generation is already running. "
+                                 "Wait for it to finish or cancel it first.")
+    if payload.resume_id and not db.get_resume(payload.resume_id):
+        raise HTTPException(404, "Selected resume not found")
+    if payload.email_type == "custom":
+        # Fail fast rather than starting a job that can only skip every
+        # contact: there is no offline template that follows instructions.
+        if not (payload.custom_instructions or "").strip():
+            raise HTTPException(400, "Custom emails need instructions describing "
+                                     "what the AI should write")
+        if payload.use_template_only or not get_cloud_llm_provider():
+            raise HTTPException(400, 'Custom emails need AI — the plain template '
+                                     'cannot follow your instructions. Uncheck '
+                                     '"Skip AI", or set an AI provider in Settings.')
+    job = generation.start(
+        contact_ids=payload.contact_ids,
+        email_type=payload.email_type,
+        resume_id=payload.resume_id,
+        custom_instructions=payload.custom_instructions,
+        use_template_only=payload.use_template_only,
+        allow_recontact=payload.allow_recontact,
+    )
+    return _parse_job(db.get_job(job["id"]))
+
+
+@app.post("/api/emails/generate/{job_id}/cancel")
+async def cancel_generation(job_id: str):
+    job = db.get_job(job_id)
+    if not job or job["type"] != "generation":
+        raise HTTPException(404, "Generation run not found")
+    if not generation.cancel(job_id):
+        raise HTTPException(409, "That generation already finished")
+    return {"success": True}
+
+
+@app.get("/api/emails")
+async def list_emails(status: Optional[str] = None):
+    return db.list_emails(status=status)
+
+
+@app.get("/api/emails/{email_id}")
+async def get_email(email_id: str):
+    email = db.get_email(email_id)
     if not email:
-        raise HTTPException(status_code=404, detail="Email not found")
-    if email.status == "sent":
-        raise HTTPException(status_code=400, detail="Cannot edit an email that has already been sent")
-    if payload.subject is not None:
-        email.subject = payload.subject
-    if payload.body is not None:
-        email.body = payload.body
-    email_storage.save(email)
-    return {"success": True, "email": email}
+        raise HTTPException(404, "Email not found")
+    return email
+
+
+def _already_delivered(email: Optional[dict]) -> bool:
+    """True once Gmail has actually delivered this message.
+
+    `status` alone is not proof: legacy rows arrived carrying a Gmail message
+    id while still labelled approved/trashed, which put delivered mail back in
+    Drafts with a live Send button. A message id (or a send timestamp) means it
+    went out, whatever the status column says.
+    """
+    if not email:
+        return False
+    return bool(str(email.get("gmail_message_id") or "").strip()
+                or str(email.get("sent_at") or "").strip())
+
+
+@app.patch("/api/emails/{email_id}")
+async def update_email(email_id: str, payload: EmailUpdate):
+    email = db.get_email(email_id)
+    if not email:
+        raise HTTPException(404, "Email not found")
+    if email["status"] == "sent" or _already_delivered(email):
+        raise HTTPException(400, "Cannot edit an email that has already been sent")
+    updates = payload.model_dump(exclude_none=True)
+    if "status" in updates and updates["status"] not in ("draft", "approved", "trashed"):
+        raise HTTPException(400, "Status must be draft, approved, or trashed")
+    db.update_email(email_id, updates)
+    return db.get_email(email_id)
+
+
+@app.post("/api/emails/bulk-status")
+async def bulk_email_status(payload: BulkStatus):
+    if payload.status not in ("draft", "approved", "trashed"):
+        raise HTTPException(400, "Status must be draft, approved, or trashed")
+    updated = 0
+    for email_id in payload.email_ids:
+        email = db.get_email(email_id)
+        # A delivered email must not be restorable to drafts — that is two
+        # clicks from sending a real contact the same message twice.
+        if email and email["status"] != "sent" and not _already_delivered(email):
+            db.update_email(email_id, {"status": payload.status})
+            updated += 1
+    return {"success": True, "updated": updated}
 
 
 @app.delete("/api/emails/{email_id}")
 async def delete_email(email_id: str):
-    """Delete an email (removes email, contact moves to 'no emails' section)"""
-    email = email_storage.get(email_id)
+    email = db.get_email(email_id)
     if not email:
-        raise HTTPException(status_code=404, detail="Email not found")
-    
-    # Delete the email
-    email_storage.delete(email_id)
-    
-    return {"success": True, "message": "Email deleted. Contact moved to 'no emails' section."}
+        raise HTTPException(404, "Email not found")
+    if email["status"] == "sent" or _already_delivered(email):
+        # Sent mail is the record of what a real person received. It also
+        # backs the duplicate-contact guard, so deleting it re-arms a second
+        # first-contact email to someone already emailed.
+        raise HTTPException(
+            409, "This email was already delivered. Its record is what stops "
+                 "the same person being emailed twice, so it can't be deleted.")
+    db.delete_email(email_id)
+    return {"success": True}
 
 
 @app.post("/api/emails/bulk-delete")
-async def bulk_delete_emails(request: EmailBulkDeleteRequest):
-    """Delete multiple generated (not sent) emails. Contacts move to 'no emails' section."""
-    deleted = 0
-    for email_id in request.email_ids:
-        email = email_storage.get(email_id)
-        if email:
-            email_storage.delete(email_id)
+async def bulk_delete_emails(payload: BulkIds):
+    deleted, protected = 0, 0
+    for eid in payload.ids:
+        email = db.get_email(eid)
+        if not email:
+            continue
+        if email["status"] == "sent" or _already_delivered(email):
+            protected += 1
+            continue
+        if db.delete_email(eid):
             deleted += 1
-    return {"success": True, "deleted": deleted}
+    return {"success": True, "deleted": deleted, "protected_sent": protected}
 
 
-# Allowed resume filenames for attachment (must exist in project root)
-# Default resume to send: resume28.pdf in project root
-ALLOWED_RESUME_FILES = ("resume28.pdf", "resume29.pdf")
+@app.post("/api/emails/{email_id}/regenerate")
+async def regenerate_email(email_id: str):
+    email = db.get_email(email_id)
+    if not email:
+        raise HTTPException(404, "Email not found")
+    if email["status"] == "sent" or _already_delivered(email):
+        raise HTTPException(400, "Cannot regenerate a sent email")
+    can, err = rate_limiter.can_generate_email()
+    if not can:
+        raise HTTPException(429, err)
+    rate_limiter.record_email_generation()
+    contact = db.get_contact(email["contact_id"])
+    if not contact:
+        raise HTTPException(404, "Contact for this email no longer exists")
+    company = db.get_company(contact["company_id"]) if contact.get("company_id") else None
+    if email.get("is_follow_up") or email.get("email_type") == "follow_up":
+        # A follow-up is not a first-contact email: composing it as one would
+        # replace the draft with a cold "Internship inquiry" that never
+        # references the message it is following up on.
+        original = db.get_email(email.get("original_email_id") or "")
+        if not original:
+            raise HTTPException(400, "The original email this follow-up replies to "
+                                     "no longer exists, so it cannot be rewritten.")
+        composed = composer.compose_follow_up(contact, company, original)
+    else:
+        try:
+            composed = composer.compose(
+                contact, company,
+                email_type=email.get("email_type") or DEFAULT_TYPE,
+                resume_id=email.get("resume_id"),
+                custom_instructions=email.get("custom_instructions"),
+            )
+        except TemplateUnavailable as e:
+            raise HTTPException(400, str(e))
+    db.update_email(email_id, {
+        "subject": composed["subject"], "body": composed["body"],
+        "status": "draft",
+        "used_template_fallback": composed["used_template_fallback"],
+        "fallback_reason": composed["fallback_reason"],
+    })
+    db.log_event("email", email_id, "regenerated", contact.get("name") or "")
+    return db.get_email(email_id)
 
-# Email sending endpoints
-@app.post("/api/send-emails")
-async def send_emails(request: EmailSendRequest):
-    """Send accepted, pending, or trashed (generated) emails in batch. Optional attach_resume: 'resume28.pdf' or 'resume29.pdf'."""
-    # Get emails to send: include accepted, pending, and trashed (so Contacts "Emails Generated - Not Sent" can send any)
-    emails_to_send = []
-    for email_id in request.email_ids:
-        email = email_storage.get(email_id)
-        if email and email.status in ("accepted", "pending", "trashed"):
-            emails_to_send.append(email)
 
-    if not emails_to_send:
-        raise HTTPException(status_code=400, detail="No emails to send (select accepted or pending emails)")
-    
-    # Check rate limit
-    can_send, error = rate_limiter.can_send_email()
-    if not can_send:
-        raise HTTPException(status_code=429, detail=error)
-    
-    # Resolve resume path only if client requested one of the allowed files
-    resume_path = None
-    if request.attach_resume and request.attach_resume in ALLOWED_RESUME_FILES:
-        candidate = os.path.join(project_root, request.attach_resume)
-        if os.path.isfile(candidate):
-            resume_path = candidate
-    
-    # Authenticate if needed
+# ---------- follow-ups ----------
+
+@app.get("/api/follow-ups")
+async def follow_ups_due(days: int = Query(7, ge=1, le=90)):
+    candidates = db.get_follow_up_candidates(days=days)
+    for c in candidates:
+        try:
+            sent = datetime.fromisoformat(c["sent_at"])
+            c["days_since_sent"] = (datetime.now() - sent).days
+        except Exception:
+            c["days_since_sent"] = None
+    return candidates
+
+
+@app.post("/api/emails/{email_id}/follow-up")
+async def generate_follow_up(email_id: str):
+    original = db.get_email(email_id)
+    if not original or original["status"] != "sent":
+        raise HTTPException(404, "Original sent email not found")
+    # Nothing dedupes downstream: two clicks used to mean two near-identical
+    # follow-ups in Drafts, both caught by "Select all", both delivered.
+    existing = db.query_one(
+        "SELECT id FROM emails WHERE original_email_id=? AND status <> 'trashed' "
+        "ORDER BY created_at DESC LIMIT 1", (email_id,))
+    if existing:
+        raise HTTPException(409, "A follow-up to this email has already been "
+                                 "drafted — find it in Drafts.")
+    can, err = rate_limiter.can_generate_email()
+    if not can:
+        raise HTTPException(429, err)
+    rate_limiter.record_email_generation()
+    contact = db.get_contact(original["contact_id"])
+    if not contact:
+        raise HTTPException(404, "Contact for this email no longer exists")
+    company = db.get_company(contact["company_id"]) if contact.get("company_id") else None
+    composed = composer.compose_follow_up(contact, company, original)
+    follow_up = db.create_email(
+        contact_id=contact["id"],
+        company_id=contact.get("company_id"),
+        email_type="follow_up",
+        resume_id=original.get("resume_id"),
+        subject=composed["subject"],
+        body=composed["body"],
+        status="draft",
+        original_email_id=original["id"],
+        is_follow_up=True,
+        used_template_fallback=composed["used_template_fallback"],
+        fallback_reason=composed["fallback_reason"],
+    )
+    db.log_event("email", follow_up["id"], "follow_up_generated",
+                 contact.get("name") or contact.get("email") or "")
+    return db.get_email(follow_up["id"])
+
+
+# ---------- sending ----------
+
+def _resume_allowed_for(email: dict) -> bool:
+    """Whether a resume may be stapled to this email.
+
+    Sales pitches are written on the explicit premise that nothing is
+    attached. A follow-up carries email_type='follow_up', which is not in
+    EMAIL_TYPES at all, so asking the table directly used to return no spec
+    and quietly fall through to "attach" — stapling the default resume to a
+    follow-up of a sales pitch. Resolve the premise through the original.
+    """
+    email_type = email.get("email_type") or ""
+    if email.get("is_follow_up") or email_type == "follow_up":
+        original = db.get_email(email.get("original_email_id") or "") or {}
+        spec = EMAIL_TYPES.get(original.get("email_type") or "")
+        # Original gone (or itself a follow-up): its premise is unknowable,
+        # so err toward not attaching rather than toward a stray PDF.
+        return bool(spec) and spec.get("resume_weight") != "none"
+    spec = EMAIL_TYPES.get(email_type) or EMAIL_TYPES[DEFAULT_TYPE]
+    return spec.get("resume_weight") != "none"
+
+
+def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
+                    attach: bool, from_email: str):
+    sent = failed = 0
+    results = []
+    cancelled = False
+    try:
+        for i, email_id in enumerate(email_ids):
+            job = db.get_job(job_id)
+            if not job or job["status"] == "cancelled":
+                cancelled = True
+                break
+            email = db.get_email(email_id)
+            if not email or email["status"] not in ("draft", "approved"):
+                results.append({"email_id": email_id, "success": False,
+                                "error": "not sendable"})
+                continue
+            if _already_delivered(email):
+                # Re-checked here and not only in the handler: a second send of
+                # this row would also overwrite gmail_message_id and orphan the
+                # thread that reply tracking follows.
+                results.append({"email_id": email_id, "success": False,
+                                "error": "already sent"})
+                failed += 1
+                continue
+            can, err = rate_limiter.can_send_email()
+            if not can:
+                # Nothing from here on is attempted. Record every remaining id
+                # so the results screen cannot report a batch as fully sent
+                # while recipients were silently never contacted.
+                for remaining_id in email_ids[i:]:
+                    results.append({"email_id": remaining_id, "success": False,
+                                    "error": err})
+                    failed += 1
+                break
+            db.update_job(job_id, stage=f"Sending to {email.get('contact_email')}",
+                          progress_current=i)
+            resume_path = None
+            attach_this = attach and _resume_allowed_for(email)
+            if attach_this:
+                resume_path = (resumes.resolve_attachment_path(resume_override)
+                               or resumes.resolve_attachment_path(email.get("resume_id")))
+                if not resume_path:
+                    default = db.get_default_resume()
+                    resume_path = resumes.resolve_attachment_path(
+                        default["id"]) if default else None
+            # A follow-up belongs in the original conversation. The stored
+            # gmail_message_id is an API id, not the RFC Message-ID header, so
+            # read the real threading values back from Gmail (and backfill the
+            # thread id — every pre-existing row was saved without one).
+            if email.get("is_follow_up") and email.get("original_email_id"):
+                original = db.get_email(email["original_email_id"])
+                if original and original.get("gmail_message_id"):
+                    ctx = email_sender.get_thread_context(original["gmail_message_id"])
+                    email["reply_to_message_id"] = ctx["message_id"]
+                    email["reply_to_thread_id"] = (
+                        ctx["thread_id"] or original.get("gmail_thread_id"))
+                    if ctx["thread_id"] and not original.get("gmail_thread_id"):
+                        db.update_email(original["id"],
+                                        {"gmail_thread_id": ctx["thread_id"]})
+            if i > 0:
+                import time as _t
+                _t.sleep(email_sender.send_delay)
+            result = email_sender.send_email(email, from_email, resume_path)
+            results.append(result)
+            if result.get("success"):
+                sent += 1
+                rate_limiter.record_email_sent()
+                db.update_email(email_id, {
+                    "status": "sent", "sent_at": now_iso(),
+                    "gmail_message_id": result.get("gmail_message_id"),
+                    "gmail_thread_id": result.get("gmail_thread_id"),
+                })
+                db.update_contact(email["contact_id"], {"status": "sent"})
+                db.log_event("email", email_id, "sent",
+                             f"→ {email.get('contact_email')}")
+            else:
+                failed += 1
+                db.log_event("email", email_id, "send_failed",
+                             result.get("error") or "")
+            db.update_job(job_id, progress_current=i + 1)
+        # Progress reflects what was actually accounted for: every id in
+        # `results` was either sent or reported as failed. It reads 100% only
+        # when nothing was left un-attempted.
+        db.update_job(job_id, progress_current=min(len(results), len(email_ids)))
+        db.finish_job(job_id, status="cancelled" if cancelled else "done",
+                      result={"sent": sent, "failed": failed, "results": results})
+    except Exception as e:
+        db.finish_job(job_id, status="failed", error=str(e),
+                      result={"sent": sent, "failed": failed, "results": results})
+    finally:
+        _send_lock.release()
+
+
+@app.post("/api/emails/send")
+def send_emails(payload: SendRequest):
+    # Plain `def` on purpose: FastAPI runs it in the threadpool, so a blocking
+    # OAuth browser flow in authenticate() cannot freeze the event loop.
+    candidates = [db.get_email(eid) or {} for eid in payload.email_ids]
+    sendable = [e["id"] for e in candidates
+                if e.get("status") in ("draft", "approved")
+                and not _already_delivered(e)]
+    if not sendable:
+        raise HTTPException(400, "None of the selected emails can be sent "
+                                 "(only drafts and approved emails that have not "
+                                 "already gone out are sendable)")
+    can, err = rate_limiter.can_send_email()
+    if not can:
+        raise HTTPException(429, err)
+    if not os.path.isfile(email_sender.credentials_path):
+        raise HTTPException(400, "Gmail is not set up: credentials.json is missing. "
+                                 "See Settings for instructions.")
+    if not _send_lock.acquire(blocking=False):
+        raise HTTPException(409, "A send batch is already in progress")
+    try:
+        # Authenticate in the request so the OAuth browser flow (if needed)
+        # happens now, not inside a background thread.
+        email_sender.authenticate()
+    except Exception as e:
+        _send_lock.release()
+        raise HTTPException(401, f"Gmail authentication failed: {e}")
+
+    try:
+        job = db.create_job("send", {"email_ids": sendable})
+        db.update_job(job["id"], progress_total=len(sendable), stage="Sending")
+        from_email = (payload.from_email or "").strip() or (db.get_profile().get("email") or "me")
+        threading.Thread(
+            target=_send_batch_job,
+            args=(job["id"], sendable, payload.resume_id, payload.attach_resume, from_email),
+            daemon=True,
+        ).start()
+    except Exception:
+        # If job setup or thread start fails, the batch thread (which owns the
+        # release) never ran — release here or sending is stuck on 409 forever.
+        _send_lock.release()
+        raise
+    return _parse_job(db.get_job(job["id"]))
+
+
+@app.post("/api/emails/send/{job_id}/cancel")
+def cancel_send(job_id: str):
+    """Stop a send batch. Emails already sent stay sent; the rest are skipped
+    before their Gmail call, so this is safe to hit mid-batch."""
+    job = db.get_job(job_id)
+    if not job or job["type"] != "send":
+        raise HTTPException(404, "Send batch not found")
+    if job["status"] != "running":
+        raise HTTPException(409, "That batch already finished")
+    db.update_job(job_id, status="cancelled")
+    return {"success": True}
+
+
+# ---------- reply tracking ----------
+
+@app.post("/api/emails/check-replies")
+def check_replies(recheck: bool = Query(False)):
+    """Check sent emails for genuine replies. With recheck=true, previously
+    marked replies are re-verified too (fixes legacy bounce/auto-reply
+    false positives). Plain `def` on purpose: the many sequential Gmail
+    calls (and any OAuth flow) run in the threadpool, not the event loop."""
+    where = "e.status='sent' AND e.gmail_message_id IS NOT NULL"
+    if not recheck:
+        where += " AND e.has_response=0"
+    sent_emails = db.query(
+        f"""SELECT e.*, ct.name AS contact_name, ct.email AS contact_email
+           FROM emails e LEFT JOIN contacts ct ON e.contact_id=ct.id
+           WHERE {where}
+           ORDER BY e.sent_at DESC LIMIT 200"""
+    )
+    if not sent_emails:
+        return {"success": True, "checked": 0, "new_replies": 0, "cleared": 0,
+                "failed_checks": 0}
     try:
         email_sender.authenticate()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gmail authentication failed: {str(e)}")
-    
-    # Send emails
-    from_email = (request.from_email and request.from_email.strip()) or "me"
-    results = email_sender.send_batch(emails_to_send, from_email, resume_path)
-    
-    # Update email statuses and contacts
-    sent_contact_ids = []
-    for result in results:
-        if result['success']:
-            email_id = result['email_id']
-            email = email_storage.get(email_id)
-            if email:
-                email.status = "sent"
-                email.sent_at = datetime.now()
-                email.gmail_message_id = result.get('gmail_message_id') or result.get('message_id')
-                # Track follow-up sent time
-                if email.is_follow_up:
-                    email.follow_up_sent_at = datetime.now()
-                email_storage.save(email)
-                sent_contact_ids.append(email.contact_id)
-                rate_limiter.record_email_sent()
-    
-    # Mark contacts as sent in CSV so they appear in the Emailed tab (do not remove them)
-    for contact_id in sent_contact_ids:
-        csv_processor.update_contact(contact_id, {"status": "sent"})
-    
-    return {
-        "success": True,
-        "sent": len([r for r in results if r['success']]),
-        "failed": len([r for r in results if not r['success']]),
-        "results": results
-    }
-
-
-@app.post("/api/gmail-disconnect")
-async def gmail_disconnect():
-    """Remove saved Gmail token. Next time you send, the browser will open to sign in again."""
-    removed = email_sender.disconnect()
-    return {"success": True, "token_removed": removed, "message": "Gmail disconnected. Next time you send, your browser will open to sign in again."}
-
-
-# Usage stats endpoint
-@app.get("/api/usage", response_model=UsageStats)
-async def get_usage_stats():
-    """Get current usage statistics"""
-    stats = rate_limiter.get_usage_stats()
-    return UsageStats(**stats)
-
-
-# Follow-up reminder endpoint
-@app.get("/api/follow-up-reminders")
-async def get_follow_up_reminders():
-    """Get contacts that need follow-up (sent 1+ weeks ago, no response)"""
-    candidates = email_storage.get_follow_up_candidates()
-    
-    # Check for responses if Gmail service is available
-    if email_sender.service:
-        try:
-            response_checker = ResponseChecker(email_sender.service)
-            response_checker.check_all_responses(candidates)
-            # Save updated emails
-            for email in candidates:
-                email_storage.save(email)
-        except Exception as e:
-            print(f"Error checking responses: {e}")
-    
-    # Filter out any that now have responses
-    follow_ups = [e for e in candidates if not e.has_response]
-    
-    # Get contact info for each
-    contacts = []
-    for email in follow_ups:
-        contact = csv_processor.get_contact(email.contact_id)
-        if contact:
-            days_since = (datetime.now() - email.sent_at).days if email.sent_at else 0
-            contacts.append({
-                'contact': contact,
-                'email': email,
-                'days_since_sent': days_since
+        raise HTTPException(401, f"Gmail authentication failed: {e}")
+    checker = ResponseChecker(email_sender.service,
+                              own_address=db.get_profile().get("email"))
+    new_replies = cleared = failed_checks = 0
+    for email in sent_emails:
+        has_reply, when = checker.check_response(
+            email["gmail_message_id"], email.get("gmail_thread_id"))
+        if has_reply is None:
+            # Check failed (network error, rate limit, ...): unknown, not
+            # 'no reply' — never clear an existing reply record for it.
+            failed_checks += 1
+            continue
+        if has_reply and not email["has_response"]:
+            new_replies += 1
+            db.update_email(email["id"], {
+                "has_response": True,
+                "response_at": when.isoformat(timespec="seconds") if when else now_iso(),
             })
-    
-    return contacts
+            if email.get("contact_id"):
+                db.update_contact(email["contact_id"], {"status": "replied"})
+            db.log_event("email", email["id"], "replied",
+                         email.get("contact_name") or email.get("contact_email") or "")
+        elif has_reply and email["has_response"] and when:
+            db.update_email(email["id"], {
+                "response_at": when.isoformat(timespec="seconds")})
+        elif not has_reply and email["has_response"]:
+            cleared += 1
+            db.update_email(email["id"], {"has_response": False, "response_at": None})
+            if email.get("contact_id"):
+                contact = db.get_contact(email["contact_id"])
+                if contact and contact.get("status") == "replied":
+                    db.update_contact(email["contact_id"], {"status": "sent"})
+    return {"success": True, "checked": len(sent_emails),
+            "new_replies": new_replies, "cleared": cleared,
+            "failed_checks": failed_checks}
 
 
-# Follow-up email generation endpoint
-@app.post("/api/generate-follow-up", response_model=GeneratedEmail)
-async def generate_follow_up(request: dict):
-    """Generate follow-up email for a contact"""
-    email_id = request.get('email_id')
-    original_email = email_storage.get(email_id)
-    
-    if not original_email or original_email.status != "sent":
-        raise HTTPException(status_code=404, detail="Original email not found")
-    
-    contact = csv_processor.get_contact(original_email.contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contact not found")
-    
-    # Get company metadata
-    metadata = enrichment_service.enrich_company(contact.company)
-    
-    # Generate follow-up email (reference original)
-    follow_up = email_generator.generate_follow_up(
-        contact,
-        metadata,
-        original_email,
-        user_name=request.get('user_name'),
-        user_background=request.get('user_background'),
-        user_email=request.get('user_email')
-    )
-    
-    # Link to original - follow-up stays in "emailed" section but with pending status
-    follow_up.original_email_id = original_email.id
-    follow_up.status = "pending"  # Generated but not sent yet
-    follow_up.is_follow_up = True
-    follow_up.follow_up_generated_at = datetime.now()
-    
-    email_storage.save(follow_up)
-    return follow_up
+# ---------- dashboard / tracking ----------
 
+@app.get("/api/dashboard")
+async def dashboard():
+    counts = {
+        "companies": db.query_one("SELECT COUNT(*) AS n FROM companies")["n"],
+        "contacts": db.query_one("SELECT COUNT(*) AS n FROM contacts")["n"],
+        "drafts": db.query_one(
+            "SELECT COUNT(*) AS n FROM emails WHERE status IN ('draft','approved')")["n"],
+        "sent": db.query_one("SELECT COUNT(*) AS n FROM emails WHERE status='sent'")["n"],
+        "replied": db.query_one(
+            "SELECT COUNT(*) AS n FROM emails WHERE has_response=1")["n"],
+    }
+    counts["reply_rate"] = round(counts["replied"] / counts["sent"] * 100, 1) if counts["sent"] else 0.0
 
-# Contact categorization endpoint
-@app.get("/api/contacts/categorized")
-async def get_categorized_contacts():
-    """Get contacts organized by email status"""
-    all_contacts = csv_processor.read_contacts()
-    all_emails = email_storage.get_all()
-    
-    # Create mapping: contact_id -> email (most recent sent email, or any email)
-    email_by_contact = {}
-    for email in all_emails:
-        contact_id = email.contact_id
-        if contact_id not in email_by_contact:
-            email_by_contact[contact_id] = email
-        else:
-            # Prefer sent emails, then most recent
-            existing = email_by_contact[contact_id]
-            if email.status == "sent" and existing.status != "sent":
-                email_by_contact[contact_id] = email
-            elif (email.created_at and existing.created_at and 
-                  email.created_at > existing.created_at):
-                email_by_contact[contact_id] = email
-    
-    # Categorize contacts
-    emailed = []  # email.status == "sent" OR is_follow_up (follow-ups stay in emailed section)
-    emails_generated = []  # has email but status != "sent" and not a follow-up (includes pending, accepted, trashed)
-    no_emails = []  # no email exists
-    
-    # Build set of contact IDs that have sent emails (for follow-up detection)
-    sent_email_contact_ids = {e.contact_id for e in all_emails if e.status == "sent"}
-    
-    for contact in all_contacts:
-        email = email_by_contact.get(contact.id)
-        if email and (email.status == "sent" or email.is_follow_up):
-            # Sent emails OR follow-ups (even if not sent yet) go to emailed section
-            emailed.append(contact)
-        elif email:
-            # All other email statuses (pending, accepted, trashed) go here
-            # Trashed emails are kept but not sent - they belong in this section
-            emails_generated.append(contact)
-        else:
-            # No email generated yet
-            no_emails.append(contact)
-    
-    # Serialize emails with datetime handling
-    emails_dict = {}
-    for email in all_emails:
-        email_dict = email.model_dump()
-        # Convert datetime objects to ISO format strings for JSON serialization
-        if email_dict.get('created_at'):
-            email_dict['created_at'] = email.created_at.isoformat() if email.created_at else None
-        if email_dict.get('sent_at'):
-            email_dict['sent_at'] = email.sent_at.isoformat() if email.sent_at else None
-        if email_dict.get('response_date'):
-            email_dict['response_date'] = email.response_date.isoformat() if email.response_date else None
-        if email_dict.get('follow_up_generated_at'):
-            email_dict['follow_up_generated_at'] = email.follow_up_generated_at.isoformat() if email.follow_up_generated_at else None
-        if email_dict.get('follow_up_sent_at'):
-            email_dict['follow_up_sent_at'] = email.follow_up_sent_at.isoformat() if email.follow_up_sent_at else None
-        emails_dict[email.contact_id] = email_dict
-    
+    since = (datetime.now() - timedelta(days=29)).strftime("%Y-%m-%d")
+    sent_by_day = db.query(
+        """SELECT substr(sent_at, 1, 10) AS day, COUNT(*) AS sent
+           FROM emails WHERE status='sent' AND sent_at >= ?
+           GROUP BY day ORDER BY day""", (since,))
+    replies_by_day = db.query(
+        """SELECT substr(response_at, 1, 10) AS day, COUNT(*) AS replies
+           FROM emails WHERE has_response=1 AND response_at >= ?
+           GROUP BY day ORDER BY day""", (since,))
+    timeline = {}
+    for i in range(30):
+        day = (datetime.now() - timedelta(days=29 - i)).strftime("%Y-%m-%d")
+        timeline[day] = {"day": day, "sent": 0, "replies": 0}
+    for row in sent_by_day:
+        if row["day"] in timeline:
+            timeline[row["day"]]["sent"] = row["sent"]
+    for row in replies_by_day:
+        if row["day"] in timeline:
+            timeline[row["day"]]["replies"] = row["replies"]
+
+    by_type = db.query(
+        # Trashed drafts are discarded work, not pending work — counting them
+        # in the denominator made "122/154 sent" look like a backlog.
+        """SELECT email_type, COUNT(*) AS total,
+                  SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+                  SUM(CASE WHEN has_response=1 THEN 1 ELSE 0 END) AS replied
+           FROM emails WHERE status <> 'trashed'
+           GROUP BY email_type ORDER BY total DESC""")
+
+    follow_ups = db.get_follow_up_candidates()
+    events = db.recent_events(limit=25)
+
     return {
-        "emailed": emailed,
-        "emails_generated": emails_generated,
-        "no_emails": no_emails,
-        "emails": emails_dict  # Include all emails for tracking
+        "counts": counts,
+        "timeline": list(timeline.values()),
+        "by_type": by_type,
+        "follow_ups_due": len(follow_ups),
+        "recent_events": events,
+        "usage": rate_limiter.get_usage_stats(),
     }
 
 
-@app.get("/")
-async def root():
-    """Health check"""
-    return {"status": "ok", "message": "AI Cold Emailer API"}
+@app.get("/api/usage")
+async def usage():
+    return rate_limiter.get_usage_stats()
+
+
+# ---------- gmail ----------
+
+@app.get("/api/gmail/status")
+async def gmail_status():
+    return {
+        "connected": email_sender.is_connected(),
+        "credentials_present": os.path.isfile(email_sender.credentials_path),
+    }
+
+
+@app.post("/api/gmail/disconnect")
+async def gmail_disconnect():
+    removed = email_sender.disconnect()
+    return {"success": True, "token_removed": removed}

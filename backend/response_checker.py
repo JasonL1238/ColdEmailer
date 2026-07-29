@@ -1,55 +1,87 @@
-from typing import List, Optional
+"""Check Gmail threads for genuine replies to sent emails (ignoring
+bounces and auto-replies, which the legacy checker wrongly counted)."""
+import re
 from datetime import datetime
-from models import GeneratedEmail
+from typing import Optional, Tuple
+
+_AUTO_SENDER_RE = re.compile(
+    r"mailer-daemon|postmaster|no-?reply|donotreply|auto-?responder", re.I)
+_AUTO_SUBJECT_RE = re.compile(
+    r"delivery status|delivery failure|undeliverable|failure notice|"
+    r"out of office|automatic reply|auto-?reply|autoreply|away from",
+    re.I)
 
 
 class ResponseChecker:
-    """Check Gmail for email responses/replies"""
-    
-    def __init__(self, service):
+    """Given an authenticated Gmail service, detect replies to sent messages."""
+
+    def __init__(self, service, own_address: Optional[str] = None):
         self.service = service
-    
-    def check_response(self, email: GeneratedEmail) -> bool:
-        """Check if there's a reply to this email"""
-        if not email.gmail_message_id:
-            return False
-        
+        self.own_address = (own_address or "").strip().lower() or None
+
+    def _is_real_reply(self, message_id: str) -> bool:
+        """Fetch headers and reject bounces, auto-replies, and our own mail."""
         try:
-            # Get the original message thread
-            original_message = self.service.users().messages().get(
-                userId='me',
-                id=email.gmail_message_id
+            msg = self.service.users().messages().get(
+                userId="me", id=message_id, format="metadata",
+                metadataHeaders=["From", "Subject", "Auto-Submitted"],
             ).execute()
-            
-            thread_id = original_message['threadId']
-            
-            # Get all messages in the thread
+            headers = {h["name"].lower(): h.get("value", "")
+                       for h in msg.get("payload", {}).get("headers", [])}
+            sender = headers.get("from", "")
+            if _AUTO_SENDER_RE.search(sender):
+                return False
+            # Belt and braces alongside the SENT-label filter: a message from
+            # our own address is our follow-up, not the recipient answering.
+            if self.own_address and self.own_address in sender.lower():
+                return False
+            if _AUTO_SUBJECT_RE.search(headers.get("subject", "")):
+                return False
+            auto_submitted = headers.get("auto-submitted", "").lower()
+            if auto_submitted and auto_submitted != "no":
+                return False
+            return True
+        except Exception:
+            # If we can't inspect it, count it — better a false positive
+            # than silently dropping a real reply.
+            return True
+
+    def check_response(self, gmail_message_id: str,
+                       gmail_thread_id: Optional[str] = None
+                       ) -> Tuple[Optional[bool], Optional[datetime]]:
+        """Returns (has_real_reply, reply_datetime). has_real_reply is None
+        when the check itself failed (network error, rate limit, ...) —
+        callers must treat that as 'unknown', never as 'no reply'."""
+        if not gmail_message_id:
+            return False, None
+        try:
+            thread_id = gmail_thread_id
+            if not thread_id:
+                original = self.service.users().messages().get(
+                    userId="me", id=gmail_message_id, format="minimal"
+                ).execute()
+                thread_id = original.get("threadId")
+            if not thread_id:
+                return False, None
+
             thread = self.service.users().threads().get(
-                userId='me',
-                id=thread_id
+                userId="me", id=thread_id, format="minimal"
             ).execute()
-            
-            # Check if there are replies (messages after the original)
-            messages = thread.get('messages', [])
-            if len(messages) > 1:
-                # There are replies
-                # Find the most recent reply
-                replies = [m for m in messages if m['id'] != email.gmail_message_id]
-                if replies:
-                    latest_reply = max(replies, key=lambda m: int(m['internalDate']))
-                    email.has_response = True
-                    email.response_date = datetime.fromtimestamp(int(latest_reply['internalDate']) / 1000)
-                    return True
-            
-            return False
+            messages = thread.get("messages", [])
+            candidates = [
+                m for m in messages
+                if m.get("id") != gmail_message_id
+                # Messages we sent live in the same thread — a follow-up of our
+                # own is not the recipient replying. Counting them inflates the
+                # reply rate and hides contacts who never answered.
+                and "SENT" not in (m.get("labelIds") or [])
+            ]
+            real = [m for m in candidates if self._is_real_reply(m["id"])]
+            if not real:
+                return False, None
+            latest = max(real, key=lambda m: int(m.get("internalDate", 0)))
+            when = datetime.fromtimestamp(int(latest.get("internalDate", 0)) / 1000)
+            return True, when
         except Exception as e:
-            print(f"Error checking response: {e}")
-            return False
-    
-    def check_all_responses(self, emails: List[GeneratedEmail]) -> List[GeneratedEmail]:
-        """Check responses for multiple emails"""
-        updated = []
-        for email in emails:
-            if self.check_response(email):
-                updated.append(email)
-        return updated
+            print(f"[replies] check failed for {gmail_message_id}: {e}")
+            return None, None  # unknown — do NOT treat as 'no reply'

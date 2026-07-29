@@ -59,7 +59,7 @@ async function testLargeJSON() {
   }));
 
   try {
-    const response = await axios.post(`${BASE_URL}/api/contacts/bulk`, largeArray, {
+    const response = await axios.post(`${BASE_URL}/api/contacts/bulk-delete`, { ids: largeArray.map(c => c.id) }, {
       headers: { 'Content-Type': 'application/json' },
       maxContentLength: Infinity,
       maxBodyLength: Infinity,

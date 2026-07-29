@@ -1,0 +1,307 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import toast from 'react-hot-toast'
+import {
+  Search, Sparkles, X, ChevronRight, Globe, Users, AlertCircle, History, Compass,
+} from 'lucide-react'
+import { discoveryAPI, errMessage } from '../api'
+import { Button, Chip, EmptyState, ProgressBar, Spinner, initials, timeAgo } from '../ui'
+import { useApp } from '../App'
+
+const SUGGESTIONS = [
+  'AI infrastructure startups in San Francisco',
+  'Seed-stage fintech startups in New York',
+  'Biotech companies working on gene therapy',
+  'Developer tools companies hiring interns',
+  'Climate tech startups with under 50 employees',
+  'Robotics companies in Boston',
+]
+
+const STATUS_LABELS = {
+  scraped: { label: 'Scraped', tone: 'green' },
+  no_emails_found: { label: 'No emails found', tone: 'amber' },
+  no_website: { label: 'No website', tone: 'gray' },
+  wrong_site: { label: 'Wrong site found', tone: 'amber' },
+  scrape_failed: { label: 'Scrape failed', tone: 'red' },
+  already_in_database: { label: 'Already saved', tone: 'sky' },
+  pending: { label: 'Pending', tone: 'gray' },
+  scraping: { label: 'Scraping…', tone: 'accent' },
+}
+
+export default function Discover() {
+  const { navigate } = useApp()
+  const [query, setQuery] = useState('')
+  const [count, setCount] = useState(10)
+  const [run, setRun] = useState(null)         // active/last-viewed run (full detail)
+  const [history, setHistory] = useState([])
+  const [starting, setStarting] = useState(false)
+  const pollRef = useRef(null)
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) clearInterval(pollRef.current)
+    pollRef.current = null
+  }, [])
+
+  /** Watch a run. announce=false when merely opening a past search, so an
+   *  old completed run doesn't fire a "search complete" toast on click. */
+  const pollRun = useCallback((id, { announce = true } = {}) => {
+    stopPolling()
+    let failures = 0
+    let announced = false
+    const tick = async () => {
+      try {
+        const { data } = await discoveryAPI.get(id)
+        failures = 0
+        setRun(data)
+        if (['done', 'failed', 'cancelled'].includes(data.status)) {
+          stopPolling()
+          loadHistoryRef.current?.()
+          if (announce && !announced) {
+            announced = true
+            if (data.status === 'done') {
+              const r = data.result || {}
+              toast.success(`Found ${r.companies_added ?? 0} companies with ${r.contacts_added ?? 0} contact emails`)
+            } else if (data.status === 'failed') {
+              toast.error(data.error || 'Discovery failed')
+            }
+          }
+        }
+      } catch {
+        // Give up rather than polling a dead backend forever.
+        if (++failures >= 10) {
+          stopPolling()
+          toast.error("Lost contact with the backend while tracking this search.")
+        }
+      }
+    }
+    tick()
+    pollRef.current = setInterval(tick, 2000)
+  }, [stopPolling])
+
+  const [historyLoaded, setHistoryLoaded] = useState(false)
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const { data } = await discoveryAPI.list()
+      setHistory(data)
+      // resume watching a run that's still going (e.g. after page refresh)
+      const running = data.find((j) => j.status === 'running')
+      if (running) pollRun(running.id)
+    } catch {
+      /* backend down; the page keeps whatever it already showed */
+    } finally {
+      setHistoryLoaded(true)
+    }
+  }, [pollRun])
+
+  // pollRun needs loadHistory, and loadHistory needs pollRun — break the cycle
+  // with a ref instead of recreating both callbacks on every render.
+  const loadHistoryRef = useRef(loadHistory)
+  useEffect(() => { loadHistoryRef.current = loadHistory }, [loadHistory])
+
+  useEffect(() => {
+    loadHistory()
+    return stopPolling
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const start = async (q) => {
+    const searchQuery = (q ?? query).trim()
+    if (!searchQuery) return
+    setStarting(true)
+    try {
+      const { data } = await discoveryAPI.start(searchQuery, count)
+      setQuery(searchQuery)
+      setRun(data)
+      pollRun(data.id)
+    } catch (e) {
+      toast.error(errMessage(e, 'Could not start discovery'))
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const cancel = async () => {
+    if (!run) return
+    try {
+      await discoveryAPI.cancel(run.id)
+      toast('Cancelling…', { icon: '✋' })
+    } catch (e) {
+      // 409 just means it finished on its own between render and click
+      if (e?.response?.status !== 409) toast.error(errMessage(e))
+    }
+  }
+
+  const isRunning = run?.status === 'running'
+  const companies = run?.companies || []
+
+  return (
+    <div className="page">
+      <div className="page-head">
+        <div>
+          <div className="page-title">Discover</div>
+          <div className="page-desc">Describe who you want to reach — AI finds real companies and scrapes their contact info</div>
+        </div>
+      </div>
+
+      {/* hero search */}
+      <div className="card discover-hero">
+        <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.01em' }}>
+          <Sparkles size={16} style={{ color: 'var(--accent)', verticalAlign: -2, marginRight: 7 }} />
+          What kind of companies are you looking for?
+        </div>
+        <div className="discover-input-row">
+          <div className="discover-search-wrap">
+            <Search size={17} />
+            <input
+              className="discover-input"
+              placeholder="e.g. AI startups in NYC working on healthcare…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && !isRunning && !starting && start()}
+              disabled={isRunning}
+            />
+          </div>
+          <select
+            className="select"
+            style={{ width: 130 }}
+            value={count}
+            onChange={(e) => setCount(Number(e.target.value))}
+            disabled={isRunning}
+          >
+            {[5, 10, 15, 20, 25].map((n) => <option key={n} value={n}>{n} companies</option>)}
+          </select>
+          {isRunning ? (
+            <Button variant="danger" icon={X} onClick={cancel}>Cancel</Button>
+          ) : (
+            <Button variant="primary" size="lg" icon={Search} onClick={() => start()} disabled={starting || !query.trim()}>
+              {starting ? 'Starting…' : 'Search'}
+            </Button>
+          )}
+        </div>
+        {!isRunning && !companies.length && (
+          <div className="suggestion-row">
+            {SUGGESTIONS.map((s) => (
+              <button key={s} className="suggestion" onClick={() => { setQuery(s); start(s) }}>{s}</button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* live progress */}
+      {run && (
+        <div className="card card-pad mt-16">
+          <div className="row-between">
+            <div className="row">
+              {isRunning && <Spinner />}
+              <div>
+                <div style={{ fontWeight: 650 }}>
+                  {isRunning ? (run.stage || 'Working…') : run.status === 'done' ? 'Search complete'
+                    : run.status === 'cancelled' ? 'Search cancelled' : 'Search failed'}
+                </div>
+                <div className="tiny">“{run.payload?.query}”</div>
+              </div>
+            </div>
+            <div className="small muted">
+              {run.progress_current}/{run.progress_total || '…'} companies
+            </div>
+          </div>
+          <div className="mt-8">
+            <ProgressBar
+              current={run.progress_current}
+              total={run.progress_total}
+              indeterminate={isRunning && !run.progress_current}
+            />
+          </div>
+          {run.status === 'failed' && (
+            <div className="row mt-8 small" style={{ color: 'var(--red)' }}>
+              <AlertCircle size={14} /> {run.error}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* results grid */}
+      {companies.length > 0 && (
+        <>
+          <div className="row-between mt-24 mb-16">
+            <div style={{ fontWeight: 700, fontSize: 15 }}>
+              {companies.length} {companies.length === 1 ? 'company' : 'companies'} found
+            </div>
+            <Button variant="primary" onClick={() => navigate('database')}>
+              Open in Database <ChevronRight size={14} />
+            </Button>
+          </div>
+          <div className="company-grid">
+            {companies.map((c) => {
+              const st = STATUS_LABELS[c.scrape_status] || STATUS_LABELS.pending
+              return (
+                <div key={c.id} className="card company-card" onClick={() => navigate('database')}>
+                  <div className="company-card-head">
+                    <div className="company-favicon">{initials(c.name)}</div>
+                    <div style={{ minWidth: 0 }}>
+                      <div className="company-name">{c.name}</div>
+                      <div className="company-domain row" style={{ gap: 4 }}>
+                        {c.domain ? <><Globe size={10} /> {c.domain}</> : 'no website found'}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="company-summary">{c.summary || <span className="tiny">No description scraped yet</span>}</div>
+                  <div className="company-card-foot">
+                    {c.industry && <Chip tone="violet">{c.industry}</Chip>}
+                    <Chip tone={st.tone}>{st.label}</Chip>
+                    <Chip tone={c.contact_count > 0 ? 'green' : 'gray'}>
+                      <Users size={10} /> {c.contact_count} {c.contact_count === 1 ? 'contact' : 'contacts'}
+                    </Chip>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </>
+      )}
+
+      {/* history + empty state */}
+      {!run && historyLoaded && history.length === 0 && (
+        <div className="card mt-16">
+          <EmptyState
+            icon={Compass}
+            title="No searches yet"
+            desc="Try a search like “fintech startups in NYC” — Reach will find real companies, scrape their sites, and pull out contact emails automatically."
+          />
+        </div>
+      )}
+      {history.length > 0 && (
+        <div className="card mt-24">
+          <div className="card-head">
+            <div className="card-title row" style={{ gap: 7 }}><History size={14} /> Past searches</div>
+          </div>
+          <div>
+            {history.slice(0, 8).map((j) => {
+              const r = j.result || {}
+              return (
+                <div
+                  key={j.id}
+                  className="email-row"
+                  onClick={() => { setRun(null); pollRun(j.id, { announce: false }) }}
+                >
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div className="email-row-title">“{j.payload?.query}”</div>
+                    <div className="email-row-sub">
+                      {j.status === 'done'
+                        ? `${r.companies_added ?? 0} companies · ${r.contacts_added ?? 0} contacts`
+                        : j.status}
+                      {' · '}{timeAgo(j.created_at)}
+                    </div>
+                  </div>
+                  <Chip tone={j.status === 'done' ? 'green' : j.status === 'running' ? 'accent' : j.status === 'failed' ? 'red' : 'gray'}>
+                    {j.status}
+                  </Chip>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

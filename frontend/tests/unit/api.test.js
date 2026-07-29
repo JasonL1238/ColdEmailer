@@ -1,280 +1,110 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-// Use vi.hoisted to create mock instance that can be accessed
 const { mockAxiosInstance } = vi.hoisted(() => {
   const instance = {
-    get: vi.fn(),
-    post: vi.fn(),
-    put: vi.fn(),
-    delete: vi.fn(),
-    interceptors: {
-      request: { use: vi.fn() },
-      response: { use: vi.fn() }
-    }
+    get: vi.fn(() => Promise.resolve({ data: {} })),
+    post: vi.fn(() => Promise.resolve({ data: {} })),
+    put: vi.fn(() => Promise.resolve({ data: {} })),
+    patch: vi.fn(() => Promise.resolve({ data: {} })),
+    delete: vi.fn(() => Promise.resolve({ data: {} })),
   }
   return { mockAxiosInstance: instance }
 })
 
-// Mock axios
-vi.mock('axios', () => {
-  return {
-    default: {
-      create: vi.fn(() => mockAxiosInstance)
-    }
-  }
+vi.mock('axios', () => ({
+  default: { create: vi.fn(() => mockAxiosInstance) },
+}))
+
+import {
+  discoveryAPI, companiesAPI, contactsAPI, resumesAPI, emailsAPI,
+  settingsAPI, dashboardAPI, errMessage,
+} from '../../src/api.js'
+
+beforeEach(() => {
+  Object.values(mockAxiosInstance).forEach((fn) => fn.mockClear?.())
 })
 
-// Import after mocking
-import { contactsAPI, companyAPI, emailAPI, usageAPI } from '../../src/api.js'
-
-describe('API Client', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-  })
-
-  describe('contactsAPI', () => {
-    it('getAll calls correct endpoint with status param', async () => {
-      const mockResponse = { data: [{ id: '1', name: 'Test' }] }
-      mockAxiosInstance.get.mockResolvedValue(mockResponse)
-
-      const result = await contactsAPI.getAll('pending')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/contacts', { params: { status: 'pending' } })
-      expect(result).toEqual(mockResponse)
-    })
-
-    it('getAll handles errors correctly', async () => {
-      const mockError = new Error('Network error')
-      mockAxiosInstance.get.mockRejectedValue(mockError)
-
-      await expect(contactsAPI.getAll()).rejects.toThrow('Network error')
-    })
-
-    it('create sends POST with contact data', async () => {
-      const contact = { name: 'John', company: 'Acme', email: 'john@acme.com' }
-      const mockResponse = { data: { id: '1', ...contact } }
-      mockAxiosInstance.post.mockResolvedValue(mockResponse)
-
-      const result = await contactsAPI.create(contact)
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/contacts', contact)
-      expect(result).toEqual(mockResponse)
-    })
-
-    it('update sends PUT with updates', async () => {
-      const updates = { name: 'Updated Name' }
-      const mockResponse = { data: { id: '1', name: 'Updated Name' } }
-      mockAxiosInstance.put.mockResolvedValue(mockResponse)
-
-      const result = await contactsAPI.update('1', updates)
-
-      expect(mockAxiosInstance.put).toHaveBeenCalledWith('/contacts/1', updates)
-      expect(result).toEqual(mockResponse)
-    })
-
-    it('delete sends DELETE request', async () => {
-      mockAxiosInstance.delete.mockResolvedValue({ data: { success: true } })
-
-      await contactsAPI.delete('1')
-
-      expect(mockAxiosInstance.delete).toHaveBeenCalledWith('/contacts/1')
-    })
-
-    it('bulkDelete sends DELETE with data', async () => {
-      const ids = ['1', '2', '3']
-      mockAxiosInstance.delete.mockResolvedValue({ data: { success: true } })
-
-      await contactsAPI.bulkDelete(ids)
-
-      expect(mockAxiosInstance.delete).toHaveBeenCalledWith('/contacts/bulk', { data: ids })
-    })
-
-    it('upload sends FormData', async () => {
-      const file = new File(['content'], 'test.csv', { type: 'text/csv' })
-      const mockResponse = { data: { success: true } }
-      mockAxiosInstance.post.mockResolvedValue(mockResponse)
-
-      const result = await contactsAPI.upload(file)
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith(
-        '/upload',
-        expect.any(FormData),
-        { headers: { 'Content-Type': 'multipart/form-data' } }
-      )
-      expect(result).toEqual(mockResponse)
-    })
-
-    it('export requests blob response', async () => {
-      const blob = new Blob(['csv,data'])
-      mockAxiosInstance.get.mockResolvedValue({ data: blob })
-
-      const result = await contactsAPI.export()
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/contacts/export', { responseType: 'blob' })
-      expect(result.data).toBe(blob)
+describe('API client', () => {
+  it('starts discovery with query and count', () => {
+    discoveryAPI.start('fintech startups', 10)
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/discovery', {
+      query: 'fintech startups', count: 10,
     })
   })
 
-  describe('companyAPI', () => {
-    it('enrich sends POST with company name', async () => {
-      const mockResponse = { data: { name: 'Acme', summary: 'Test' } }
-      mockAxiosInstance.post.mockResolvedValue(mockResponse)
+  it('lists companies with search param', () => {
+    companiesAPI.list('acme')
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/companies', { params: { search: 'acme' } })
+  })
 
-      const result = await companyAPI.enrich('Acme Corp')
+  it('bulk deletes contacts, protecting sent history by default', () => {
+    contactsAPI.bulkDelete(['a', 'b'])
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith(
+      '/contacts/bulk-delete', { ids: ['a', 'b'] }, { params: { force: false } })
+  })
 
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/enrich-company', null, {
-        params: { company_name: 'Acme Corp' }
-      })
-      expect(result).toEqual(mockResponse)
-    })
+  it('bulk deletes with force when the user confirms', () => {
+    contactsAPI.bulkDelete(['a'], true)
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith(
+      '/contacts/bulk-delete', { ids: ['a'] }, { params: { force: true } })
+  })
 
-    it('enrich includes URL when provided', async () => {
-      mockAxiosInstance.post.mockResolvedValue({ data: {} })
+  it('deletes a single contact without force by default', () => {
+    contactsAPI.delete('c1')
+    expect(mockAxiosInstance.delete).toHaveBeenCalledWith('/contacts/c1', { params: { force: false } })
+  })
 
-      await companyAPI.enrich('Acme Corp', 'https://acme.com')
+  it('cancels an in-flight send batch', () => {
+    emailsAPI.cancelSend('job1')
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/emails/send/job1/cancel')
+  })
 
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/enrich-company', null, {
-        params: { company_name: 'Acme Corp', url: 'https://acme.com' }
-      })
-    })
-
-    it('getMetadata sends GET request', async () => {
-      const mockResponse = { data: { name: 'Acme', industry: 'Tech' } }
-      mockAxiosInstance.get.mockResolvedValue(mockResponse)
-
-      const result = await companyAPI.getMetadata('Acme Corp')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/company-metadata/Acme Corp')
-      expect(result).toEqual(mockResponse)
+  it('generates emails with full payload', () => {
+    emailsAPI.generate({ contact_ids: ['x'], email_type: 'coffee_chat' })
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/emails/generate', {
+      contact_ids: ['x'], email_type: 'coffee_chat',
     })
   })
 
-  describe('emailAPI', () => {
-    it('generate sends POST with contact IDs', async () => {
-      const mockResponse = { data: [{ id: 'email1', subject: 'Test' }] }
-      mockAxiosInstance.post.mockResolvedValue(mockResponse)
+  it('updates email via PATCH', () => {
+    emailsAPI.update('e1', { subject: 'Hi' })
+    expect(mockAxiosInstance.patch).toHaveBeenCalledWith('/emails/e1', { subject: 'Hi' })
+  })
 
-      const result = await emailAPI.generate(['1', '2'])
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/generate-emails', {
-        contact_ids: ['1', '2'],
-        user_name: null,
-        user_background: null,
-        user_email: null
-      })
-      expect(result).toEqual(mockResponse)
-    })
-
-    it('generate includes user info when provided', async () => {
-      mockAxiosInstance.post.mockResolvedValue({ data: [] })
-
-      await emailAPI.generate(null, 'John Doe', 'Engineer', 'john@test.com')
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/generate-emails', {
-        contact_ids: null,
-        user_name: 'John Doe',
-        user_background: 'Engineer',
-        user_email: 'john@test.com'
-      })
-    })
-
-    it('getAll filters by status', async () => {
-      const mockResponse = { data: [{ id: '1', status: 'pending' }] }
-      mockAxiosInstance.get.mockResolvedValue(mockResponse)
-
-      const result = await emailAPI.getAll('pending')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/emails', { params: { status: 'pending' } })
-      expect(result).toEqual(mockResponse)
-    })
-
-    it('updateStatus sends PUT with status', async () => {
-      mockAxiosInstance.put.mockResolvedValue({ data: { success: true } })
-
-      await emailAPI.updateStatus('email1', 'accepted')
-
-      expect(mockAxiosInstance.put).toHaveBeenCalledWith('/emails/email1', null, {
-        params: { status: 'accepted' }
-      })
-    })
-
-    it('send sends POST with email IDs', async () => {
-      const emailIds = ['1', '2', '3']
-      mockAxiosInstance.post.mockResolvedValue({ data: { success: true } })
-
-      await emailAPI.send(emailIds)
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/send-emails', { email_ids: emailIds })
+  it('sends emails with attachment options', () => {
+    emailsAPI.send({ email_ids: ['e1'], attach_resume: true, resume_id: null })
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/emails/send', {
+      email_ids: ['e1'], attach_resume: true, resume_id: null,
     })
   })
 
-  describe('usageAPI', () => {
-    it('getStats sends GET request', async () => {
-      const mockResponse = { data: { emails_sent_today: 5 } }
-      mockAxiosInstance.get.mockResolvedValue(mockResponse)
-
-      const result = await usageAPI.getStats()
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/usage')
-      expect(result).toEqual(mockResponse)
-    })
+  it('uploads resumes as multipart form', () => {
+    const file = new File(['%PDF'], 'r.pdf')
+    resumesAPI.upload(file, 'ML')
+    const [url, form] = mockAxiosInstance.post.mock.calls[0]
+    expect(url).toBe('/resumes')
+    expect(form).toBeInstanceOf(FormData)
   })
 
-  describe('Error handling', () => {
-    it('handles network errors', async () => {
-      const networkError = { message: 'Network Error', code: 'ERR_NETWORK' }
-      mockAxiosInstance.get.mockRejectedValue(networkError)
-
-      await expect(contactsAPI.getAll()).rejects.toEqual(networkError)
-    })
-
-    it('handles 404 errors', async () => {
-      const notFoundError = {
-        response: { status: 404, data: { detail: 'Not found' } }
-      }
-      mockAxiosInstance.get.mockRejectedValue(notFoundError)
-
-      await expect(contactsAPI.getAll()).rejects.toEqual(notFoundError)
-    })
-
-    it('handles 500 errors', async () => {
-      const serverError = {
-        response: { status: 500, data: { detail: 'Internal server error' } }
-      }
-      mockAxiosInstance.post.mockRejectedValue(serverError)
-
-      await expect(contactsAPI.create({})).rejects.toEqual(serverError)
-    })
+  it('fetches settings and dashboard', () => {
+    settingsAPI.get()
+    dashboardAPI.get()
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/settings')
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/dashboard')
   })
+})
 
-  describe('Edge cases', () => {
-    it('handles null contact IDs', async () => {
-      mockAxiosInstance.post.mockResolvedValue({ data: [] })
-
-      await emailAPI.generate(null)
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/generate-emails', {
-        contact_ids: null,
-        user_name: null,
-        user_background: null,
-        user_email: null
-      })
-    })
-
-    it('handles empty arrays', async () => {
-      mockAxiosInstance.post.mockResolvedValue({ data: { success: true } })
-
-      await emailAPI.send([])
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/send-emails', { email_ids: [] })
-    })
-
-    it('handles undefined status', async () => {
-      mockAxiosInstance.get.mockResolvedValue({ data: [] })
-
-      await contactsAPI.getAll(undefined)
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/contacts', { params: { status: undefined } })
-    })
+describe('errMessage', () => {
+  it('extracts FastAPI detail strings', () => {
+    expect(errMessage({ response: { data: { detail: 'Nope' } } })).toBe('Nope')
+  })
+  it('extracts pydantic validation messages', () => {
+    expect(errMessage({ response: { data: { detail: [{ msg: 'field required' }] } } })).toBe('field required')
+  })
+  it('handles network errors readably', () => {
+    expect(errMessage({ message: 'Network Error' })).toMatch(/backend/i)
+  })
+  it('falls back gracefully', () => {
+    expect(errMessage({}, 'fallback')).toBe('fallback')
   })
 })
