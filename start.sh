@@ -17,7 +17,9 @@ if [ ! -d venv ]; then
     ./venv/bin/pip install -q --upgrade pip
     ./venv/bin/pip install -q -r requirements.txt
 fi
-./venv/bin/python -m uvicorn main:app --reload --port 8000 > "$BACKEND_LOG" 2>&1 &
+# Bind IPv4 explicitly — macOS localhost can be ::1 while the Vite proxy
+# targets 127.0.0.1, which would otherwise make every /api call fail.
+./venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000 > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 
 # --- frontend ---
@@ -26,13 +28,13 @@ if [ ! -d node_modules ]; then
     echo "📦 Installing frontend dependencies (first run)…"
     npm install --silent
 fi
-npm run dev > "$FRONTEND_LOG" 2>&1 &
+npm run dev -- --host 127.0.0.1 --port 5173 > "$FRONTEND_LOG" 2>&1 &
 FRONTEND_PID=$!
 
 # --- wait for backend to answer ---
 printf "⏳ Waiting for backend"
 for _ in $(seq 1 30); do
-    if curl -sf http://localhost:8000/ > /dev/null 2>&1; then break; fi
+    if curl -sf http://127.0.0.1:8000/ > /dev/null 2>&1; then break; fi
     printf "."
     sleep 1
 done
@@ -40,8 +42,8 @@ echo ""
 
 echo ""
 echo "✨ Reach is running"
-echo "   App:      http://localhost:5173"
-echo "   API docs: http://localhost:8000/docs"
+echo "   App:      http://127.0.0.1:5173"
+echo "   API docs: http://127.0.0.1:8000/docs"
 echo ""
 
 # --- setup checklist ---

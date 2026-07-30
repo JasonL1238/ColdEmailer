@@ -7,7 +7,9 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        // Prefer IPv4 — on macOS `localhost` can resolve to ::1 while
+        // uvicorn often binds 127.0.0.1 only, which makes the proxy 500.
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
     },
