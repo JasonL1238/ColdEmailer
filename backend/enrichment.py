@@ -1046,22 +1046,35 @@ class EnrichmentService:
                 result["pages_scraped"], result.get("summary"), result["contacts"])
             return True
 
-        def _has_fast_success() -> bool:
+        def _has_fast_success(page_records_local, queue_local=None) -> bool:
             about_ok = bool(result.get("summary"))
-            about_page = any(
-                re.search(
-                    r"/(about|about-us|company|team|leadership|people|who-we-are)(/|$)",
-                    (u or "").lower())
-                for u in (result.get("research_sources") or [])
-            )
+            dedicated_about = about_page_present(page_records_local)
+            # Fast success needs a person *email* associated with the contact —
+            # LinkedIn-only is useful to store, but does not meet the scrape bar.
             person = next((
                 c for c in (result.get("contacts") or [])
-                if c.get("person_verified")
-                or (c.get("linkedin_verified") and c.get("name")
-                    and not c.get("name_from_email"))
-                or (c.get("email_verified") and c.get("name")
-                    and not c.get("name_from_email"))
+                if c.get("email")
+                and c.get("name")
+                and not c.get("name_from_email")
+                and c.get("email_kind") != "generic"
+                and c.get("on_domain")
+                and (
+                    c.get("email_verified")
+                    or (c.get("email_person_match")
+                        and c.get("email_mx_ok") is True)
+                )
             ), None)
+            pending_about = any(
+                _ABOUT_PATH_RE.search((u or "").lower())
+                for u in (queue_local or [])
+            )
+            # Homepage alone counts as the "about" site once identity + summary
+            # exist. Pending guessed /about probes must not block early exit
+            # when we already have a verified person email.
+            about_page = dedicated_about or (
+                about_ok and result.get("identity_verified")
+                and (not pending_about or person is not None)
+            )
             return bool(
                 result.get("identity_verified")
                 and about_ok
@@ -1086,18 +1099,39 @@ class EnrichmentService:
                 for p in (preferred_fallbacks + (other_fallbacks if not fast else []))
             ]
             attempted = 0
+            fallback_failures = 0
+            max_fast_fallback_failures = 2
             while queue and attempted < max_attempts \
                     and len(page_records) < max_pages and not timed_out():
                 page_url = queue.pop(0)
                 attempted += 1
+                was_fallback = page_url.rstrip("/") in {
+                    f.rstrip("/") for f in fallback_pages
+                } and not any(
+                    p["url"].rstrip("/") == page_url.rstrip("/")
+                    for p in page_records
+                )
                 html = self.scraper.fetch_html(page_url)
                 if not html:
+                    if was_fallback:
+                        fallback_failures += 1
                     if not queue:
-                        for fallback in fallback_pages:
-                            key = fallback.rstrip("/")
-                            if key not in queued:
-                                queued.add(key)
-                                queue.append(fallback)
+                        # In fast mode, stop guessing paths after a couple of
+                        # 404s — homepage may already be enough.
+                        if fast and (
+                                fallback_failures >= max_fast_fallback_failures
+                                or about_page_present(page_records)):
+                            pass
+                        else:
+                            for fallback in fallback_pages:
+                                key = fallback.rstrip("/")
+                                if key not in queued:
+                                    if fast and fallback_failures >= max_fast_fallback_failures:
+                                        break
+                                    queued.add(key)
+                                    queue.append(fallback)
+                                    if fast:
+                                        break  # one fallback at a time
                     continue
                 text = self.scraper.extract_text(html)
                 page_records.append({"url": page_url, "html": html, "text": text or ""})
@@ -1113,16 +1147,28 @@ class EnrichmentService:
                         queue.insert(insert_at, discovered_url)
                         insert_at += 1
                 if not queue:
-                    for fallback in fallback_pages:
-                        key = fallback.rstrip("/")
-                        if key not in queued:
-                            queued.add(key)
-                            queue.append(fallback)
+                    # Keep probing fallbacks until we hit the fast failure cap
+                    # or already have person-email success. An /about page alone
+                    # must not skip /team when contacts live there.
+                    if page_records:
+                        _refresh_contacts_and_meta(
+                            page_records, texts, run_llm=False)
+                    if not (fast and (
+                            fallback_failures >= max_fast_fallback_failures
+                            or _has_fast_success(page_records, []))):
+                        for fallback in fallback_pages:
+                            key = fallback.rstrip("/")
+                            if key not in queued:
+                                queued.add(key)
+                                queue.append(fallback)
+                                if fast:
+                                    break
 
-                # Early exit only after a real about/team page + verified person.
-                if fast and about_page_present(page_records):
+                # Early exit once we have about signal + verified person.
+                if fast and page_records:
                     if _refresh_contacts_and_meta(
-                            page_records, texts, run_llm=False) and _has_fast_success():
+                            page_records, texts, run_llm=False) and _has_fast_success(
+                                page_records, queue):
                         result["elapsed_sec"] = round(time.monotonic() - started, 2)
                         return result
 
@@ -1152,7 +1198,8 @@ class EnrichmentService:
                             texts.append(f"SOURCE: {page_url}\n{text[:5000]}")
 
             if page_records:
-                need_llm = not result.get("summary") or not _has_fast_success()
+                need_llm = not result.get("summary") or not _has_fast_success(
+                    page_records, [])
                 _refresh_contacts_and_meta(
                     page_records, texts, run_llm=need_llm and not timed_out())
             else:
@@ -1166,11 +1213,15 @@ class EnrichmentService:
                 delay_cm.__exit__(None, None, None)
 
 
+_ABOUT_PATH_RE = re.compile(
+    r"/(about|about-us|company|team|leadership|people|who-we-are)(/|$)",
+    re.I,
+)
+
+
 def about_page_present(page_records: List[Dict[str, str]]) -> bool:
     """True when crawl already fetched a dedicated about/team-style page."""
     return any(
-        re.search(
-            r"/(about|about-us|company|team|leadership|people|who-we-are)(/|$)",
-            (p.get("url") or "").lower())
+        _ABOUT_PATH_RE.search((p.get("url") or "").lower())
         for p in page_records
     )

@@ -343,15 +343,18 @@ class TestEndToEndCompanyCrawl:
         assert person["person_verified"] is True
         assert result["elapsed_sec"] < 60
 
-    def test_fast_mode_does_not_succeed_on_homepage_only_firstname_email(self, monkeypatch):
+    def test_fast_mode_accepts_homepage_as_about_when_no_team_links(self, monkeypatch):
+        """Homepage-only sites should not burn the deadline on /about 404s."""
         import enrichment
 
         pages = {
             "https://acme.com": """
               <html><body><h1>Acme</h1>
               <p>Acme builds reliable robotics systems for industrial teams
-              that need safer and more efficient warehouse operations.</p>
-              <a href="mailto:kim@acme.com">Email</a>
+              that need safer and more efficient warehouse operations every day.</p>
+              <p>Jane Doe — CEO</p>
+              <a href="mailto:jane.doe@acme.com">Email Jane</a>
+              <a href="https://www.linkedin.com/in/jane-doe">LinkedIn</a>
               </body></html>
             """,
         }
@@ -361,11 +364,80 @@ class TestEndToEndCompanyCrawl:
         monkeypatch.setattr(service, "_school_research_pages",
                             lambda *_args, **_kwargs: [])
         monkeypatch.setattr(enrichment, "llm_metadata", lambda *_args: None)
-        # Force about fallbacks to miss so we stay homepage-only
+
+        result = service.enrich("Acme", "https://acme.com", mode="fast")
+        assert result["ok"] is True
+        assert result["elapsed_sec"] < 60
+        assert any(c.get("linkedin_verified") for c in result["contacts"])
+        # Must not keep probing missing /about forever
+        assert result["pages_attempted"] <= 4
+
+    def test_fast_mode_does_not_verify_generic_inbox_on_homepage(self, monkeypatch):
+        import enrichment
+
+        pages = {
+            "https://acme.com": """
+              <html><body><h1>Acme</h1>
+              <p>Acme builds reliable robotics systems for industrial teams
+              that need safer and more efficient warehouse operations.</p>
+              <a href="mailto:hello@acme.com">Email</a>
+              </body></html>
+            """,
+        }
+        service = EnrichmentService()
+        fixture = _FixtureScraper(pages)
+        service.scraper = fixture
+        monkeypatch.setattr(service, "_school_research_pages",
+                            lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(enrichment, "llm_metadata", lambda *_args: None)
         monkeypatch.setattr(service.scraper, "fetch_html",
                             lambda url: pages.get(url.rstrip("/")))
 
         result = service.enrich("Acme", "https://acme.com", mode="fast")
         assert result["pages_scraped"] >= 1
-        # Must not treat homepage+kim@ as a verified person success
         assert not any(c.get("person_verified") for c in result.get("contacts") or [])
+        assert not any(
+            c.get("email_kind") == "personal" for c in result.get("contacts") or [])
+
+    def test_fast_mode_does_not_early_exit_on_linkedin_only(self, monkeypatch):
+        """LinkedIn-only people are stored, but fast success needs a person email."""
+        import enrichment
+
+        pages = {
+            "https://acme.com": """
+              <html><body><h1>Acme</h1>
+              <p>Acme builds reliable robotics systems for industrial teams
+              that need safer and more efficient warehouse operations every day.</p>
+              <a href="/team">Team</a>
+              <a href="/press">News</a>
+              </body></html>
+            """,
+            "https://acme.com/team": """
+              <html><body><h1>Team</h1>
+              <section>
+                <h2>Jane Doe — Chief Technology Officer</h2>
+                <p>Jane previously led engineering at Stripe.</p>
+                <a href="https://www.linkedin.com/in/jane-doe">LinkedIn</a>
+              </section>
+              </body></html>
+            """,
+            "https://acme.com/press": """
+              <html><body><h1>News</h1>
+              <p>Acme shipped Atlas for warehouse teams this quarter.</p>
+              </body></html>
+            """,
+        }
+        service = EnrichmentService()
+        fixture = _FixtureScraper(pages)
+        service.scraper = fixture
+        monkeypatch.setattr(service, "_school_research_pages",
+                            lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(enrichment, "llm_metadata", lambda *_args: None)
+
+        result = service.enrich("Acme", "https://acme.com", mode="fast")
+        assert any(c.get("linkedin_verified") for c in result.get("contacts") or [])
+        assert not any(
+            (c.get("email") or "").strip() for c in result.get("contacts") or [])
+        # Without a person email, keep crawling past team (press still visited).
+        assert "https://acme.com/press" in result["research_sources"]
+        assert result["elapsed_sec"] < 60

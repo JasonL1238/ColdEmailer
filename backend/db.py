@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS companies (
     scraped_at  TEXT,
     scrape_status TEXT DEFAULT 'pending',
     name_key    TEXT,
+    scrape_warnings TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -164,6 +165,7 @@ _ADDED_COLUMNS = {
         "pages_attempted": "INTEGER DEFAULT 0",
         "research_quality": "TEXT DEFAULT 'low'",
         "name_key": "TEXT",
+        "scrape_warnings": "TEXT",
     },
     "contacts": {
         "linkedin_url": "TEXT",
@@ -708,6 +710,7 @@ class Database:
             "job_id": kwargs.get("job_id"),
             "scraped_at": kwargs.get("scraped_at"),
             "scrape_status": kwargs.get("scrape_status", "pending"),
+            "scrape_warnings": json.dumps(kwargs.get("scrape_warnings") or []),
             "created_at": ts,
             "updated_at": ts,
         }
@@ -728,15 +731,16 @@ class Database:
         if row is None:
             return None
         out = dict(row)
-        raw = out.get("research_sources")
-        if isinstance(raw, str):
-            try:
-                parsed = json.loads(raw)
-                out["research_sources"] = parsed if isinstance(parsed, list) else []
-            except (TypeError, ValueError):
-                out["research_sources"] = []
-        elif raw is None:
-            out["research_sources"] = []
+        for key in ("research_sources", "scrape_warnings"):
+            raw = out.get(key)
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    out[key] = parsed if isinstance(parsed, list) else []
+                except (TypeError, ValueError):
+                    out[key] = []
+            elif raw is None:
+                out[key] = []
         return out
 
     def get_company(self, company_id: str) -> Optional[Dict[str, Any]]:
@@ -769,9 +773,9 @@ class Database:
 
     def update_company(self, company_id: str, updates: Dict[str, Any]):
         updates = dict(updates)
-        if "research_sources" in updates and not isinstance(
-                updates["research_sources"], str):
-            updates["research_sources"] = json.dumps(updates["research_sources"] or [])
+        for key in ("research_sources", "scrape_warnings"):
+            if key in updates and not isinstance(updates[key], str):
+                updates[key] = json.dumps(updates[key] or [])
         updates["updated_at"] = now_iso()
         self._update("companies", company_id, updates)
 
@@ -838,8 +842,11 @@ class Database:
                 self.find_contact_by_email(email) if email else None
             ) or (self.find_contact_by_linkedin(linkedin_url) if linkedin_url else None)
             if existing:
+                existing = dict(existing)
+                existing["_inserted"] = False
                 return existing
             raise
+        data["_inserted"] = True
         return data
 
     def get_contact(self, contact_id: str) -> Optional[Dict[str, Any]]:

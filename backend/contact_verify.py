@@ -280,6 +280,7 @@ def annotate_contact(contact: Dict, check_mx: bool = True) -> Dict:
     # Only trust the extractor's explicit flag. Guessing "name looks like the
     # email local" rejects legitimate page names (Jane Doe + jane.doe@).
     from_email = bool(out.get("name_from_email"))
+    on_domain = bool(out.get("on_domain"))
 
     email_info = verify_email(
         email, name, check_mx=check_mx, name_from_email=from_email,
@@ -307,6 +308,10 @@ def annotate_contact(contact: Dict, check_mx: bool = True) -> Dict:
     out["person_verified"] = bool(
         name and not from_email and (
             out["email_verified"] or out["linkedin_verified"]
+            # On-domain person-matched email only when MX was confirmed True.
+            # Unchecked MX (None) must not promote a contact to verified.
+            or (out["email_person_match"] and on_domain
+                and out.get("email_mx_ok") is True)
         )
     )
     return out

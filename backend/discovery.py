@@ -10,7 +10,7 @@ import re
 import threading
 from typing import Dict, List, Optional
 
-from db import Database
+from db import Database, normalize_linkedin_url
 from ddg_search import ddg_text_search
 from enrichment import (EnrichmentService, registered_domain,
                         scrape_status_for, select_outreach_contacts)
@@ -137,14 +137,29 @@ def discovery_scrape_status(enriched: dict) -> str:
     — so the user re-runs research and gets the same wrong site — instead of
     "Wrong site found", which tells them the domain is what needs fixing.
 
-    The one addition is discovery-specific: a page that was read but listed no
-    addresses is not a failure, and the summary it produced is real evidence.
+    "scraped" requires a person-associated email. LinkedIn-only contacts are
+    still stored, but the company is marked no_emails_found so the UI does not
+    claim email-outreach readiness.
     """
     status = scrape_status_for(enriched)
-    if (status == "scraped" and not enriched.get("emails")
-            and not enriched.get("contacts")):
-        return "no_emails_found"
-    return status
+    if status != "scraped":
+        return status
+    has_person_email = any(
+        (c.get("email") or "").strip()
+        and c.get("email_kind") != "generic"
+        and not c.get("name_from_email")
+        and (
+            c.get("email_verified")
+            or (
+                c.get("email_person_match")
+                and c.get("email_mx_ok") is True
+            )
+        )
+        for c in (enriched.get("contacts") or [])
+    )
+    if has_person_email:
+        return "scraped"
+    return "no_emails_found"
 
 
 class DiscoveryService:
@@ -255,6 +270,7 @@ class DiscoveryService:
             companies_added += 1
 
             emails_this_company = 0
+            contact_conflicts = []
             for candidate in select_outreach_contacts(
                     enriched.get("contacts") or [],
                     enriched.get("emails") or [], company.get("domain"),
@@ -273,11 +289,29 @@ class DiscoveryService:
                     addr = ""
                 if not addr and not linkedin_url:
                     continue
-                if ((addr and self.db.find_contact_by_email(addr))
-                        or (linkedin_url and self.db.find_contact_by_linkedin(linkedin_url))):
+                existing = (
+                    self.db.find_contact_by_email(addr) if addr else None
+                ) or (
+                    self.db.find_contact_by_linkedin(linkedin_url)
+                    if linkedin_url else None
+                )
+                if existing:
+                    if existing.get("company_id") != company["id"]:
+                        other = (
+                            self.db.get_company(existing["company_id"])
+                            if existing.get("company_id") else None
+                        )
+                        other_name = (other or {}).get("name") or "another company"
+                        detail = (
+                            f"{addr or linkedin_url} already belongs to "
+                            f"{other_name} — not reassigned to {name}"
+                        )
+                        contact_conflicts.append(detail)
+                        self.db.log_event(
+                            "company", company["id"], "contact_conflict", detail)
                     continue
                 local = addr.split("@", 1)[0] if addr else ""
-                self.db.create_contact(
+                created = self.db.create_contact(
                     company_id=company["id"],
                     name=candidate.get("name") or _guess_name_from_email(local),
                     email=addr,
@@ -295,11 +329,66 @@ class DiscoveryService:
                     linkedin_verified=bool(candidate.get("linkedin_verified")),
                     person_verified=bool(candidate.get("person_verified")),
                 )
-                contacts_added += 1
-                emails_this_company += bool(addr)
+                # IntegrityError fallback can return another company's row.
+                if created.get("company_id") and created["company_id"] != company["id"]:
+                    other = self.db.get_company(created["company_id"])
+                    other_name = (other or {}).get("name") or "another company"
+                    detail = (
+                        f"{addr or linkedin_url} already belongs to "
+                        f"{other_name} — not reassigned to {name}"
+                    )
+                    contact_conflicts.append(detail)
+                    self.db.log_event(
+                        "company", company["id"], "contact_conflict", detail)
+                    continue
+                # Same-company race: ensure LinkedIn actually landed on this row.
+                if linkedin_url:
+                    wanted = normalize_linkedin_url(linkedin_url)
+                    stored = normalize_linkedin_url(created.get("linkedin_url"))
+                    if wanted and wanted != stored:
+                        clash = self.db.find_contact_by_linkedin(linkedin_url)
+                        other = (
+                            self.db.get_company(clash.get("company_id"))
+                            if clash and clash.get("id") != created.get("id")
+                            and clash.get("company_id") else None
+                        )
+                        other_name = (
+                            (other or {}).get("name") or "another contact"
+                        )
+                        detail = (
+                            f"{linkedin_url} could not be attached to {name} — "
+                            f"already held by {other_name}"
+                            if clash and clash.get("id") != created.get("id") else
+                            f"{linkedin_url} could not be attached to {name} "
+                            f"(insert race)"
+                        )
+                        contact_conflicts.append(detail)
+                        self.db.log_event(
+                            "company", company["id"],
+                            "contact_conflict", detail)
+                # Only count when the returned row actually has the email.
+                created_email = (created.get("email") or "").strip().lower()
+                if addr and created_email == addr.lower():
+                    emails_this_company += 1
+                    if created.get("_inserted", True):
+                        contacts_added += 1
+
+            if contact_conflicts:
+                self.db.update_company(company["id"], {
+                    "scrape_warnings": contact_conflicts,
+                })
+            else:
+                self.db.update_company(company["id"], {"scrape_warnings": []})
+
+            # Conflicts can wipe every person email for a new company — don't
+            # leave status at "scraped" with zero emailable contacts.
+            if status == "scraped" and emails_this_company == 0:
+                status = "no_emails_found"
+                self.db.update_company(company["id"], {"scrape_status": status})
 
             results.append({"company_id": company["id"], "name": name,
-                            "status": status, "emails_found": emails_this_company})
+                            "status": status, "emails_found": emails_this_company,
+                            "contact_conflicts": contact_conflicts})
             self.db.update_job(job_id, progress_current=i + 1)
 
         was_cancelled = self._cancelled(job_id)

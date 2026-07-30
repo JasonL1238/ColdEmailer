@@ -21,16 +21,17 @@ if os.path.isfile(_root_env):
     load_dotenv(_root_env)
 
 from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
+                normalize_linkedin_url,
                 repair_contact_reply_status, repair_delivered_email_status,
                 repair_mismatched_company_sites,
                 repair_offdomain_contact_warnings,
                 repair_speculative_company_summaries,
                 repair_unverified_legacy_replies)
-from discovery import DiscoveryService
+from discovery import DiscoveryService, discovery_scrape_status
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
                             TemplateUnavailable)
 from email_sender import EmailSender
-from enrichment import EnrichmentService, scrape_status_for
+from enrichment import EnrichmentService
 from generation import GenerationBusy, GenerationService
 from models import (
     EMAIL_ADDRESS_RE, BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
@@ -289,7 +290,7 @@ def _enrich_company_async(company_id: str):
         }
         updates = {k: v for k, v in enriched.items()
                    if k in research_fields and v is not None}
-        updates["scrape_status"] = scrape_status_for(enriched)
+        updates["scrape_status"] = discovery_scrape_status(enriched)
         if updates["scrape_status"] == "wrong_site":
             # Do not leave the rejected URL or an older profile in place. A
             # later retry must search again instead of scraping the same wrong
@@ -305,6 +306,8 @@ def _enrich_company_async(company_id: str):
         from discovery import _guess_name_from_email, _role_for_email, contact_notes
         from enrichment import select_outreach_contacts
         domain = (db.get_company(company_id) or {}).get("domain")
+        contact_conflicts = []
+        contacts_added = 0
         for candidate in select_outreach_contacts(
                 enriched.get("contacts") or [],
                 enriched.get("emails") or [], domain,
@@ -322,8 +325,10 @@ def _enrich_company_async(company_id: str):
             if not addr and not linkedin_url:
                 continue
             existing_contact = (
-                db.find_contact_by_email(addr) if addr else
+                db.find_contact_by_email(addr) if addr else None
+            ) or (
                 db.find_contact_by_linkedin(linkedin_url)
+                if linkedin_url else None
             )
             if existing_contact:
                 if existing_contact.get("company_id") == company_id:
@@ -333,52 +338,183 @@ def _enrich_company_async(company_id: str):
                     if not existing_contact.get("role") and candidate.get("role"):
                         richer["role"] = candidate["role"]
                     if not existing_contact.get("linkedin_url") and linkedin_url:
-                        richer["linkedin_url"] = linkedin_url
-                        richer["linkedin_verified"] = int(
-                            bool(candidate.get("linkedin_verified")))
+                        clash = db.find_contact_by_linkedin(linkedin_url)
+                        if clash and clash.get("id") != existing_contact.get("id"):
+                            other = (
+                                db.get_company(clash.get("company_id"))
+                                if clash.get("company_id") else None
+                            )
+                            other_name = (other or {}).get("name") or "another company"
+                            detail = (
+                                f"{linkedin_url} already belongs to {other_name} — "
+                                f"not attached to {company['name']}"
+                            )
+                            contact_conflicts.append(detail)
+                            db.log_event(
+                                "company", company_id, "contact_conflict", detail)
+                        else:
+                            richer["linkedin_url"] = linkedin_url
+                            richer["linkedin_verified"] = int(
+                                bool(candidate.get("linkedin_verified")))
                     new_notes = contact_notes(candidate)
                     if new_notes and not existing_contact.get("notes"):
                         richer["notes"] = new_notes
-                    for flag in ("email_kind", "email_verified",
-                                 "linkedin_verified", "person_verified"):
-                        if candidate.get(flag) is not None and flag not in richer:
-                            val = candidate.get(flag)
-                            richer[flag] = int(bool(val)) if flag != "email_kind" else val
+                    existing_email = (existing_contact.get("email") or "").strip()
+                    # Mailbox-bound flags only apply to the stored address.
+                    if addr:
+                        same_mailbox = existing_email.lower() == addr.lower()
+                        if not existing_email:
+                            richer["email"] = addr
+                            same_mailbox = True
+                        elif (
+                            not same_mailbox
+                            and existing_contact.get("email_kind") == "generic"
+                            and candidate.get("email_kind") == "personal"
+                            and (candidate.get("email_verified")
+                                 or candidate.get("email_person_match"))
+                        ):
+                            # Upgrade company inbox → verified person mailbox.
+                            richer["email"] = addr
+                            same_mailbox = True
+                        if same_mailbox:
+                            for flag in ("email_kind", "email_verified"):
+                                if candidate.get(flag) is not None:
+                                    val = candidate.get(flag)
+                                    richer[flag] = (
+                                        int(bool(val)) if flag != "email_kind"
+                                        else val
+                                    )
+                    if (
+                        linkedin_url
+                        and candidate.get("linkedin_verified") is not None
+                        and richer.get("linkedin_url")
+                    ):
+                        richer["linkedin_verified"] = int(
+                            bool(candidate.get("linkedin_verified")))
+                    if candidate.get("person_verified") is not None:
+                        # Only promote when this update actually keeps verified
+                        # person evidence on the row (email flags or attached LI).
+                        if richer.get("email_verified") or richer.get("linkedin_url"):
+                            richer["person_verified"] = int(
+                                bool(candidate.get("person_verified")))
                     if richer:
                         db.update_contact(existing_contact["id"], richer)
+                else:
+                    other = (
+                        db.get_company(existing_contact["company_id"])
+                        if existing_contact.get("company_id") else None
+                    )
+                    other_name = (other or {}).get("name") or "another company"
+                    label = addr or linkedin_url
+                    detail = (
+                        f"{label} already belongs to {other_name} — "
+                        f"not reassigned to {company['name']}"
+                    )
+                    contact_conflicts.append(detail)
+                    db.log_event(
+                        "company", company_id, "contact_conflict", detail)
                 continue
             local = addr.split("@", 1)[0] if addr else ""
-            db.create_contact(company_id=company_id, email=addr,
-                              linkedin_url=linkedin_url,
-                              name=(candidate.get("name")
-                                    or _guess_name_from_email(local)),
-                              role=(candidate.get("role")
-                                    or _role_for_email(local)),
-                              source="discovery", status="new",
-                              notes=contact_notes(candidate),
-                              source_url=candidate.get("source_url"),
-                              evidence=candidate.get("evidence"),
-                              affinity=", ".join(
-                                  candidate.get("affinity") or []) or None,
-                              seniority_rank=candidate.get(
-                                  "seniority_rank", 20),
-                              email_kind=candidate.get("email_kind") or "unknown",
-                              email_verified=bool(candidate.get("email_verified")),
-                              linkedin_verified=bool(
-                                  candidate.get("linkedin_verified")),
-                              person_verified=bool(
-                                  candidate.get("person_verified")))
-        # Log what actually happened — an unconditional "researched" here made
-        # the activity feed claim success for wrong-site and failed scrapes.
+            created = db.create_contact(
+                company_id=company_id, email=addr,
+                linkedin_url=linkedin_url,
+                name=(candidate.get("name")
+                      or _guess_name_from_email(local)),
+                role=(candidate.get("role")
+                      or _role_for_email(local)),
+                source="discovery", status="new",
+                notes=contact_notes(candidate),
+                source_url=candidate.get("source_url"),
+                evidence=candidate.get("evidence"),
+                affinity=", ".join(
+                    candidate.get("affinity") or []) or None,
+                seniority_rank=candidate.get(
+                    "seniority_rank", 20),
+                email_kind=candidate.get("email_kind") or "unknown",
+                email_verified=bool(candidate.get("email_verified")),
+                linkedin_verified=bool(
+                    candidate.get("linkedin_verified")),
+                person_verified=bool(
+                    candidate.get("person_verified")))
+            # IntegrityError fallback can return another company's row
+            if created.get("company_id") and created["company_id"] != company_id:
+                other = db.get_company(created["company_id"])
+                other_name = (other or {}).get("name") or "another company"
+                label = addr or linkedin_url
+                detail = (
+                    f"{label} already belongs to {other_name} — "
+                    f"not reassigned to {company['name']}"
+                )
+                contact_conflicts.append(detail)
+                db.log_event("company", company_id, "contact_conflict", detail)
+                continue
+            # Same-company insert/race: still verify each identifier landed.
+            if linkedin_url:
+                wanted = normalize_linkedin_url(linkedin_url)
+                stored = normalize_linkedin_url(created.get("linkedin_url"))
+                if wanted and wanted != stored:
+                    clash = db.find_contact_by_linkedin(linkedin_url)
+                    other = (
+                        db.get_company(clash.get("company_id"))
+                        if clash and clash.get("id") != created.get("id")
+                        and clash.get("company_id") else None
+                    )
+                    other_name = (other or {}).get("name") or "another contact"
+                    detail = (
+                        f"{linkedin_url} could not be attached to "
+                        f"{company['name']} — already held by {other_name}"
+                        if clash and clash.get("id") != created.get("id") else
+                        f"{linkedin_url} could not be attached to "
+                        f"{company['name']} (insert race)"
+                    )
+                    contact_conflicts.append(detail)
+                    db.log_event(
+                        "company", company_id, "contact_conflict", detail)
+            created_email = (created.get("email") or "").strip().lower()
+            if addr and created_email == addr.lower():
+                if created.get("_inserted", True):
+                    contacts_added += 1
+        if contact_conflicts:
+            db.update_company(company_id, {
+                "scrape_warnings": contact_conflicts,
+            })
+        else:
+            db.update_company(company_id, {"scrape_warnings": []})
+        # If every person email conflicted away and the company still has no
+        # person-associated email, downgrade scraped → no_emails_found.
         status = updates["scrape_status"]
         if status == "scraped":
-            db.log_event("company", company_id, "enriched", company["name"])
+            rows = db.query(
+                "SELECT email, email_kind, email_verified FROM contacts "
+                "WHERE company_id=? AND email IS NOT NULL AND TRIM(email) != ''",
+                (company_id,),
+            )
+            has_person_email = any(
+                (r.get("email_kind") or "") == "personal"
+                and r.get("email_verified")
+                for r in rows
+            )
+            if not has_person_email:
+                status = "no_emails_found"
+                updates["scrape_status"] = status
+                db.update_company(company_id, {"scrape_status": status})
+        # Log what actually happened — an unconditional "researched" here made
+        # the activity feed claim success for wrong-site and failed scrapes.
+        if status == "scraped":
+            extra = (f" ({len(contact_conflicts)} contact conflict(s))"
+                     if contact_conflicts else "")
+            db.log_event("company", company_id, "enriched",
+                         f"{company['name']}{extra}")
         elif status == "wrong_site":
             db.log_event("company", company_id, "research_failed",
                          f"{company['name']}: {enriched.get('mismatch') or 'wrong site'}")
         else:
             db.log_event("company", company_id, "research_failed",
                          f"{company['name']}: no usable information found")
+        return {
+            "contacts_added": contacts_added,
+            "contact_conflicts": contact_conflicts,
+        }
     except Exception as e:
         db.update_company(company_id, {"scrape_status": "scrape_failed"})
         db.log_event("company", company_id, "research_failed", company["name"])
@@ -469,24 +605,78 @@ CONTACT_STATUSES = ("new", "drafted", "sent", "replied", "archived")
 
 @app.post("/api/contacts")
 async def create_contact(payload: ContactCreate):
+    from contact_ingest import sanitize_inbound_contact
     email = (payload.email or "").strip()
+    cleaned, err = sanitize_inbound_contact(
+        name=payload.name, email=email, linkedin_url=payload.linkedin_url,
+        role=payload.role, require_person_email=True, check_mx=False)
+    if err:
+        messages = {
+            "company_or_role_inbox":
+                "That looks like a company inbox (hello@, info@, careers@…). "
+                "Add a person's address or a matching LinkedIn profile instead.",
+            "email_does_not_match_name":
+                "The email local-part does not match this person's name.",
+            "linkedin_does_not_match_name":
+                "That LinkedIn URL does not match this person's name.",
+            "linkedin_needs_name":
+                "A LinkedIn profile needs the person's name so we can verify it.",
+            "name_required_for_email":
+                "A personal email needs the person's name so we can verify it.",
+            "invalid_email":
+                "That email address is not valid.",
+            "no_usable_contact_method":
+                "Provide a personal email and/or a LinkedIn profile URL.",
+            "invalid_linkedin_url":
+                "Use a full https://www.linkedin.com/in/... profile URL.",
+        }
+        raise HTTPException(400, messages.get(err, err))
+    email = cleaned["email"]
+    linkedin_url = cleaned["linkedin_url"]
     if email and db.find_contact_by_email(email):
         raise HTTPException(409, f"A contact with email {email} already exists")
-    if payload.linkedin_url and db.find_contact_by_linkedin(payload.linkedin_url):
+    if linkedin_url and db.find_contact_by_linkedin(linkedin_url):
         raise HTTPException(409, "That LinkedIn profile is already a contact")
     company_id = payload.company_id
+    created_company_id = None
     if company_id and not db.get_company(company_id):
         raise HTTPException(404, "That company no longer exists")
     if not company_id and payload.company_name and payload.company_name.strip():
         existing = db.find_company_by_name(payload.company_name)
-        company_id = existing["id"] if existing else db.create_company(
-            payload.company_name, source="manual")["id"]
+        if existing:
+            company_id = existing["id"]
+        else:
+            before = {
+                r["id"] for r in db.query("SELECT id FROM companies")
+            }
+            company_id = db.create_company(
+                payload.company_name, source="manual")["id"]
+            if company_id not in before:
+                created_company_id = company_id
     contact = db.create_contact(
-        name=payload.name, email=email, role=payload.role,
-        linkedin_url=payload.linkedin_url,
+        name=cleaned["name"], email=email, role=cleaned["role"],
+        linkedin_url=linkedin_url,
         company_id=company_id, notes=payload.notes, source="manual",
+        email_kind=cleaned["email_kind"],
+        email_verified=cleaned["email_verified"],
+        linkedin_verified=cleaned["linkedin_verified"],
+        person_verified=cleaned["person_verified"],
     )
-    return db.get_contact(contact["id"])
+    if not contact.get("_inserted", True):
+        if created_company_id:
+            # Atomic: only delete if still empty (avoids racing a concurrent insert).
+            db.execute(
+                "DELETE FROM companies WHERE id=? AND NOT EXISTS "
+                "(SELECT 1 FROM contacts WHERE company_id=?)",
+                (created_company_id, created_company_id),
+            )
+        raise HTTPException(
+            409, "That contact already exists (possible concurrent create)")
+    row = db.get_contact(contact["id"])
+    if cleaned.get("ingest_warning"):
+        row = dict(row or {})
+        row["ingest_warning"] = cleaned["ingest_warning"]
+    return row
 
 
 @app.put("/api/contacts/{contact_id}")
@@ -626,8 +816,9 @@ async def import_contacts_csv(file: UploadFile = File(...)):
                 "Header must include at least one contact method: email or linkedin_url")
         # Report why rows were dropped separately — "duplicates skipped" is a
         # misleading thing to tell someone whose addresses were malformed.
-        added = duplicates = invalid = 0
+        added = duplicates = invalid = warnings = 0
         invalid_samples = []
+        from contact_ingest import sanitize_inbound_contact
         for row in reader:
             def get(key):
                 return (row.get(cols[key]) or "").strip() if key in cols else ""
@@ -653,37 +844,67 @@ async def import_contacts_csv(file: UploadFile = File(...)):
                 notes = get("notes") or None
                 affinity = get("affinity") or None
                 source = "csv"
-            try:
-                linkedin_url = validate_linkedin_profile_url(linkedin_url)
-            except ValueError:
-                linkedin_url = None
-                invalid_linkedin = True
-            else:
-                invalid_linkedin = False
-            if ((email and not EMAIL_ADDRESS_RE.fullmatch(email))
-                    or invalid_linkedin or (not email and not linkedin_url)):
+            cleaned, err = sanitize_inbound_contact(
+                name=name, email=email, linkedin_url=linkedin_url, role=role,
+                require_person_email=True, check_mx=False)
+            if err:
                 invalid += 1
                 if len(invalid_samples) < 5:
-                    invalid_samples.append(email or get("linkedin_url") or "(blank)")
+                    label = email or linkedin_url or name or "row"
+                    invalid_samples.append(f"{label} ({err})")
                 continue
+            if cleaned.get("ingest_warning"):
+                # Only count warnings for rows we actually store.
+                pending_warning = True
+            else:
+                pending_warning = False
+            email = cleaned["email"]
+            linkedin_url = cleaned["linkedin_url"]
+            name = cleaned["name"]
+            role = cleaned["role"]
             if ((email and db.find_contact_by_email(email))
                     or (linkedin_url and db.find_contact_by_linkedin(linkedin_url))):
                 duplicates += 1
                 continue
             company_id = None
+            created_company_id = None
             if company_name:
                 existing = db.find_company_by_name(company_name)
-                company_id = existing["id"] if existing else db.create_company(
-                    company_name, source="csv")["id"]
-            db.create_contact(
+                if existing:
+                    company_id = existing["id"]
+                else:
+                    before = {
+                        r["id"] for r in db.query("SELECT id FROM companies")
+                    }
+                    company_id = db.create_company(
+                        company_name, source="csv")["id"]
+                    if company_id not in before:
+                        created_company_id = company_id
+            created = db.create_contact(
                 name=name, email=email, company_id=company_id,
                 linkedin_url=linkedin_url,
                 role=role or None, notes=notes, affinity=affinity, source=source,
+                email_kind=cleaned["email_kind"],
+                email_verified=cleaned["email_verified"],
+                linkedin_verified=cleaned["linkedin_verified"],
+                person_verified=cleaned["person_verified"],
             )
+            if not created.get("_inserted", True):
+                if created_company_id:
+                    db.execute(
+                        "DELETE FROM companies WHERE id=? AND NOT EXISTS "
+                        "(SELECT 1 FROM contacts WHERE company_id=?)",
+                        (created_company_id, created_company_id),
+                    )
+                duplicates += 1
+                continue
+            if pending_warning:
+                warnings += 1
             added += 1
         db.log_event("contact", None, "imported", f"{added} contacts from CSV")
         return {"success": True, "added": added,
                 "duplicates": duplicates, "invalid": invalid,
+                "warnings": warnings,
                 "invalid_samples": invalid_samples,
                 "skipped": duplicates + invalid}
     except ValueError as e:

@@ -10,7 +10,8 @@ from typing import Dict, List, Optional
 from db import Database
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
                             TemplateUnavailable)
-from enrichment import EnrichmentService, scrape_status_for
+from discovery import discovery_scrape_status
+from enrichment import EnrichmentService
 from rate_limiter import RateLimiter
 
 
@@ -144,7 +145,7 @@ class GenerationService:
                             "scraped_at", "research_sources", "pages_scraped",
                             "pages_attempted", "research_quality")
                    and v is not None}
-        updates["scrape_status"] = scrape_status_for(enriched)
+        updates["scrape_status"] = discovery_scrape_status(enriched)
         if updates["scrape_status"] == "wrong_site":
             updates.update({
                 key: None for key in (

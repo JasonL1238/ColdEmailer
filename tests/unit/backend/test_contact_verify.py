@@ -122,3 +122,30 @@ class TestSelectVerified:
         }, check_mx=False)
         assert out["email_person_match"] is False
         assert out["person_verified"] is False
+
+    def test_annotate_rejects_on_domain_first_name_inferred_from_email(self):
+        """Page-less first-name locals must not clear name_from_email."""
+        out = annotate_contact({
+            "email": "kim@acme.com",
+            "name": "Kim",
+            "name_from_email": True,
+            "on_domain": True,
+            "linkedin_url": None,
+        }, check_mx=False)
+        assert out["name_from_email"] is True
+        assert out["email_person_match"] is False
+        assert out["email_verified"] is False
+        assert out["person_verified"] is False
+
+    def test_unchecked_mx_does_not_person_verify_first_name_local(self):
+        out = annotate_contact({
+            "email": "kim@acme.com",
+            "name": "Kim",
+            "name_from_email": False,
+            "on_domain": True,
+            "linkedin_url": None,
+        }, check_mx=False)
+        assert out["email_mx_ok"] is None
+        assert out["email_person_match"] is True
+        assert out["email_verified"] is False
+        assert out["person_verified"] is False

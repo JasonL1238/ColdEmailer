@@ -128,7 +128,8 @@ class TestDiscoveryUsesTheSharedStatusMapping:
                     "ok": True, "emails": []}
         assert self._status(enriched) == "no_emails_found"
 
-    def test_a_linkedin_only_contact_counts_as_successful_research(self):
+    def test_a_linkedin_only_contact_is_not_email_ready(self):
+        """LI-only research is useful, but status must not claim scraped emails."""
         enriched = {
             "url": "https://acme.com",
             "identity_verified": True,
@@ -136,10 +137,48 @@ class TestDiscoveryUsesTheSharedStatusMapping:
             "emails": [],
             "contacts": [{
                 "name": "Jane Doe",
+                "email": "",
                 "linkedin_url": "https://www.linkedin.com/in/jane-doe",
+                "linkedin_verified": True,
+                "person_verified": True,
+            }],
+        }
+        assert self._status(enriched) == "no_emails_found"
+
+    def test_a_person_email_contact_is_scraped(self):
+        enriched = {
+            "url": "https://acme.com",
+            "identity_verified": True,
+            "ok": True,
+            "emails": ["jane.doe@acme.com"],
+            "contacts": [{
+                "name": "Jane Doe",
+                "email": "jane.doe@acme.com",
+                "email_kind": "personal",
+                "email_person_match": True,
+                "email_verified": True,
+                "name_from_email": False,
             }],
         }
         assert self._status(enriched) == "scraped"
+
+    def test_failed_mx_person_match_is_not_scraped(self):
+        enriched = {
+            "url": "https://acme.com",
+            "identity_verified": True,
+            "ok": True,
+            "emails": ["jane.doe@acme.com"],
+            "contacts": [{
+                "name": "Jane Doe",
+                "email": "jane.doe@acme.com",
+                "email_kind": "personal",
+                "email_person_match": True,
+                "email_verified": False,
+                "email_mx_ok": False,
+                "name_from_email": False,
+            }],
+        }
+        assert self._status(enriched) == "no_emails_found"
 
     def test_a_genuine_failure_is_still_a_failure(self):
         enriched = {"url": "https://acme.com", "identity_verified": True,
@@ -147,9 +186,37 @@ class TestDiscoveryUsesTheSharedStatusMapping:
         assert self._status(enriched) == "scrape_failed"
 
     def test_a_good_scrape_with_addresses_is_scraped(self):
-        enriched = {"url": "https://acme.com", "identity_verified": True,
-                    "ok": True, "emails": ["hi@acme.com"]}
+        enriched = {
+            "url": "https://acme.com",
+            "identity_verified": True,
+            "ok": True,
+            "emails": ["jane.doe@acme.com"],
+            "contacts": [{
+                "name": "Jane Doe",
+                "email": "jane.doe@acme.com",
+                "email_kind": "personal",
+                "email_person_match": True,
+                "email_verified": True,
+                "email_mx_ok": True,
+                "name_from_email": False,
+            }],
+        }
         assert self._status(enriched) == "scraped"
+
+    def test_generic_only_emails_are_not_scraped_ready(self):
+        enriched = {
+            "url": "https://acme.com",
+            "identity_verified": True,
+            "ok": True,
+            "emails": ["hello@acme.com"],
+            "contacts": [{
+                "name": "",
+                "email": "hello@acme.com",
+                "email_kind": "generic",
+                "email_person_match": False,
+            }],
+        }
+        assert self._status(enriched) == "no_emails_found"
 
     def test_the_discovery_loop_uses_that_function(self):
         """Guard against a second copy of the mapping reappearing inline."""

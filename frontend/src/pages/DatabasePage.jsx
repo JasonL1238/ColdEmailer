@@ -213,11 +213,14 @@ export default function DatabasePage() {
       if (data.duplicates) parts.push(`${data.duplicates} already in your database`)
       if (data.invalid) {
         const sample = (data.invalid_samples || []).slice(0, 2).join(', ')
-        parts.push(`${data.invalid} with an invalid contact method${sample ? ` (e.g. ${sample})` : ''}`)
+        parts.push(`${data.invalid} invalid${sample ? ` (e.g. ${sample})` : ''}`)
+      }
+      if (data.warnings) {
+        parts.push(`${data.warnings} with LinkedIn dropped (name mismatch)`)
       }
       toast.success(
         `Imported ${data.added} contact${data.added === 1 ? '' : 's'}` +
-        (parts.length ? `. Skipped ${parts.join(' and ')}.` : ''),
+        (parts.length ? `. Skipped/noted: ${parts.join('; ')}.` : ''),
         { duration: parts.length ? 6000 : 4000 }
       )
       load()
@@ -708,6 +711,21 @@ function CompanyDrawer({ company, onClose, onChanged, onDeleted, onCompose }) {
         </>
       }
     >
+      {Array.isArray(company.scrape_warnings) && company.scrape_warnings.length > 0 && (
+        <div className="card card-pad" style={{ borderColor: 'var(--amber)' }}>
+          <div className="row" style={{ gap: 6, marginBottom: 6 }}>
+            <AlertTriangle size={14} style={{ color: 'var(--amber)' }} />
+            <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              Contact conflicts
+            </div>
+          </div>
+          <div className="stack" style={{ gap: 4 }}>
+            {company.scrape_warnings.map((w) => (
+              <div key={w} className="small">{w}</div>
+            ))}
+          </div>
+        </div>
+      )}
       {company.summary ? (
         <div className="stack" style={{ gap: 10 }}>
           <Info label="What they do" value={company.summary} />
@@ -913,7 +931,7 @@ function AddContactModal({ companies, onClose, onAdded }) {
     }
     setSaving(true)
     try {
-      await contactsAPI.create({
+      const { data: created } = await contactsAPI.create({
         name: form.name.trim(),
         email: form.email.trim(),
         linkedin_url: form.linkedin_url.trim() || null,
@@ -921,7 +939,11 @@ function AddContactModal({ companies, onClose, onAdded }) {
         company_id: form.company_id || null,
         company_name: form.company_id ? null : (form.company_name.trim() || null),
       })
-      toast.success('Contact added')
+      if (created?.ingest_warning === 'linkedin_does_not_match_name') {
+        toast.success('Contact added — LinkedIn URL dropped (did not match name)')
+      } else {
+        toast.success('Contact added')
+      }
       onAdded()
     } catch (e) { toast.error(errMessage(e)) }
     finally { setSaving(false) }
