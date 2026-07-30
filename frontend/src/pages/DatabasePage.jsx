@@ -15,10 +15,10 @@ import { useApp } from '../App'
 import ComposeModal from './ComposeModal'
 
 const SCRAPE_STATUS = {
-  scraped: { label: 'Researched', tone: 'green' },
+  scraped: { label: 'Contacts found', tone: 'green' },
   pending: { label: 'Not researched', tone: 'gray' },
   scraping: { label: 'Researching…', tone: 'accent' },
-  no_emails_found: { label: 'No emails found', tone: 'amber' },
+  no_emails_found: { label: 'No contacts found', tone: 'amber' },
   no_website: { label: 'No website', tone: 'gray' },
   wrong_site: { label: 'Wrong site found', tone: 'amber' },
   scrape_failed: { label: 'Research failed', tone: 'red' },

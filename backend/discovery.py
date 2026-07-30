@@ -115,9 +115,19 @@ def contact_notes(candidate: Dict) -> Optional[str]:
     elif candidate.get("email") and not candidate.get("email_person_match"):
         notes.append("Email local-part does not clearly match this person's name.")
     if candidate.get("linkedin_verified"):
-        notes.append("LinkedIn URL slug matches this person's name.")
+        source = candidate.get("linkedin_source")
+        if source == "web_search":
+            notes.append("LinkedIn found via web search; slug matches this person's name.")
+        else:
+            notes.append("LinkedIn URL slug matches this person's name.")
     elif candidate.get("linkedin_url") and not candidate.get("linkedin_person_match"):
         notes.append("LinkedIn URL did not match this person's name — not stored as verified.")
+    if candidate.get("email_source") == "hunter":
+        notes.append("Email from Hunter.io finder — confirm before sending.")
+    if candidate.get("email_guess"):
+        notes.append(
+            f"Possible email pattern {candidate['email_guess']} "
+            f"(not verified — confirm before using).")
     if candidate.get("source_url"):
         notes.append(f"Source: {candidate['source_url']}")
     if candidate.get("evidence"):
@@ -137,27 +147,30 @@ def discovery_scrape_status(enriched: dict) -> str:
     — so the user re-runs research and gets the same wrong site — instead of
     "Wrong site found", which tells them the domain is what needs fixing.
 
-    "scraped" requires a person-associated email. LinkedIn-only contacts are
-    still stored, but the company is marked no_emails_found so the UI does not
-    claim email-outreach readiness.
+    "scraped" means outreach-ready: a verified person email and/or a
+    name-matching LinkedIn profile. Either channel counts.
     """
     status = scrape_status_for(enriched)
     if status != "scraped":
         return status
-    has_person_email = any(
-        (c.get("email") or "").strip()
-        and c.get("email_kind") != "generic"
-        and not c.get("name_from_email")
-        and (
-            c.get("email_verified")
+    has_outreach = any(
+        c.get("name") and not c.get("name_from_email") and (
+            c.get("linkedin_verified")
             or (
-                c.get("email_person_match")
-                and c.get("email_mx_ok") is True
+                (c.get("email") or "").strip()
+                and c.get("email_kind") != "generic"
+                and (
+                    c.get("email_verified")
+                    or (
+                        c.get("email_person_match")
+                        and c.get("email_mx_ok") is True
+                    )
+                )
             )
         )
         for c in (enriched.get("contacts") or [])
     )
-    if has_person_email:
+    if has_outreach:
         return "scraped"
     return "no_emails_found"
 
@@ -270,6 +283,7 @@ class DiscoveryService:
             companies_added += 1
 
             emails_this_company = 0
+            contacts_this_company = 0
             contact_conflicts = []
             for candidate in select_outreach_contacts(
                     enriched.get("contacts") or [],
@@ -366,12 +380,20 @@ class DiscoveryService:
                         self.db.log_event(
                             "company", company["id"],
                             "contact_conflict", detail)
-                # Only count when the returned row actually has the email.
+                # Count inserted outreach contacts (email and/or LinkedIn).
                 created_email = (created.get("email") or "").strip().lower()
-                if addr and created_email == addr.lower():
+                created_li = (created.get("linkedin_url") or "").strip()
+                email_ok = bool(addr and created_email == addr.lower())
+                li_ok = bool(
+                    linkedin_url and created_li
+                    and normalize_linkedin_url(created_li)
+                    == normalize_linkedin_url(linkedin_url)
+                )
+                if email_ok:
                     emails_this_company += 1
-                    if created.get("_inserted", True):
-                        contacts_added += 1
+                if (email_ok or li_ok) and created.get("_inserted", True):
+                    contacts_this_company += 1
+                    contacts_added += 1
 
             if contact_conflicts:
                 self.db.update_company(company["id"], {
@@ -380,9 +402,9 @@ class DiscoveryService:
             else:
                 self.db.update_company(company["id"], {"scrape_warnings": []})
 
-            # Conflicts can wipe every person email for a new company — don't
-            # leave status at "scraped" with zero emailable contacts.
-            if status == "scraped" and emails_this_company == 0:
+            # Conflicts can wipe every outreach contact — don't leave "scraped"
+            # with nobody to message.
+            if status == "scraped" and contacts_this_company == 0:
                 status = "no_emails_found"
                 self.db.update_company(company["id"], {"scrape_status": status})
 

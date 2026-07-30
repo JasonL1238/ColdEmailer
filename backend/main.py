@@ -51,7 +51,12 @@ except ImportError:
 
 app = FastAPI(title="Cold Emailer API", version="2.0")
 
-_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+# Include both localhost and 127.0.0.1 — browsers treat them as different
+# origins, and start.sh serves the app on 127.0.0.1 to avoid IPv6 proxy issues.
+_cors_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000",
+).split(",")
 _allowed_origins = {o.strip() for o in _cors_origins if o.strip()}
 app.add_middleware(
     CORSMiddleware,
@@ -471,30 +476,42 @@ def _enrich_company_async(company_id: str):
                     db.log_event(
                         "company", company_id, "contact_conflict", detail)
             created_email = (created.get("email") or "").strip().lower()
-            if addr and created_email == addr.lower():
-                if created.get("_inserted", True):
-                    contacts_added += 1
+            created_li = (created.get("linkedin_url") or "").strip()
+            email_ok = bool(addr and created_email == addr.lower())
+            li_ok = bool(
+                linkedin_url and created_li
+                and normalize_linkedin_url(created_li)
+                == normalize_linkedin_url(linkedin_url)
+            )
+            if (email_ok or li_ok) and created.get("_inserted", True):
+                contacts_added += 1
         if contact_conflicts:
             db.update_company(company_id, {
                 "scrape_warnings": contact_conflicts,
             })
         else:
             db.update_company(company_id, {"scrape_warnings": []})
-        # If every person email conflicted away and the company still has no
-        # person-associated email, downgrade scraped → no_emails_found.
+        # If every outreach contact conflicted away, downgrade scraped.
         status = updates["scrape_status"]
         if status == "scraped":
             rows = db.query(
-                "SELECT email, email_kind, email_verified FROM contacts "
-                "WHERE company_id=? AND email IS NOT NULL AND TRIM(email) != ''",
+                "SELECT email, email_kind, email_verified, linkedin_url, "
+                "linkedin_verified, name FROM contacts WHERE company_id=?",
                 (company_id,),
             )
-            has_person_email = any(
-                (r.get("email_kind") or "") == "personal"
-                and r.get("email_verified")
+            has_outreach = any(
+                (
+                    (r.get("email") or "").strip()
+                    and (r.get("email_kind") or "") == "personal"
+                    and r.get("email_verified")
+                ) or (
+                    (r.get("linkedin_url") or "").strip()
+                    and r.get("linkedin_verified")
+                    and (r.get("name") or "").strip()
+                )
                 for r in rows
             )
-            if not has_person_email:
+            if not has_outreach:
                 status = "no_emails_found"
                 updates["scrape_status"] = status
                 db.update_company(company_id, {"scrape_status": status})

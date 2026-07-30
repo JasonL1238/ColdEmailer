@@ -12,6 +12,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from contact_enrich import enrich_contacts_outreach
 from contact_verify import (
     GENERIC_LOCALS,
     annotate_contact,
@@ -957,7 +958,8 @@ class EnrichmentService:
         def timed_out() -> bool:
             return budget is not None and (time.monotonic() - started) >= budget
 
-        def _refresh_contacts_and_meta(page_records, texts, *, run_llm: bool):
+        def _refresh_contacts_and_meta(page_records, texts, *, run_llm: bool,
+                                        do_outreach: bool = False):
             combined = "\n\n".join(texts)[:24000]
             result["pages_attempted"] = attempted
             result["pages_scraped"] = len(page_records)
@@ -1028,14 +1030,23 @@ class EnrichmentService:
 
             # Always run MX when annotating — DNS is cheap vs an HTTP page and
             # "email_verified" must mean MX was actually confirmed.
+            # LinkedIn/Hunter outreach enrichment runs once after the crawl
+            # (see do_outreach) to avoid DDG rate-limit blowups mid-loop.
             result["contacts"] = [
                 annotate_contact(c, check_mx=True)
                 for c in contacts
             ]
+            if do_outreach:
+                result["contacts"] = enrich_contacts_outreach(
+                    result["contacts"],
+                    company_name=company_name,
+                    domain=result.get("domain"),
+                    check_mx=True,
+                )
             result["contacts"].sort(key=lambda c: (
                 0 if c.get("person_verified") else 1,
-                0 if c.get("email_verified") else 1,
                 0 if c.get("linkedin_verified") else 1,
+                0 if c.get("email_verified") else 1,
                 0 if c.get("school_match") else 1,
                 c.get("seniority_rank", 20),
                 0 if c.get("on_domain") else 1,
@@ -1046,34 +1057,41 @@ class EnrichmentService:
                 result["pages_scraped"], result.get("summary"), result["contacts"])
             return True
 
+        def _has_outreach_person(contacts_local=None) -> bool:
+            """Person email or verified LinkedIn — either is outreach-ready."""
+            for c in (contacts_local if contacts_local is not None
+                      else result.get("contacts") or []):
+                if not c.get("name") or c.get("name_from_email"):
+                    continue
+                if c.get("linkedin_verified"):
+                    return True
+                if (
+                    c.get("email")
+                    and c.get("email_kind") != "generic"
+                    and c.get("on_domain")
+                    and (
+                        c.get("email_verified")
+                        or (c.get("email_person_match")
+                            and c.get("email_mx_ok") is True)
+                    )
+                ):
+                    return True
+            return False
+
         def _has_fast_success(page_records_local, queue_local=None) -> bool:
             about_ok = bool(result.get("summary"))
             dedicated_about = about_page_present(page_records_local)
-            # Fast success needs a person *email* associated with the contact —
-            # LinkedIn-only is useful to store, but does not meet the scrape bar.
-            person = next((
-                c for c in (result.get("contacts") or [])
-                if c.get("email")
-                and c.get("name")
-                and not c.get("name_from_email")
-                and c.get("email_kind") != "generic"
-                and c.get("on_domain")
-                and (
-                    c.get("email_verified")
-                    or (c.get("email_person_match")
-                        and c.get("email_mx_ok") is True)
-                )
-            ), None)
+            person = _has_outreach_person()
             pending_about = any(
                 _ABOUT_PATH_RE.search((u or "").lower())
                 for u in (queue_local or [])
             )
             # Homepage alone counts as the "about" site once identity + summary
             # exist. Pending guessed /about probes must not block early exit
-            # when we already have a verified person email.
+            # when we already have a verified outreach person.
             about_page = dedicated_about or (
                 about_ok and result.get("identity_verified")
-                and (not pending_about or person is not None)
+                and (not pending_about or person)
             )
             return bool(
                 result.get("identity_verified")
@@ -1164,11 +1182,15 @@ class EnrichmentService:
                                 if fast:
                                     break
 
-                # Early exit once we have about signal + verified person.
+                # Early exit once we have about signal + verified person from
+                # the company site. One outreach pass still runs so Hunter can
+                # fill emails for LinkedIn-only people before we stop crawling.
                 if fast and page_records:
                     if _refresh_contacts_and_meta(
                             page_records, texts, run_llm=False) and _has_fast_success(
                                 page_records, queue):
+                        _refresh_contacts_and_meta(
+                            page_records, texts, run_llm=False, do_outreach=True)
                         result["elapsed_sec"] = round(time.monotonic() - started, 2)
                         return result
 
@@ -1200,8 +1222,12 @@ class EnrichmentService:
             if page_records:
                 need_llm = not result.get("summary") or not _has_fast_success(
                     page_records, [])
+                # One outreach pass after the crawl fills LinkedIn/Hunter gaps.
                 _refresh_contacts_and_meta(
-                    page_records, texts, run_llm=need_llm and not timed_out())
+                    page_records, texts,
+                    run_llm=need_llm and not timed_out(),
+                    do_outreach=not timed_out(),
+                )
             else:
                 result["pages_attempted"] = attempted
                 result["identity_verified"] = False

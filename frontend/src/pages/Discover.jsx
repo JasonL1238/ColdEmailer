@@ -17,8 +17,8 @@ const SUGGESTIONS = [
 ]
 
 const STATUS_LABELS = {
-  scraped: { label: 'Scraped', tone: 'green' },
-  no_emails_found: { label: 'No emails found', tone: 'amber' },
+  scraped: { label: 'Contacts found', tone: 'green' },
+  no_emails_found: { label: 'No contacts found', tone: 'amber' },
   no_website: { label: 'No website', tone: 'gray' },
   wrong_site: { label: 'Wrong site found', tone: 'amber' },
   scrape_failed: { label: 'Scrape failed', tone: 'red' },
@@ -59,7 +59,7 @@ export default function Discover() {
             announced = true
             if (data.status === 'done') {
               const r = data.result || {}
-              toast.success(`Found ${r.companies_added ?? 0} companies with ${r.contacts_added ?? 0} contact emails`)
+              toast.success(`Found ${r.companies_added ?? 0} companies with ${r.contacts_added ?? 0} contacts`)
             } else if (data.status === 'failed') {
               toast.error(data.error || 'Discovery failed')
             }

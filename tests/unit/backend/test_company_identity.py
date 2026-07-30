@@ -128,8 +128,8 @@ class TestDiscoveryUsesTheSharedStatusMapping:
                     "ok": True, "emails": []}
         assert self._status(enriched) == "no_emails_found"
 
-    def test_a_linkedin_only_contact_is_not_email_ready(self):
-        """LI-only research is useful, but status must not claim scraped emails."""
+    def test_a_linkedin_only_contact_is_outreach_ready(self):
+        """Verified LinkedIn counts as scraped success alongside email."""
         enriched = {
             "url": "https://acme.com",
             "identity_verified": True,
@@ -143,7 +143,7 @@ class TestDiscoveryUsesTheSharedStatusMapping:
                 "person_verified": True,
             }],
         }
-        assert self._status(enriched) == "no_emails_found"
+        assert self._status(enriched) == "scraped"
 
     def test_a_person_email_contact_is_scraped(self):
         enriched = {

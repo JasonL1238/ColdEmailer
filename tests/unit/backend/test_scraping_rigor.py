@@ -4,8 +4,11 @@ These cases model failure modes seen on real company sites: nonstandard team
 paths, public email obfuscation, generic inboxes competing with named leaders,
 and Penn State being mistaken for the University of Pennsylvania.
 """
+import pytest
+
 from enrichment import (
     EnrichmentService,
+    annotate_contact,
     discover_internal_links,
     extract_contact_candidates,
     extract_emails_from_html,
@@ -16,6 +19,18 @@ from enrichment import (
 
 def _cloudflare_encode(address: str, key: int = 0x12) -> str:
     return f"{key:02x}" + "".join(f"{ord(char) ^ key:02x}" for char in address)
+
+
+@pytest.fixture(autouse=True)
+def _offline_outreach_enrichment(monkeypatch):
+    """Crawl fixtures stay offline — LinkedIn/email API enrichment is unit-tested
+    separately in test_contact_enrich.py."""
+    import enrichment
+
+    def _passthrough(contacts, **_kwargs):
+        return [annotate_contact(c, check_mx=False) for c in (contacts or [])]
+
+    monkeypatch.setattr(enrichment, "enrich_contacts_outreach", _passthrough)
 
 
 class TestRobustEmailExtraction:
@@ -399,8 +414,8 @@ class TestEndToEndCompanyCrawl:
         assert not any(
             c.get("email_kind") == "personal" for c in result.get("contacts") or [])
 
-    def test_fast_mode_does_not_early_exit_on_linkedin_only(self, monkeypatch):
-        """LinkedIn-only people are stored, but fast success needs a person email."""
+    def test_fast_mode_early_exits_on_verified_linkedin(self, monkeypatch):
+        """Verified LinkedIn is enough for fast success (equal to person email)."""
         import enrichment
 
         pages = {
@@ -436,8 +451,5 @@ class TestEndToEndCompanyCrawl:
 
         result = service.enrich("Acme", "https://acme.com", mode="fast")
         assert any(c.get("linkedin_verified") for c in result.get("contacts") or [])
-        assert not any(
-            (c.get("email") or "").strip() for c in result.get("contacts") or [])
-        # Without a person email, keep crawling past team (press still visited).
-        assert "https://acme.com/press" in result["research_sources"]
+        assert "https://acme.com/press" not in result["research_sources"]
         assert result["elapsed_sec"] < 60
