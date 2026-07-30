@@ -106,6 +106,18 @@ def contact_notes(candidate: Dict) -> Optional[str]:
     for affinity in candidate.get("affinity") or []:
         if affinity and affinity not in (candidate.get("school") or ""):
             notes.append(f"Warm match: {affinity}. Verify before referencing it.")
+    if candidate.get("email_verified"):
+        notes.append("Email verified as person-associated (name match + MX confirmed).")
+    elif candidate.get("email_person_match") and candidate.get("email_mx_ok") is None:
+        notes.append("Email local matches name; MX not confirmed yet.")
+    elif candidate.get("email_kind") == "generic":
+        notes.append("Company/role inbox — not a specific person.")
+    elif candidate.get("email") and not candidate.get("email_person_match"):
+        notes.append("Email local-part does not clearly match this person's name.")
+    if candidate.get("linkedin_verified"):
+        notes.append("LinkedIn URL slug matches this person's name.")
+    elif candidate.get("linkedin_url") and not candidate.get("linkedin_person_match"):
+        notes.append("LinkedIn URL did not match this person's name — not stored as verified.")
     if candidate.get("source_url"):
         notes.append(f"Source: {candidate['source_url']}")
     if candidate.get("evidence"):
@@ -245,9 +257,22 @@ class DiscoveryService:
             emails_this_company = 0
             for candidate in select_outreach_contacts(
                     enriched.get("contacts") or [],
-                    enriched.get("emails") or [], company.get("domain")):
+                    enriched.get("emails") or [], company.get("domain"),
+                    limit=3, person_only=True):
                 addr = candidate.get("email") or ""
                 linkedin_url = candidate.get("linkedin_url") or ""
+                # Drop LinkedIn that failed person-slug verification
+                if linkedin_url and not candidate.get("linkedin_verified"):
+                    linkedin_url = ""
+                # Drop generic / unmatched emails — keep LinkedIn-only people
+                if addr and (
+                        candidate.get("email_kind") == "generic"
+                        or (candidate.get("name")
+                            and not candidate.get("email_person_match")
+                            and not candidate.get("email_verified"))):
+                    addr = ""
+                if not addr and not linkedin_url:
+                    continue
                 if ((addr and self.db.find_contact_by_email(addr))
                         or (linkedin_url and self.db.find_contact_by_linkedin(linkedin_url))):
                     continue
@@ -265,6 +290,10 @@ class DiscoveryService:
                     evidence=candidate.get("evidence"),
                     affinity=", ".join(candidate.get("affinity") or []) or None,
                     seniority_rank=candidate.get("seniority_rank", 20),
+                    email_kind=candidate.get("email_kind") or "unknown",
+                    email_verified=bool(candidate.get("email_verified")),
+                    linkedin_verified=bool(candidate.get("linkedin_verified")),
+                    person_verified=bool(candidate.get("person_verified")),
                 )
                 contacts_added += 1
                 emails_this_company += bool(addr)

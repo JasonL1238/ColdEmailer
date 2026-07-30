@@ -89,12 +89,20 @@ export default function DatabasePage() {
   const filteredContacts = useMemo(() => {
     const rows = (contacts || []).filter((c) => {
       const matchesSearch = !q ||
-        [c.name, c.email, c.company_name, c.role].some((v) => v?.toLowerCase().includes(q))
+        [c.name, c.email, c.company_name, c.role, c.affinity, c.linkedin_url]
+          .some((v) => v?.toLowerCase().includes(q))
       const matchesFilter = viewFilter === 'all'
         || (viewFilter === 'active' && c.status !== 'archived')
         || (viewFilter === 'uncontacted' && Number(c.email_count || 0) === 0)
         || (viewFilter === 'replied' && Number(c.verified_reply_count || 0) > 0)
         || (viewFilter === 'archived' && c.status === 'archived')
+        || (viewFilter === 'verified' && Number(c.person_verified || 0) === 1)
+        || (viewFilter === 'personal_email' && (
+          c.email_kind === 'personal' || Number(c.email_verified || 0) === 1))
+        || (viewFilter === 'has_linkedin' && !!c.linkedin_url)
+        || (viewFilter === 'linkedin_verified' && Number(c.linkedin_verified || 0) === 1)
+        || (viewFilter === 'affinity' && !!c.affinity)
+        || (viewFilter === 'senior' && Number(c.seniority_rank ?? 99) <= 5)
       return matchesSearch && matchesFilter
     })
     return rows.sort((a, b) => {
@@ -104,6 +112,15 @@ export default function DatabasePage() {
           || (a.name || a.email || '').localeCompare(b.name || b.email || '')
       }
       if (sortBy === 'status') return (a.status || '').localeCompare(b.status || '')
+      if (sortBy === 'seniority') {
+        return Number(a.seniority_rank ?? 99) - Number(b.seniority_rank ?? 99)
+          || (a.name || '').localeCompare(b.name || '')
+      }
+      if (sortBy === 'verified') {
+        return Number(b.person_verified || 0) - Number(a.person_verified || 0)
+          || Number(b.email_verified || 0) - Number(a.email_verified || 0)
+          || (a.name || '').localeCompare(b.name || '')
+      }
       return (Date.parse(b.created_at || '') || 0) - (Date.parse(a.created_at || '') || 0)
     })
   }, [contacts, q, sortBy, viewFilter])
@@ -266,6 +283,12 @@ export default function DatabasePage() {
                 <option value="uncontacted">Not contacted</option>
                 <option value="replied">Replied</option>
                 <option value="archived">Archived</option>
+                <option value="verified">Person verified</option>
+                <option value="personal_email">Personal email</option>
+                <option value="has_linkedin">Has LinkedIn</option>
+                <option value="linkedin_verified">LinkedIn verified</option>
+                <option value="affinity">Warm match</option>
+                <option value="senior">Senior (CEO/Founder/VP)</option>
               </>
             )}
           </select>
@@ -286,6 +309,8 @@ export default function DatabasePage() {
               <>
                 <option value="company">By company</option>
                 <option value="status">By status</option>
+                <option value="seniority">Most senior</option>
+                <option value="verified">Verified first</option>
               </>
             )}
           </select>
@@ -501,13 +526,19 @@ function ContactsTable({ contacts, selected, onToggle, onToggleAll, allSelected,
             <th style={{ width: 34 }}>
               <input type="checkbox" className="checkbox" checked={allSelected} onChange={onToggleAll} />
             </th>
-            <th>Contact</th><th>Company</th><th>Role</th><th>Status</th>
+            <th>Contact</th><th>Company</th><th>Role</th><th>Verified</th><th>Status</th>
             <th style={{ width: 112 }}></th>
           </tr>
         </thead>
         <tbody>
           {contacts.map((c) => {
             const st = contactStatusMeta(c)
+            const verifiedBits = []
+            if (Number(c.person_verified || 0) === 1) verifiedBits.push('Person')
+            else {
+              if (Number(c.email_verified || 0) === 1) verifiedBits.push('Email')
+              if (Number(c.linkedin_verified || 0) === 1) verifiedBits.push('LinkedIn')
+            }
             return (
               <tr key={c.id} className={selected.has(c.id) ? 'selected' : ''}>
                 <td>
@@ -524,10 +555,26 @@ function ContactsTable({ contacts, selected, onToggle, onToggleAll, allSelected,
                     )}
                   </div>
                   <div className="td-sub mono">{c.email || 'no email'}</div>
+                  {c.linkedin_url && (
+                    <div className="td-sub">
+                      <a href={c.linkedin_url} target="_blank" rel="noreferrer"
+                        onClick={(e) => e.stopPropagation()}>
+                        LinkedIn
+                      </a>
+                      {Number(c.linkedin_verified || 0) === 1 ? ' · matched' : ''}
+                    </div>
+                  )}
                   {c.affinity && <div className="td-sub warm-match">{c.affinity}</div>}
                 </td>
                 <td className="td-dim truncate-cell">{c.company_name || '—'}</td>
                 <td className="td-dim truncate-cell">{c.role || '—'}</td>
+                <td>
+                  {verifiedBits.length > 0
+                    ? <Chip tone="green">{verifiedBits.join(' · ')}</Chip>
+                    : c.email_kind === 'generic'
+                      ? <Chip tone="amber">Company inbox</Chip>
+                      : <span className="muted">—</span>}
+                </td>
                 <td><Chip tone={st.tone} title={st.title}>{st.label}</Chip></td>
                 <td>
                   <div className="row" style={{ gap: 2, justifyContent: 'flex-end' }}>

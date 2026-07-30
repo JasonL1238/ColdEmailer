@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, "data", "coldemailer.db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS companies (
     job_id      TEXT,
     scraped_at  TEXT,
     scrape_status TEXT DEFAULT 'pending',
+    name_key    TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -67,6 +68,10 @@ CREATE TABLE IF NOT EXISTS contacts (
     evidence   TEXT,
     affinity   TEXT,
     seniority_rank INTEGER DEFAULT 20,
+    email_kind TEXT DEFAULT 'unknown',
+    email_verified INTEGER DEFAULT 0,
+    linkedin_verified INTEGER DEFAULT 0,
+    person_verified INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -158,6 +163,7 @@ _ADDED_COLUMNS = {
         "pages_scraped": "INTEGER DEFAULT 0",
         "pages_attempted": "INTEGER DEFAULT 0",
         "research_quality": "TEXT DEFAULT 'low'",
+        "name_key": "TEXT",
     },
     "contacts": {
         "linkedin_url": "TEXT",
@@ -165,6 +171,10 @@ _ADDED_COLUMNS = {
         "evidence": "TEXT",
         "affinity": "TEXT",
         "seniority_rank": "INTEGER DEFAULT 20",
+        "email_kind": "TEXT DEFAULT 'unknown'",
+        "email_verified": "INTEGER DEFAULT 0",
+        "linkedin_verified": "INTEGER DEFAULT 0",
+        "person_verified": "INTEGER DEFAULT 0",
     },
 }
 
@@ -237,6 +247,36 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
+_COMPANY_NAME_STOP = {
+    "inc", "llc", "ltd", "corp", "corporation", "company", "co", "the",
+    "group", "labs", "lab", "technologies", "technology", "tech", "systems",
+    "solutions", "software", "ai", "io",
+}
+
+
+def company_name_key(name: Optional[str]) -> Optional[str]:
+    """Normalize a company name for duplicate detection ('Acme Inc' == 'acme')."""
+    if not name:
+        return None
+    tokens = [
+        t for t in re.split(r"[^a-z0-9]+", name.lower())
+        if t and t not in _COMPANY_NAME_STOP
+    ]
+    return "".join(tokens) or None
+
+
+def normalize_linkedin_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    value = url.strip().rstrip("/")
+    if not value:
+        return None
+    # Collapse www / trailing slash differences for lookups
+    value = re.sub(r"^https?://(www\.)?linkedin\.com",
+                   "https://www.linkedin.com", value, flags=re.I)
+    return value.rstrip("/")
+
+
 class Database:
     """Thread-safe SQLite wrapper. One connection guarded by a lock —
     FastAPI handlers and background job threads share it safely."""
@@ -252,6 +292,8 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
             self._add_missing_columns()
+            self._ensure_dedupe_indexes()
+            self._backfill_name_keys()
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn.commit()
 
@@ -262,6 +304,264 @@ class Database:
             for name, decl in columns.items():
                 if name not in have:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    def _ensure_dedupe_indexes(self):
+        """Unique indexes that block duplicate emails / LinkedIn / companies.
+
+        Pre-existing duplicate rows are collapsed first so the index create
+        does not fail on a user's real database. Non-unique helper indexes that
+        reference columns added via ALTER TABLE are created here too — after
+        `_add_missing_columns` — so legacy DBs do not fail on first open.
+        """
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_companies_name_key ON companies (name_key)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contacts_linkedin "
+            "ON contacts (linkedin_url COLLATE NOCASE)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contacts_person_verified "
+            "ON contacts (person_verified)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contacts_seniority "
+            "ON contacts (seniority_rank)"
+        )
+        # Normalize LinkedIn URLs before unique-index creation
+        rows = self._conn.execute(
+            "SELECT id, linkedin_url FROM contacts "
+            "WHERE linkedin_url IS NOT NULL AND TRIM(linkedin_url) != ''"
+        ).fetchall()
+        for row in rows:
+            normalized = normalize_linkedin_url(row["linkedin_url"])
+            if normalized and normalized != row["linkedin_url"]:
+                self._conn.execute(
+                    "UPDATE contacts SET linkedin_url=? WHERE id=?",
+                    (normalized, row["id"]),
+                )
+        self._collapse_duplicate_contacts()
+        self._collapse_duplicate_companies()
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_email_unique "
+            "ON contacts (email COLLATE NOCASE) "
+            "WHERE email IS NOT NULL AND TRIM(email) != ''"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_linkedin_unique "
+            "ON contacts (linkedin_url COLLATE NOCASE) "
+            "WHERE linkedin_url IS NOT NULL AND TRIM(linkedin_url) != ''"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_domain_unique "
+            "ON companies (domain COLLATE NOCASE) "
+            "WHERE domain IS NOT NULL AND TRIM(domain) != ''"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_key_unique "
+            "ON companies (name_key) "
+            "WHERE name_key IS NOT NULL AND TRIM(name_key) != ''"
+        )
+
+    def _collapse_duplicate_contacts(self):
+        """Keep the best contact per email / LinkedIn within the same company."""
+        # Email duplicates — prefer person_verified, then oldest
+        rows = self._conn.execute(
+            "SELECT lower(email) AS e, company_id, COUNT(*) AS n "
+            "FROM contacts WHERE email IS NOT NULL AND TRIM(email) != '' "
+            "GROUP BY lower(email), company_id HAVING COUNT(*) > 1"
+        ).fetchall()
+        for row in rows:
+            keep = self._conn.execute(
+                "SELECT id FROM contacts WHERE lower(email)=? AND "
+                "ifnull(company_id,'')=ifnull(?, '') "
+                "ORDER BY person_verified DESC, email_verified DESC, "
+                "created_at ASC LIMIT 1",
+                (row["e"], row["company_id"]),
+            ).fetchone()
+            if not keep:
+                continue
+            self._conn.execute(
+                "UPDATE emails SET contact_id=?, company_id=COALESCE(?, company_id) "
+                "WHERE contact_id IN ("
+                "  SELECT id FROM contacts WHERE lower(email)=? "
+                "  AND ifnull(company_id,'')=ifnull(?, '') AND id!=?)",
+                (keep["id"], row["company_id"], row["e"], row["company_id"],
+                 keep["id"]),
+            )
+            self._conn.execute(
+                "DELETE FROM contacts WHERE lower(email)=? "
+                "AND ifnull(company_id,'')=ifnull(?, '') AND id!=?",
+                (row["e"], row["company_id"], keep["id"]),
+            )
+        # Cross-company same email: clear the newer copy's email rather than
+        # merging people across companies.
+        cross = self._conn.execute(
+            "SELECT lower(email) AS e FROM contacts "
+            "WHERE email IS NOT NULL AND TRIM(email) != '' "
+            "GROUP BY lower(email) HAVING COUNT(DISTINCT company_id) > 1"
+        ).fetchall()
+        for row in cross:
+            keep = self._conn.execute(
+                "SELECT id FROM contacts WHERE lower(email)=? "
+                "ORDER BY person_verified DESC, created_at ASC LIMIT 1",
+                (row["e"],),
+            ).fetchone()
+            if not keep:
+                continue
+            self._conn.execute(
+                "UPDATE contacts SET email='' WHERE lower(email)=? AND id!=?",
+                (row["e"], keep["id"]),
+            )
+
+        # LinkedIn duplicates (normalized)
+        rows = self._conn.execute(
+            "SELECT lower(rtrim(replace(replace(linkedin_url, "
+            "'https://linkedin.com', 'https://www.linkedin.com'), "
+            "'http://www.linkedin.com', 'https://www.linkedin.com'), '/')) AS u, "
+            "company_id "
+            "FROM contacts WHERE linkedin_url IS NOT NULL AND TRIM(linkedin_url) != '' "
+            "GROUP BY u, company_id HAVING COUNT(*) > 1"
+        ).fetchall()
+        for row in rows:
+            keep = self._conn.execute(
+                "SELECT id FROM contacts WHERE "
+                "lower(rtrim(replace(replace(linkedin_url, "
+                "'https://linkedin.com', 'https://www.linkedin.com'), "
+                "'http://www.linkedin.com', 'https://www.linkedin.com'), '/'))=? "
+                "AND ifnull(company_id,'')=ifnull(?, '') "
+                "ORDER BY person_verified DESC, linkedin_verified DESC, "
+                "created_at ASC LIMIT 1",
+                (row["u"], row["company_id"]),
+            ).fetchone()
+            if not keep:
+                continue
+            self._conn.execute(
+                "UPDATE emails SET contact_id=?, company_id=COALESCE(?, company_id) "
+                "WHERE contact_id IN ("
+                "  SELECT id FROM contacts WHERE "
+                "  lower(rtrim(replace(replace(linkedin_url, "
+                "'https://linkedin.com', 'https://www.linkedin.com'), "
+                "'http://www.linkedin.com', 'https://www.linkedin.com'), '/'))=? "
+                "  AND ifnull(company_id,'')=ifnull(?, '') AND id!=?)",
+                (keep["id"], row["company_id"], row["u"], row["company_id"],
+                 keep["id"]),
+            )
+            self._conn.execute(
+                "DELETE FROM contacts WHERE "
+                "lower(rtrim(replace(replace(linkedin_url, "
+                "'https://linkedin.com', 'https://www.linkedin.com'), "
+                "'http://www.linkedin.com', 'https://www.linkedin.com'), '/'))=? "
+                "AND ifnull(company_id,'')=ifnull(?, '') AND id!=?",
+                (row["u"], row["company_id"], keep["id"]),
+            )
+
+        # Cross-company same LinkedIn: clear the loser's URL (do not merge people).
+        cross_li = self._conn.execute(
+            "SELECT lower(rtrim(linkedin_url, '/')) AS u FROM contacts "
+            "WHERE linkedin_url IS NOT NULL AND TRIM(linkedin_url) != '' "
+            "GROUP BY u HAVING COUNT(DISTINCT ifnull(company_id,'')) > 1"
+        ).fetchall()
+        for row in cross_li:
+            keep = self._conn.execute(
+                "SELECT id FROM contacts WHERE lower(rtrim(linkedin_url, '/'))=? "
+                "ORDER BY person_verified DESC, linkedin_verified DESC, "
+                "created_at ASC LIMIT 1",
+                (row["u"],),
+            ).fetchone()
+            if not keep:
+                continue
+            self._conn.execute(
+                "UPDATE contacts SET linkedin_url=NULL, linkedin_verified=0 "
+                "WHERE lower(rtrim(linkedin_url, '/'))=? AND id!=?",
+                (row["u"], keep["id"]),
+            )
+
+    def _collapse_duplicate_companies(self):
+        rows = self._conn.execute(
+            "SELECT lower(domain) AS d, MIN(created_at) AS first_at "
+            "FROM companies WHERE domain IS NOT NULL AND TRIM(domain) != '' "
+            "GROUP BY lower(domain) HAVING COUNT(*) > 1"
+        ).fetchall()
+        for row in rows:
+            keep = self._conn.execute(
+                "SELECT id FROM companies WHERE lower(domain)=? "
+                "ORDER BY created_at ASC LIMIT 1",
+                (row["d"],),
+            ).fetchone()
+            if not keep:
+                continue
+            dups = self._conn.execute(
+                "SELECT id FROM companies WHERE lower(domain)=? AND id!=?",
+                (row["d"], keep["id"]),
+            ).fetchall()
+            for dup in dups:
+                self._conn.execute(
+                    "UPDATE contacts SET company_id=? WHERE company_id=?",
+                    (keep["id"], dup["id"]),
+                )
+                self._conn.execute(
+                    "UPDATE emails SET company_id=? WHERE company_id=?",
+                    (keep["id"], dup["id"]),
+                )
+                self._conn.execute("DELETE FROM companies WHERE id=?", (dup["id"],))
+
+        # Conflicting soft keys: keep the oldest, disambiguate or clear the rest
+        # so the unique index can be created.
+        key_rows = self._conn.execute(
+            "SELECT name_key FROM companies "
+            "WHERE name_key IS NOT NULL AND TRIM(name_key) != '' "
+            "GROUP BY name_key HAVING COUNT(*) > 1"
+        ).fetchall()
+        for row in key_rows:
+            keep = self._conn.execute(
+                "SELECT id, domain FROM companies WHERE name_key=? "
+                "ORDER BY created_at ASC LIMIT 1",
+                (row["name_key"],),
+            ).fetchone()
+            if not keep:
+                continue
+            dups = self._conn.execute(
+                "SELECT id, domain FROM companies WHERE name_key=? AND id!=?",
+                (row["name_key"], keep["id"]),
+            ).fetchall()
+            for dup in dups:
+                # Same domain → true duplicate, merge into keeper
+                if keep["domain"] and dup["domain"] and keep["domain"] == dup["domain"]:
+                    self._conn.execute(
+                        "UPDATE contacts SET company_id=? WHERE company_id=?",
+                        (keep["id"], dup["id"]),
+                    )
+                    self._conn.execute(
+                        "UPDATE emails SET company_id=? WHERE company_id=?",
+                        (keep["id"], dup["id"]),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM companies WHERE id=?", (dup["id"],))
+                else:
+                    # Distinct companies sharing a soft key — disambiguate
+                    suffix = (dup["domain"] or dup["id"][:8] or "x").split(".")[0]
+                    self._conn.execute(
+                        "UPDATE companies SET name_key=? WHERE id=?",
+                        (f"{row['name_key']}:{suffix}", dup["id"]),
+                    )
+
+    def _backfill_name_keys(self):
+        rows = self._conn.execute(
+            "SELECT id, name FROM companies WHERE name_key IS NULL OR name_key=''"
+        ).fetchall()
+        for row in rows:
+            key = company_name_key(row["name"])
+            if not key:
+                continue
+            clash = self._conn.execute(
+                "SELECT id FROM companies WHERE name_key=? AND id!=?",
+                (key, row["id"]),
+            ).fetchone()
+            if clash:
+                continue
+            self._conn.execute(
+                "UPDATE companies SET name_key=? WHERE id=?", (key, row["id"]))
 
     # ---------- low-level helpers ----------
 
@@ -342,10 +642,55 @@ class Database:
 
     def create_company(self, name: str, **kwargs) -> Dict[str, Any]:
         ts = now_iso()
+        name_key = kwargs.get("name_key") or company_name_key(name)
+        domain = (kwargs.get("domain") or "").strip().lower() or None
+        # Prefer returning an existing soft/domain match over inserting a
+        # duplicate with a null key to dodge the unique index.
+        if domain:
+            existing = self.find_company_by_domain(domain)
+            if existing:
+                return existing
+        # Exact name + same domain (or both missing domain) only.
+        existing = self.find_company_by_name(name)
+        if existing:
+            existing_domain = (existing.get("domain") or "").lower() or None
+            if existing_domain == domain:
+                return existing
+            # Same display name, different domain → distinct companies
+            if domain and existing_domain and existing_domain != domain:
+                existing = None
+            elif not domain and not existing_domain:
+                return existing
+            else:
+                # One has domain, one doesn't — prefer treating as same only when
+                # soft keys match AND we're not inventing a second domain later.
+                existing = None
+        if name_key:
+            soft = self.find_company_by_name_key(name_key)
+            # Soft-key collision only counts as a duplicate when domains match.
+            # Never merge solely because both lack a domain ("Acme Inc" vs
+            # "Acme Labs" without websites).
+            if soft and domain and soft.get("domain") and soft.get("domain") == domain:
+                return soft
+            if soft and domain and soft.get("domain") and soft.get("domain") != domain:
+                name_key = f"{name_key}:{domain.split('.')[0]}"
+            elif soft and domain and not soft.get("domain"):
+                # Only claim the domain-less soft-key row when the display
+                # names match (same company found before its website). Never
+                # attach acme.com onto an unrelated "Acme Labs" soft key.
+                if (soft.get("name") or "").strip().lower() == name.strip().lower():
+                    self.update_company(
+                        soft["id"], {"domain": domain, "name_key": name_key})
+                    return soft
+                name_key = f"{name_key}:{domain.split('.')[0]}"
+            elif soft and not domain:
+                # Incoming has no domain; soft-key hit may be a different firm.
+                name_key = f"{name_key}:{new_id()[:8]}"
         data = {
             "id": kwargs.get("id") or new_id(),
             "name": name.strip(),
-            "domain": kwargs.get("domain"),
+            "name_key": name_key,
+            "domain": domain,
             "url": kwargs.get("url"),
             "summary": kwargs.get("summary"),
             "industry": kwargs.get("industry"),
@@ -366,7 +711,16 @@ class Database:
             "created_at": ts,
             "updated_at": ts,
         }
-        self._insert("companies", data)
+        try:
+            self._insert("companies", data)
+        except sqlite3.IntegrityError:
+            existing = (
+                self.find_company_by_domain(domain) if domain else None
+            ) or self.find_company_by_name(name) or self.find_company_by_name_key(
+                name_key or "")
+            if existing:
+                return existing
+            raise
         return self._decode_company(data)
 
     @staticmethod
@@ -390,15 +744,28 @@ class Database:
             self.query_one("SELECT * FROM companies WHERE id=?", (company_id,)))
 
     def find_company_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        return self._decode_company(self.query_one(
+        if not name or not name.strip():
+            return None
+        exact = self._decode_company(self.query_one(
             "SELECT * FROM companies WHERE name=? COLLATE NOCASE", (name.strip(),)
+        ))
+        if exact:
+            return exact
+        return None
+
+    def find_company_by_name_key(self, name_key: str) -> Optional[Dict[str, Any]]:
+        if not name_key:
+            return None
+        return self._decode_company(self.query_one(
+            "SELECT * FROM companies WHERE name_key=?", (name_key,),
         ))
 
     def find_company_by_domain(self, domain: str) -> Optional[Dict[str, Any]]:
         if not domain:
             return None
         return self._decode_company(self.query_one(
-            "SELECT * FROM companies WHERE domain=?", (domain.lower(),)))
+            "SELECT * FROM companies WHERE domain=? COLLATE NOCASE",
+            (domain.lower(),)))
 
     def update_company(self, company_id: str, updates: Dict[str, Any]):
         updates = dict(updates)
@@ -441,12 +808,14 @@ class Database:
 
     def create_contact(self, **kwargs) -> Dict[str, Any]:
         ts = now_iso()
+        email = (kwargs.get("email") or "").strip()
+        linkedin_url = normalize_linkedin_url(kwargs.get("linkedin_url"))
         data = {
             "id": kwargs.get("id") or new_id(),
             "company_id": kwargs.get("company_id"),
             "name": (kwargs.get("name") or "").strip(),
-            "email": (kwargs.get("email") or "").strip(),
-            "linkedin_url": (kwargs.get("linkedin_url") or "").strip() or None,
+            "email": email,
+            "linkedin_url": linkedin_url,
             "role": kwargs.get("role"),
             "source": kwargs.get("source", "manual"),
             "status": kwargs.get("status", "new"),
@@ -455,10 +824,22 @@ class Database:
             "evidence": kwargs.get("evidence"),
             "affinity": kwargs.get("affinity"),
             "seniority_rank": kwargs.get("seniority_rank", 20),
+            "email_kind": kwargs.get("email_kind") or "unknown",
+            "email_verified": 1 if kwargs.get("email_verified") else 0,
+            "linkedin_verified": 1 if kwargs.get("linkedin_verified") else 0,
+            "person_verified": 1 if kwargs.get("person_verified") else 0,
             "created_at": ts,
             "updated_at": ts,
         }
-        self._insert("contacts", data)
+        try:
+            self._insert("contacts", data)
+        except sqlite3.IntegrityError:
+            existing = (
+                self.find_contact_by_email(email) if email else None
+            ) or (self.find_contact_by_linkedin(linkedin_url) if linkedin_url else None)
+            if existing:
+                return existing
+            raise
         return data
 
     def get_contact(self, contact_id: str) -> Optional[Dict[str, Any]]:
@@ -477,20 +858,40 @@ class Database:
         )
 
     def find_contact_by_linkedin(self, linkedin_url: str) -> Optional[Dict[str, Any]]:
+        linkedin_url = normalize_linkedin_url(linkedin_url)
         if not linkedin_url:
             return None
-        return self.query_one(
+        row = self.query_one(
             "SELECT * FROM contacts WHERE linkedin_url=? COLLATE NOCASE",
-            (linkedin_url.strip().rstrip("/"),),
+            (linkedin_url,),
         )
+        if row:
+            return row
+        # Legacy rows may still store bare linkedin.com without www.
+        variants = {
+            linkedin_url.lower().rstrip("/"),
+            linkedin_url.lower().rstrip("/").replace(
+                "://www.linkedin.com", "://linkedin.com"),
+        }
+        for variant in variants:
+            row = self.query_one(
+                "SELECT * FROM contacts WHERE lower(rtrim(linkedin_url, '/')) = ?",
+                (variant,),
+            )
+            if row:
+                return row
+        return None
 
     def update_contact(self, contact_id: str, updates: Dict[str, Any]):
         allowed = {
             "company_id", "name", "email", "linkedin_url", "role", "status",
             "notes", "source", "source_url", "evidence", "affinity",
-            "seniority_rank",
+            "seniority_rank", "email_kind", "email_verified",
+            "linkedin_verified", "person_verified",
         }
         updates = {k: v for k, v in updates.items() if k in allowed}
+        if "linkedin_url" in updates:
+            updates["linkedin_url"] = normalize_linkedin_url(updates.get("linkedin_url"))
         if updates:
             updates["updated_at"] = now_iso()
             self._update("contacts", contact_id, updates)
@@ -524,10 +925,10 @@ class Database:
         if search:
             clauses.append(
                 "(ct.name LIKE ? OR ct.email LIKE ? OR ct.role LIKE ? "
-                "OR ct.affinity LIKE ? OR c.name LIKE ?)"
+                "OR ct.affinity LIKE ? OR ct.linkedin_url LIKE ? OR c.name LIKE ?)"
             )
             like = f"%{search}%"
-            params += [like, like, like, like, like]
+            params += [like, like, like, like, like, like]
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY ct.created_at DESC"

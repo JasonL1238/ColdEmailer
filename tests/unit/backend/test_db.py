@@ -73,9 +73,106 @@ def test_contact_can_be_linkedin_only_and_is_searchable_by_affinity(db):
     assert db.list_contacts(search="Stripe")[0]["id"] == contact["id"]
 
 
-def test_contact_email_lookup_is_case_insensitive(db):
-    db.create_contact(email="Jane@Example.com")
-    assert db.find_contact_by_email("jane@example.com") is not None
+def test_contact_email_and_linkedin_are_unique(db):
+    company = db.create_company("Acme")
+    db.create_contact(company_id=company["id"], email="a@acme.com", name="A")
+    dup = db.create_contact(company_id=company["id"], email="a@acme.com", name="B")
+    assert dup["email"] == "a@acme.com"
+    assert dup["name"] == "A"  # returns existing on conflict
+    assert len([c for c in db.list_contacts() if c["email"] == "a@acme.com"]) == 1
+
+    db.create_contact(
+        company_id=company["id"], name="Jane",
+        linkedin_url="https://www.linkedin.com/in/jane-doe")
+    again = db.create_contact(
+        company_id=company["id"], name="Other",
+        linkedin_url="https://www.linkedin.com/in/jane-doe/")
+    assert again["name"] == "Jane"
+    assert len(db.list_contacts(search="jane-doe")) >= 1
+
+
+def test_company_name_key_dedupes_acme_inc(db):
+    first = db.create_company("Acme Inc", domain="acme.com")
+    # Same domain must not create a second row
+    second = db.create_company("Acme Corporation", domain="acme.com")
+    assert second["id"] == first["id"]
+    # Different domain with similar name stays separate
+    other = db.create_company("Acme Labs", domain="acmelabs.io")
+    assert other["id"] != first["id"]
+    assert db.find_company_by_name("Acme Inc")["id"] == first["id"]
+    assert db.find_company_by_name("Acme Labs")["id"] == other["id"]
+
+
+def test_legacy_db_upgrades_without_name_key_column(tmp_path):
+    """Schema v3 DBs must open after adding name_key / verification columns."""
+    import sqlite3
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE companies (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, domain TEXT, url TEXT,
+            summary TEXT, industry TEXT, product TEXT, hook TEXT,
+            recent_news TEXT, why_care TEXT, location TEXT,
+            discovery_note TEXT, research_sources TEXT,
+            pages_scraped INTEGER DEFAULT 0, pages_attempted INTEGER DEFAULT 0,
+            research_quality TEXT DEFAULT 'low', source TEXT,
+            job_id TEXT, scraped_at TEXT, scrape_status TEXT DEFAULT 'pending',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE contacts (
+            id TEXT PRIMARY KEY, company_id TEXT, name TEXT, email TEXT,
+            linkedin_url TEXT, role TEXT, source TEXT, status TEXT, notes TEXT,
+            source_url TEXT, evidence TEXT, affinity TEXT,
+            seniority_rank INTEGER DEFAULT 20,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE resumes (
+            id TEXT PRIMARY KEY, label TEXT, filename TEXT, path TEXT,
+            text_content TEXT, is_default INTEGER, uploaded_at TEXT NOT NULL
+        );
+        CREATE TABLE emails (
+            id TEXT PRIMARY KEY, contact_id TEXT, company_id TEXT,
+            subject TEXT, body TEXT, status TEXT, created_at TEXT
+        );
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT,
+            entity_id TEXT, event TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
+        );
+        PRAGMA user_version=3;
+    """)
+    conn.close()
+    db = Database(path)
+    company = db.create_company("Acme", domain="acme.com")
+    assert company["name_key"] == "acme"
+    contact = db.create_contact(
+        company_id=company["id"], email="jane.doe@acme.com",
+        name="Jane Doe", email_verified=1, person_verified=1)
+    assert contact["person_verified"] == 1
+
+
+def test_same_display_name_different_domains_stay_separate(db):
+    a = db.create_company("Same Name Co", domain="a.com")
+    b = db.create_company("Same Name Co", domain="b.com")
+    assert a["id"] != b["id"]
+
+
+def test_acme_inc_and_acme_labs_without_domain_stay_separate(db):
+    a = db.create_company("Acme Inc")
+    b = db.create_company("Acme Labs")
+    assert a["id"] != b["id"]
+
+
+def test_domain_claim_does_not_steal_unrelated_soft_key(db):
+    labs = db.create_company("Acme Labs")  # no domain yet
+    inc = db.create_company("Acme Inc", domain="acme.com")
+    assert labs["id"] != inc["id"]
+    assert db.get_company(labs["id"])["domain"] in (None, "")
+    assert db.get_company(inc["id"])["domain"] == "acme.com"
 
 
 def test_update_contact_rejects_unlisted_fields(db):

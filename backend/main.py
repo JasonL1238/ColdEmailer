@@ -307,9 +307,20 @@ def _enrich_company_async(company_id: str):
         domain = (db.get_company(company_id) or {}).get("domain")
         for candidate in select_outreach_contacts(
                 enriched.get("contacts") or [],
-                enriched.get("emails") or [], domain):
+                enriched.get("emails") or [], domain,
+                limit=3, person_only=True):
             addr = candidate.get("email") or ""
             linkedin_url = candidate.get("linkedin_url") or ""
+            if linkedin_url and not candidate.get("linkedin_verified"):
+                linkedin_url = ""
+            if addr and (
+                    candidate.get("email_kind") == "generic"
+                    or (candidate.get("name")
+                        and not candidate.get("email_person_match")
+                        and not candidate.get("email_verified"))):
+                addr = ""
+            if not addr and not linkedin_url:
+                continue
             existing_contact = (
                 db.find_contact_by_email(addr) if addr else
                 db.find_contact_by_linkedin(linkedin_url)
@@ -323,13 +334,20 @@ def _enrich_company_async(company_id: str):
                         richer["role"] = candidate["role"]
                     if not existing_contact.get("linkedin_url") and linkedin_url:
                         richer["linkedin_url"] = linkedin_url
+                        richer["linkedin_verified"] = int(
+                            bool(candidate.get("linkedin_verified")))
                     new_notes = contact_notes(candidate)
                     if new_notes and not existing_contact.get("notes"):
                         richer["notes"] = new_notes
+                    for flag in ("email_kind", "email_verified",
+                                 "linkedin_verified", "person_verified"):
+                        if candidate.get(flag) is not None and flag not in richer:
+                            val = candidate.get(flag)
+                            richer[flag] = int(bool(val)) if flag != "email_kind" else val
                     if richer:
                         db.update_contact(existing_contact["id"], richer)
                 continue
-            local = addr.split("@", 1)[0]
+            local = addr.split("@", 1)[0] if addr else ""
             db.create_contact(company_id=company_id, email=addr,
                               linkedin_url=linkedin_url,
                               name=(candidate.get("name")
@@ -343,7 +361,13 @@ def _enrich_company_async(company_id: str):
                               affinity=", ".join(
                                   candidate.get("affinity") or []) or None,
                               seniority_rank=candidate.get(
-                                  "seniority_rank", 20))
+                                  "seniority_rank", 20),
+                              email_kind=candidate.get("email_kind") or "unknown",
+                              email_verified=bool(candidate.get("email_verified")),
+                              linkedin_verified=bool(
+                                  candidate.get("linkedin_verified")),
+                              person_verified=bool(
+                                  candidate.get("person_verified")))
         # Log what actually happened — an unconditional "researched" here made
         # the activity feed claim success for wrong-site and failed scrapes.
         status = updates["scrape_status"]

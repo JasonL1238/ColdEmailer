@@ -4,6 +4,7 @@ Company enrichment: scrape a company's site, extract structured metadata
 """
 import html as html_lib
 import re
+import time
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
@@ -11,6 +12,14 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from contact_verify import (
+    GENERIC_LOCALS,
+    annotate_contact,
+    is_generic_inbox,
+    linkedin_matches_person,
+    name_tokens,
+    select_verified_person_contacts,
+)
 from web_scraper import WebScraper, is_safe_public_url
 
 try:
@@ -28,6 +37,11 @@ SUBPAGES = [
 
 MAX_PAGES_FETCHED = 8
 MAX_PAGE_ATTEMPTS = 16
+# Fast path: homepage + about/team enough for "what they do" + 1 person contact.
+FAST_MAX_PAGES = 3
+FAST_MAX_ATTEMPTS = 5
+FAST_DEADLINE_SEC = 55.0
+FAST_MIN_DELAY = 0.35
 
 _LINK_PRIORITY = {
     "leadership": 0, "team": 0, "people": 0, "founder": 0, "management": 0,
@@ -245,15 +259,18 @@ def _is_valid_outreach_email(addr: str) -> bool:
 
 
 def rank_outreach_emails(emails: List[str], company_domain: Optional[str]) -> List[str]:
-    """Sort candidate emails: company-domain first, then by local-part priority."""
+    """Sort candidate emails: company-domain first, then person locals over generics."""
     def score(addr: str) -> Tuple[int, int, str]:
         local, _, domain = addr.lower().partition("@")
         domain_score = 0 if (company_domain and registered_domain(domain) == company_domain) else 1
-        try:
-            local_score = _LOCAL_PRIORITY.index(local)
-        except ValueError:
-            # Named person addresses (jane@, jsmith@) rank above generic unknown
-            local_score = len(_LOCAL_PRIORITY) if "." in local or len(local) <= 12 else len(_LOCAL_PRIORITY) + 5
+        if is_generic_inbox(local):
+            try:
+                local_score = 100 + _LOCAL_PRIORITY.index(local)
+            except ValueError:
+                local_score = 150
+        else:
+            # Named person addresses rank above every generic inbox
+            local_score = 0 if ("." in local or len(local) <= 12) else 5
         return (domain_score, local_score, addr)
     return sorted(dict.fromkeys(emails), key=score)
 
@@ -319,10 +336,11 @@ def _affinity_matches(context: str, preferred_school: Optional[str],
     return list(dict.fromkeys(matches))
 
 
-def _linkedin_profile_url(value: str) -> Optional[str]:
-    """Normalize a LinkedIn member URL already linked from a first-party page.
+def _linkedin_profile_url(value: str, person_name: Optional[str] = None) -> Optional[str]:
+    """Normalize a LinkedIn /in/ URL from a first-party page.
 
-    We record the link but never fetch LinkedIn itself.
+    When person_name is known, reject slugs that do not match that person so
+    we never store a same-first-name stranger's profile.
     """
     try:
         parsed = urlparse((value or "").strip())
@@ -334,7 +352,10 @@ def _linkedin_profile_url(value: str) -> Optional[str]:
         return None
     if not parsed.path.lower().startswith("/in/"):
         return None
-    return f"https://www.linkedin.com{parsed.path.rstrip('/')}"
+    url = f"https://www.linkedin.com{parsed.path.rstrip('/')}"
+    if person_name and not linkedin_matches_person(url, person_name):
+        return None
+    return url
 
 
 def _infer_role(context: str, local: str) -> Tuple[Optional[str], int]:
@@ -442,6 +463,13 @@ def extract_contact_candidates(
             )[:1200]
             role, seniority = _infer_role(context, local)
             name = _infer_name(context, local)
+            # Track whether the displayed name was invented from the local-part
+            # so verification cannot circularly "confirm" that address.
+            name_from_email = False
+            if name:
+                from_ctx = _infer_name(context, "")
+                if not from_ctx:
+                    name_from_email = True
             school_match = _school_match(context, preferred_school)
             affinities = _affinity_matches(
                 context, preferred_school, preferred_affiliations)
@@ -449,6 +477,7 @@ def extract_contact_candidates(
                 "email": addr,
                 "linkedin_url": None,
                 "name": name,
+                "name_from_email": name_from_email,
                 "role": role,
                 "source_url": page_url,
                 "evidence": context[:500],
@@ -470,7 +499,8 @@ def extract_contact_candidates(
         # their public profile without publishing an email. Preserve that
         # useful, auditable lead without crawling the LinkedIn destination.
         for anchor in soup.find_all("a", href=True):
-            linkedin_url = _linkedin_profile_url(anchor.get("href") or "")
+            raw_href = anchor.get("href") or ""
+            linkedin_url = _linkedin_profile_url(raw_href)
             if not linkedin_url:
                 continue
             contexts = []
@@ -483,10 +513,33 @@ def extract_contact_candidates(
                 if value:
                     contexts.append(value)
                 node = node.parent
+            # Flat team pages often put the LinkedIn icon as a sibling of the
+            # bio, not inside it. Pull nearby sibling text before giving up.
+            nearby = []
+            for sibling in list(anchor.previous_siblings)[:5]:
+                sibling_text = (sibling.get_text(" ", strip=True)
+                                if hasattr(sibling, "get_text")
+                                else str(sibling).strip())
+                if sibling_text:
+                    nearby.append(sibling_text)
+            if nearby:
+                contexts.append(" ".join(reversed(nearby)))
+            parent = anchor.parent
+            if parent is not None:
+                for sibling in list(parent.previous_siblings)[:3]:
+                    sibling_text = (sibling.get_text(" ", strip=True)
+                                    if hasattr(sibling, "get_text")
+                                    else str(sibling).strip())
+                    if sibling_text:
+                        contexts.append(sibling_text)
             context = min(
-                (c for c in contexts if c), key=lambda c: abs(len(c) - 300),
-                default=anchor.get_text(" ", strip=True),
+                (c for c in contexts if c and c.lower() not in {
+                    "linkedin", "in", "profile", "connect"}),
+                key=lambda c: abs(len(c) - 300),
+                default="",
             )[:1200]
+            if not context:
+                context = page_text[:800]
             role, seniority = _infer_role(context, "")
             name = _infer_name(context, "")
             anchor_name = anchor.get_text(" ", strip=True)
@@ -494,9 +547,12 @@ def extract_contact_candidates(
                     r"[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}",
                     anchor_name):
                 name = anchor_name
-            # A /in/ link proves a person exists, but keep only links the
-            # company page associates with a name or a target decision role.
-            if not name and not role:
+            # LinkedIn-only contacts need a real name so the /in/ slug can be
+            # checked against that person (not a role label alone).
+            if not name:
+                continue
+            linkedin_url = _linkedin_profile_url(raw_href, person_name=name)
+            if not linkedin_url:
                 continue
             school_match = _school_match(context, preferred_school)
             affinities = _affinity_matches(
@@ -520,7 +576,9 @@ def extract_contact_candidates(
                 and existing["name"].strip().lower() == name.strip().lower()
             ), None)
             if same_name:
-                same_name["linkedin_url"] = linkedin_url
+                # Only attach LinkedIn when the slug matches this contact's name.
+                if linkedin_matches_person(linkedin_url, same_name.get("name") or name):
+                    same_name["linkedin_url"] = linkedin_url
                 same_name["affinity"] = list(dict.fromkeys(
                     (same_name.get("affinity") or []) + affinities))
                 if school_match:
@@ -529,7 +587,22 @@ def extract_contact_candidates(
             else:
                 merged[f"linkedin:{linkedin_url.lower()}"] = person
 
-    generic_locals = set(_LOCAL_PRIORITY)
+        # Final pass: attach /in/ links whose slug matches an email contact's
+        # name even when DOM proximity was weak.
+        page_linkedin = []
+        for anchor in soup.find_all("a", href=True):
+            url = _linkedin_profile_url(anchor.get("href") or "")
+            if url:
+                page_linkedin.append(url)
+        for contact in list(merged.values()):
+            if contact.get("linkedin_url") or not contact.get("name"):
+                continue
+            for url in page_linkedin:
+                if linkedin_matches_person(url, contact["name"]):
+                    contact["linkedin_url"] = url
+                    break
+
+    generic_locals = set(_LOCAL_PRIORITY) | set(GENERIC_LOCALS)
     return sorted(
         merged.values(),
         key=lambda c: (
@@ -537,7 +610,7 @@ def extract_contact_candidates(
             c["seniority_rank"],
             0 if c["on_domain"] else 1,
             0 if c["name"] else 1,
-            1 if (c.get("email") or "").split("@", 1)[0].lower() in generic_locals else 0,
+            1 if is_generic_inbox((c.get("email") or "").split("@", 1)[0]) else 0,
             (c.get("email") or c.get("linkedin_url") or "").lower(),
         ),
     )
@@ -545,8 +618,14 @@ def extract_contact_candidates(
 
 def select_outreach_contacts(candidates: List[Dict], emails: List[str],
                              company_domain: Optional[str],
-                             limit: int = 5) -> List[Dict]:
-    """Prefer same-school senior leaders, then other named/on-domain contacts."""
+                             limit: int = 5,
+                             person_only: bool = True,
+                             check_mx: bool = True) -> List[Dict]:
+    """Prefer verified people (personal email / matching LinkedIn).
+
+    When person_only is True (default), company inboxes like hello@ / info@
+    are not selected — they are not a specific contact.
+    """
     by_email = {c.get("email", "").lower(): dict(c)
                 for c in candidates or [] if c.get("email")}
     ranked = rank_outreach_emails(emails, company_domain)
@@ -563,40 +642,53 @@ def select_outreach_contacts(candidates: List[Dict], emails: List[str],
             f"the right company before sending." if company_domain else
             "Company domain unknown — verify this address before sending."
         )
-    selected = []
+    pool: List[Dict] = []
     for addr in safe_pool:
         candidate = by_email.get(addr.lower(), {
             "email": addr, "name": "", "role": None, "source_url": None,
-            "school_match": False, "school": None,
+            "school_match": False, "school": None, "linkedin_url": None,
+            "seniority_rank": 20, "on_domain": bool(company_domain),
+            "affinity": [],
         })
         candidate["warning"] = warning
-        selected.append(candidate)
+        pool.append(candidate)
 
-    # select_outreach_emails ranks only addresses. Re-rank its safe, on-domain
-    # subset using the richer person evidence.
-    selected.sort(key=lambda c: (
-        0 if c.get("school_match") else 1,
-        c.get("seniority_rank", 20),
-        0 if c.get("name") else 1,
-    ))
     selected_keys = {
         ((c.get("email") or "").lower(), (c.get("linkedin_url") or "").lower())
-        for c in selected
+        for c in pool
     }
-    linkedin_only = [
-        dict(c) for c in (candidates or [])
-        if c.get("linkedin_url") and not c.get("email")
-        and ((c.get("email") or "").lower(),
-             (c.get("linkedin_url") or "").lower()) not in selected_keys
-    ]
-    linkedin_only.sort(key=lambda c: (
+    for c in candidates or []:
+        if not c.get("linkedin_url"):
+            continue
+        key = ((c.get("email") or "").lower(), (c.get("linkedin_url") or "").lower())
+        if key in selected_keys:
+            continue
+        # Merge LinkedIn onto an email row with the same person name when possible
+        same = next((
+            p for p in pool
+            if c.get("name") and p.get("name")
+            and p["name"].strip().lower() == c["name"].strip().lower()
+        ), None)
+        if same and linkedin_matches_person(c["linkedin_url"], same.get("name")):
+            same["linkedin_url"] = c["linkedin_url"]
+            continue
+        if c.get("email") and key[0] in by_email:
+            continue
+        pool.append(dict(c))
+        selected_keys.add(key)
+
+    if person_only:
+        verified = select_verified_person_contacts(
+            pool, limit=limit, require_person=True, check_mx=check_mx)
+        return verified
+
+    annotated = [annotate_contact(c, check_mx=check_mx) for c in pool]
+    annotated.sort(key=lambda c: (
         0 if c.get("school_match") else 1,
-        0 if c.get("affinity") else 1,
         c.get("seniority_rank", 20),
         0 if c.get("name") else 1,
     ))
-    selected.extend(linkedin_only)
-    return selected[:limit]
+    return annotated[:limit]
 
 
 def select_outreach_emails(emails: List[str], company_domain: Optional[str],
@@ -819,9 +911,22 @@ class EnrichmentService:
 
     def enrich(self, company_name: str, url: Optional[str] = None,
                preferred_school: Optional[str] = None,
-               preferred_affiliations: Optional[str] = None) -> Dict:
-        """Full enrichment: returns dict with url, domain, metadata fields,
-        evidence-backed contacts, crawl diagnostics, and an ok flag."""
+               preferred_affiliations: Optional[str] = None,
+               mode: str = "fast",
+               deadline_sec: Optional[float] = None) -> Dict:
+        """Enrich a company from its site.
+
+        mode='fast' (default): stop once we have identity + an about summary +
+        at least one verified person contact, within ~55s.
+        mode='full': deeper crawl (legacy 8-page research).
+        """
+        fast = (mode or "fast").lower() != "full"
+        max_pages = FAST_MAX_PAGES if fast else MAX_PAGES_FETCHED
+        max_attempts = FAST_MAX_ATTEMPTS if fast else MAX_PAGE_ATTEMPTS
+        budget = deadline_sec if deadline_sec is not None else (
+            FAST_DEADLINE_SEC if fast else None)
+        started = time.monotonic()
+
         if not url:
             url = self.find_website(company_name)
         result: Dict = {
@@ -835,142 +940,237 @@ class EnrichmentService:
             "pages_scraped": 0,
             "research_sources": [],
             "research_quality": "low",
+            "enrich_mode": "fast" if fast else "full",
+            "elapsed_sec": 0.0,
         }
         if not url:
+            result["elapsed_sec"] = round(time.monotonic() - started, 2)
             return result
 
-        domain = result["domain"]
-        texts: List[str] = []
-        page_records: List[Dict[str, str]] = []
-        queue = [url]
-        queued = {url.rstrip("/")}
-        # Keep path guesses as fallbacks. Real navigation discovered from the
-        # home page is inserted ahead of them.
-        fallback_pages = [
-            urljoin(url.rstrip("/") + "/", p.lstrip("/")) for p in SUBPAGES
-        ]
-        attempted = 0
-        while queue and attempted < MAX_PAGE_ATTEMPTS \
-                and len(page_records) < MAX_PAGES_FETCHED:
-            page_url = queue.pop(0)
-            attempted += 1
-            html = self.scraper.fetch_html(page_url)
-            if not html:
-                if not queue:
-                    for fallback in fallback_pages:
-                        key = fallback.rstrip("/")
-                        if key not in queued:
-                            queued.add(key)
-                            queue.append(fallback)
-                continue
-            text = self.scraper.extract_text(html)
-            page_records.append({"url": page_url, "html": html, "text": text or ""})
-            if text and len(text) > 80:
-                texts.append(f"SOURCE: {page_url}\n{text[:5000]}")
+        # Fast path uses a tighter same-domain delay so homepage+about+team
+        # can finish under a minute without ignoring robots/SSRF checks.
+        delay_cm = None
+        if fast and hasattr(self.scraper, "delay_override"):
+            delay_cm = self.scraper.delay_override(FAST_MIN_DELAY)
+            delay_cm.__enter__()
 
-            discovered = discover_internal_links(html, page_url, domain)
-            insert_at = 0
-            for discovered_url in discovered:
-                key = discovered_url.rstrip("/")
-                if key not in queued:
-                    queued.add(key)
-                    queue.insert(insert_at, discovered_url)
-                    insert_at += 1
-            if not queue:
-                for fallback in fallback_pages:
-                    key = fallback.rstrip("/")
-                    if key not in queued:
-                        queued.add(key)
-                        queue.append(fallback)
+        def timed_out() -> bool:
+            return budget is not None and (time.monotonic() - started) >= budget
 
-        # Alumni bios are often orphaned from the current nav. Search may find
-        # them, but only verified same-domain pages are fetched or trusted.
-        school_pages = self._school_research_pages(
-            company_name, domain, preferred_school)
-        if school_pages and not any(
-                _school_match(p.get("text") or "", preferred_school)
-                for p in page_records):
-            for page_url in school_pages:
-                if attempted >= MAX_PAGE_ATTEMPTS or len(page_records) >= MAX_PAGES_FETCHED:
-                    break
-                if any(p["url"].rstrip("/") == page_url.rstrip("/") for p in page_records):
-                    continue
-                attempted += 1
-                html = self.scraper.fetch_html(page_url)
-                if not html:
-                    continue
-                text = self.scraper.extract_text(html)
-                page_records.append({"url": page_url, "html": html, "text": text or ""})
-                if text and len(text) > 80:
-                    texts.append(f"SOURCE: {page_url}\n{text[:5000]}")
+        def _refresh_contacts_and_meta(page_records, texts, *, run_llm: bool):
+            combined = "\n\n".join(texts)[:24000]
+            result["pages_attempted"] = attempted
+            result["pages_scraped"] = len(page_records)
+            result["research_sources"] = [p["url"] for p in page_records]
+            verified = (domain_matches_name(company_name, result["domain"])
+                        or page_mentions_company(company_name, combined))
+            result["identity_verified"] = verified
+            if not verified:
+                result["ok"] = False
+                result["mismatch"] = (
+                    f"The page at {result['domain'] or url} never mentions "
+                    f"{company_name}, so it is probably a different company.")
+                result["emails"] = []
+                result["contacts"] = []
+                return False
 
-        combined = "\n\n".join(texts)[:24000]
-        result["pages_attempted"] = attempted
-        result["pages_scraped"] = len(page_records)
-        result["research_sources"] = [p["url"] for p in page_records]
+            all_emails = []
+            for page in page_records:
+                all_emails.extend(extract_emails_from_html(page["html"]))
+            result["emails"] = rank_outreach_emails(all_emails, result["domain"])[:12]
+            contacts = extract_contact_candidates(
+                page_records, result["domain"], preferred_school,
+                preferred_affiliations)
+            if combined:
+                meta = None
+                llm_contacts = []
+                if run_llm and not timed_out():
+                    meta = llm_metadata(
+                        company_name, combined, result["emails"], preferred_school)
+                    if meta:
+                        llm_contacts = meta.pop("_contacts", []) or []
+                meta = meta or heuristic_metadata(company_name, combined)
+                result.update({k: v for k, v in (meta or {}).items()
+                               if not str(k).startswith("_")})
+                result["ok"] = bool((meta or {}).get("summary"))
+                by_email = {
+                    contact["email"].lower(): contact
+                    for contact in contacts if contact.get("email")
+                }
+                for grounded in llm_contacts:
+                    contact = by_email.get(grounded["email"].lower())
+                    if not contact:
+                        continue
+                    if grounded.get("name"):
+                        grounded_name = grounded["name"]
+                        contact["name"] = grounded_name
+                        # Only clear name_from_email when the model supplies an
+                        # independent multi-token name (not "Kim" for kim@).
+                        if len(name_tokens(grounded_name)) >= 2:
+                            contact["name_from_email"] = False
+                        elif contact.get("name_from_email"):
+                            contact["name_from_email"] = True
+                    if grounded.get("role"):
+                        contact["role"] = grounded["role"]
+                    if grounded.get("source_url"):
+                        contact["source_url"] = grounded["source_url"]
+                    if grounded.get("evidence"):
+                        contact["evidence"] = grounded["evidence"]
+                    if grounded.get("school_match"):
+                        contact["school_match"] = True
+                        contact["school"] = preferred_school
+                    _, contact["seniority_rank"] = _infer_role(
+                        f"{contact.get('role') or ''} {grounded.get('evidence') or ''}",
+                        (contact.get("email") or "").split("@", 1)[0],
+                    )
+            else:
+                result["ok"] = False
 
-        # Confirm this site is actually the company's before believing anything
-        # on it. A search result can easily be an unrelated business; scraping
-        # it produces a confident, entirely fabricated profile that would then
-        # be quoted back to a real person in a cold email.
-        verified = (domain_matches_name(company_name, result["domain"])
-                    or page_mentions_company(company_name, combined))
-        result["identity_verified"] = verified
-        if not verified:
-            result["ok"] = False
-            result["mismatch"] = (
-                f"The page at {result['domain'] or url} never mentions "
-                f"{company_name}, so it is probably a different company.")
-            # Emails from an unrelated domain belong to someone else entirely.
-            result["emails"] = []
-            return result
-
-        all_emails = []
-        for page in page_records:
-            all_emails.extend(extract_emails_from_html(page["html"]))
-        result["emails"] = rank_outreach_emails(all_emails, result["domain"])[:12]
-        result["contacts"] = extract_contact_candidates(
-            page_records, result["domain"], preferred_school,
-            preferred_affiliations)
-        if combined:
-            meta = llm_metadata(
-                company_name, combined, result["emails"], preferred_school)
-            llm_contacts = []
-            if meta:
-                llm_contacts = meta.pop("_contacts", []) or []
-            meta = meta or heuristic_metadata(company_name, combined)
-            result.update({k: v for k, v in (meta or {}).items()})
-            result["ok"] = bool((meta or {}).get("summary"))
-            by_email = {
-                contact["email"].lower(): contact
-                for contact in result["contacts"]
-            }
-            for grounded in llm_contacts:
-                contact = by_email.get(grounded["email"].lower())
-                if not contact:
-                    continue
-                if grounded.get("name"):
-                    contact["name"] = grounded["name"]
-                if grounded.get("role"):
-                    contact["role"] = grounded["role"]
-                if grounded.get("source_url"):
-                    contact["source_url"] = grounded["source_url"]
-                if grounded.get("evidence"):
-                    contact["evidence"] = grounded["evidence"]
-                if grounded.get("school_match"):
-                    contact["school_match"] = True
-                    contact["school"] = preferred_school
-                _, contact["seniority_rank"] = _infer_role(
-                    f"{contact.get('role') or ''} {grounded.get('evidence') or ''}",
-                    (contact.get("email") or "").split("@", 1)[0],
-                )
+            # Always run MX when annotating — DNS is cheap vs an HTTP page and
+            # "email_verified" must mean MX was actually confirmed.
+            result["contacts"] = [
+                annotate_contact(c, check_mx=True)
+                for c in contacts
+            ]
             result["contacts"].sort(key=lambda c: (
+                0 if c.get("person_verified") else 1,
+                0 if c.get("email_verified") else 1,
+                0 if c.get("linkedin_verified") else 1,
                 0 if c.get("school_match") else 1,
                 c.get("seniority_rank", 20),
                 0 if c.get("on_domain") else 1,
                 0 if c.get("name") else 1,
                 (c.get("email") or c.get("linkedin_url") or "").lower(),
             ))
-        result["research_quality"] = self._research_quality(
-            result["pages_scraped"], result.get("summary"), result["contacts"])
-        return result
+            result["research_quality"] = self._research_quality(
+                result["pages_scraped"], result.get("summary"), result["contacts"])
+            return True
+
+        def _has_fast_success() -> bool:
+            about_ok = bool(result.get("summary"))
+            about_page = any(
+                re.search(
+                    r"/(about|about-us|company|team|leadership|people|who-we-are)(/|$)",
+                    (u or "").lower())
+                for u in (result.get("research_sources") or [])
+            )
+            person = next((
+                c for c in (result.get("contacts") or [])
+                if c.get("person_verified")
+                or (c.get("linkedin_verified") and c.get("name")
+                    and not c.get("name_from_email"))
+                or (c.get("email_verified") and c.get("name")
+                    and not c.get("name_from_email"))
+            ), None)
+            return bool(
+                result.get("identity_verified")
+                and about_ok
+                and about_page
+                and person
+            )
+
+        try:
+            domain = result["domain"]
+            texts: List[str] = []
+            page_records: List[Dict[str, str]] = []
+            queue = [url]
+            queued = {url.rstrip("/")}
+            # Prefer about/team early so "what they do" + people land quickly.
+            preferred_fallbacks = [
+                "/about", "/about-us", "/company", "/team", "/leadership",
+                "/people", "/contact", "/contact-us",
+            ]
+            other_fallbacks = [p for p in SUBPAGES if p not in preferred_fallbacks]
+            fallback_pages = [
+                urljoin(url.rstrip("/") + "/", p.lstrip("/"))
+                for p in (preferred_fallbacks + (other_fallbacks if not fast else []))
+            ]
+            attempted = 0
+            while queue and attempted < max_attempts \
+                    and len(page_records) < max_pages and not timed_out():
+                page_url = queue.pop(0)
+                attempted += 1
+                html = self.scraper.fetch_html(page_url)
+                if not html:
+                    if not queue:
+                        for fallback in fallback_pages:
+                            key = fallback.rstrip("/")
+                            if key not in queued:
+                                queued.add(key)
+                                queue.append(fallback)
+                    continue
+                text = self.scraper.extract_text(html)
+                page_records.append({"url": page_url, "html": html, "text": text or ""})
+                if text and len(text) > 80:
+                    texts.append(f"SOURCE: {page_url}\n{text[:5000]}")
+
+                discovered = discover_internal_links(html, page_url, domain)
+                insert_at = 0
+                for discovered_url in discovered:
+                    key = discovered_url.rstrip("/")
+                    if key not in queued:
+                        queued.add(key)
+                        queue.insert(insert_at, discovered_url)
+                        insert_at += 1
+                if not queue:
+                    for fallback in fallback_pages:
+                        key = fallback.rstrip("/")
+                        if key not in queued:
+                            queued.add(key)
+                            queue.append(fallback)
+
+                # Early exit only after a real about/team page + verified person.
+                if fast and about_page_present(page_records):
+                    if _refresh_contacts_and_meta(
+                            page_records, texts, run_llm=False) and _has_fast_success():
+                        result["elapsed_sec"] = round(time.monotonic() - started, 2)
+                        return result
+
+            # Alumni bios are often orphaned from the current nav. Search may find
+            # them, but only verified same-domain pages are fetched or trusted.
+            if not fast and not timed_out():
+                school_pages = self._school_research_pages(
+                    company_name, domain, preferred_school)
+                if school_pages and not any(
+                        _school_match(p.get("text") or "", preferred_school)
+                        for p in page_records):
+                    for page_url in school_pages:
+                        if attempted >= max_attempts or len(page_records) >= max_pages \
+                                or timed_out():
+                            break
+                        if any(p["url"].rstrip("/") == page_url.rstrip("/")
+                               for p in page_records):
+                            continue
+                        attempted += 1
+                        html = self.scraper.fetch_html(page_url)
+                        if not html:
+                            continue
+                        text = self.scraper.extract_text(html)
+                        page_records.append(
+                            {"url": page_url, "html": html, "text": text or ""})
+                        if text and len(text) > 80:
+                            texts.append(f"SOURCE: {page_url}\n{text[:5000]}")
+
+            if page_records:
+                need_llm = not result.get("summary") or not _has_fast_success()
+                _refresh_contacts_and_meta(
+                    page_records, texts, run_llm=need_llm and not timed_out())
+            else:
+                result["pages_attempted"] = attempted
+                result["identity_verified"] = False
+
+            result["elapsed_sec"] = round(time.monotonic() - started, 2)
+            return result
+        finally:
+            if delay_cm is not None:
+                delay_cm.__exit__(None, None, None)
+
+
+def about_page_present(page_records: List[Dict[str, str]]) -> bool:
+    """True when crawl already fetched a dedicated about/team-style page."""
+    return any(
+        re.search(
+            r"/(about|about-us|company|team|leadership|people|who-we-are)(/|$)",
+            (p.get("url") or "").lower())
+        for p in page_records
+    )

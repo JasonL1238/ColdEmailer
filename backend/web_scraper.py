@@ -5,6 +5,7 @@ from typing import Optional
 from text_cleaner import TextCleaner
 import ipaddress
 import socket
+import threading
 import time
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -60,6 +61,30 @@ class WebScraper:
         })
         self.last_request_time = {}
         self.min_delay = 2  # 2 seconds between requests to same domain
+        self._delay_override = threading.local()
+
+    def delay_override(self, seconds: float):
+        """Temporarily override min_delay for the current thread only."""
+        scraper = self
+
+        class _DelayCtx:
+            def __enter__(self_inner):
+                self_inner._prev = getattr(scraper._delay_override, "value", None)
+                scraper._delay_override.value = seconds
+                return scraper
+
+            def __exit__(self_inner, *exc):
+                if self_inner._prev is None:
+                    if hasattr(scraper._delay_override, "value"):
+                        del scraper._delay_override.value
+                else:
+                    scraper._delay_override.value = self_inner._prev
+
+        return _DelayCtx()
+
+    def _effective_delay(self) -> float:
+        override = getattr(self._delay_override, "value", None)
+        return float(override) if override is not None else float(self.min_delay)
     
     def _check_robots_txt(self, url: str) -> bool:
         """Check if we're allowed to scrape this URL"""
@@ -77,10 +102,11 @@ class WebScraper:
     def _rate_limit(self, url: str):
         """Rate limit requests to same domain"""
         domain = urlparse(url).netloc
+        delay = self._effective_delay()
         if domain in self.last_request_time:
             elapsed = time.time() - self.last_request_time[domain]
-            if elapsed < self.min_delay:
-                time.sleep(self.min_delay - elapsed)
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
         self.last_request_time[domain] = time.time()
     
     def _safe_get(self, url: str, timeout: int = 10) -> Optional[requests.Response]:
