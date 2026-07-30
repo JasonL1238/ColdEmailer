@@ -20,10 +20,6 @@ Load, concurrency, large-input, and memory tests for the backend API.
 
 Backend must be running at http://localhost:8000 (or set `BASE_URL`).
 
-## Slow API simulation
-
-In backend `.env`: `STRESS_TEST_MODE=true`. Backend then adds random 0–5s delay and ~10% failure rate.
-
 ## Expected behavior
 
 - **Load:** Light &lt;500ms, medium &lt;1s, heavy may time out

@@ -263,7 +263,7 @@ def test_legacy_import_never_lands_delivered_mail_back_in_drafts(tmp_path):
     }))
     fresh = Database(str(tmp_path / "migrated.db"))
 
-    migrate_legacy_data(fresh, str(tmp_path), str(backend_dir))
+    migrate_legacy_data(fresh, str(backend_dir))
 
     assert fresh.get_email("e1")["status"] == "sent"
     assert fresh.get_email("e2")["status"] == "sent"

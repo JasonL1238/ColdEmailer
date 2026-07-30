@@ -84,7 +84,6 @@ generation = GenerationService(db, composer, enrichment, rate_limiter)
 email_sender = EmailSender(
     credentials_path=os.getenv("CREDENTIALS_JSON_PATH") or os.path.join(_PROJECT_ROOT, "credentials.json"),
     token_path=os.getenv("TOKEN_JSON_PATH") or os.path.join(_PROJECT_ROOT, "token.json"),
-    project_root=_PROJECT_ROOT,
 )
 
 _send_lock = threading.Lock()  # one send batch at a time
@@ -118,7 +117,7 @@ def _seed_profile_once():
             "email": "li59@seas.upenn.edu",
             "phone": "847-907-0871",
             "website": (os.getenv("PERSONAL_WEBSITE_URL")
-                        or "https://personal-site-sooty-ten.vercel.app/").strip(),
+                        or "https://personal-site-zeta-ashy-80.vercel.app/").strip(),
             "background": background,
         })
     db.set_setting("profile_seeded", True)
@@ -136,7 +135,7 @@ def _reap_orphaned_jobs():
         print(f"[startup] reaped {len(orphans)} interrupted job(s)")
 
 
-migrate_legacy_data(db, _PROJECT_ROOT, _BACKEND_DIR)
+migrate_legacy_data(db, _BACKEND_DIR)
 repair_delivered_email_status(db)
 repair_unverified_legacy_replies(db)
 repair_contact_reply_status(db)

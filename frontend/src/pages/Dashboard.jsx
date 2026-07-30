@@ -6,7 +6,7 @@ import {
   AlertTriangle,
 } from 'lucide-react'
 import { dashboardAPI, emailsAPI, errMessage } from '../api'
-import { Button, Chip, EmptyState, Spinner, timeAgo, EMAIL_TYPE_META } from '../ui'
+import { Button, Chip, EmptyState, timeAgo, EMAIL_TYPE_META } from '../ui'
 import { useApp } from '../App'
 
 const EVENT_ICONS = {
@@ -125,7 +125,7 @@ export default function Dashboard() {
         </div>
       ) : (
         <>
-          {/* funnel stats */}
+          {/* pipeline counts */}
           <div className="stat-grid">
             <StatCard icon={Building2} label="Companies" value={counts.companies}
               onClick={() => navigate('database')} />

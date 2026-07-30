@@ -7,16 +7,14 @@ Those flags drove the headline reply rate, a per-email "replied <date>" chip,
 114 contact chips, and (most damaging) they switched the follow-up pipeline off.
 """
 import asyncio
-import json
 import os
 import tempfile
 from datetime import datetime, timedelta
 
 import pytest
-from fastapi import HTTPException
 
 import main
-from db import (Database, _batch_stamped_reply_ids, now_iso,
+from db import (Database, _batch_stamped_reply_ids,
                 repair_contact_reply_status, repair_unverified_legacy_replies)
 
 

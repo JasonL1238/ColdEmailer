@@ -4,7 +4,6 @@ Files live under backend/data/resumes/; text + metadata live in SQLite.
 """
 import os
 import re
-import shutil
 from typing import Dict, List, Optional
 
 from db import Database

@@ -1,7 +1,6 @@
 import pytest
 from datetime import datetime, timedelta
 from backend.rate_limiter import RateLimiter
-import os
 
 
 class TestRateLimiter:

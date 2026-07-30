@@ -1,6 +1,6 @@
 # Handoff notes
 
-State as of commit `81c5fa1` on `main`. Paste the prompt at the bottom into a
+State as of the latest commit on `main`. Paste the prompt at the bottom into a
 new session, or just point it at this file.
 
 ## What this is
@@ -15,7 +15,7 @@ Rebuilt from a CSV/JSON pipeline onto SQLite. Architecture and setup are in
 
 ## Current state
 
-- **Green:** 355 backend tests (`cd tests && ../backend/venv/bin/python -m pytest`),
+- **Green:** 366 backend tests (`cd tests && ../backend/venv/bin/python -m pytest`),
   48 frontend tests (`cd frontend && npm test`), clean `vite build`.
 - **Working tree clean**, `main` == `origin/main`.
 - **Run it:** `./start.sh` → app on :5173, API on :8000.
@@ -87,7 +87,7 @@ Rebuilt from a CSV/JSON pipeline onto SQLite. Architecture and setup are in
 > `use_template_only: true` for any generation test (no API calls, no quota).
 > Prefix any test data ZZTEST and clean it up.
 >
-> Everything is committed and green: 355 backend + 48 frontend tests pass.
+> Everything is committed and green: 366 backend + 48 frontend tests pass.
 > Start by running `./start.sh` and both test suites to confirm that still
 > holds, then read the "Known open items" section of HANDOFF.md.
 >

@@ -3,11 +3,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
 import {
   Search, Plus, Upload, Download, Trash2, RefreshCw, Globe, Building2,
-  Users, Sparkles, Mail, ExternalLink, X, AlertTriangle, Archive, ArchiveRestore,
+  Users, Sparkles, ExternalLink, AlertTriangle, Archive, ArchiveRestore,
 } from 'lucide-react'
 import { companiesAPI, contactsAPI, errMessage } from '../api'
 import {
-  Button, Chip, Drawer, EmptyState, Modal, Segmented, Spinner,
+  Button, Chip, Drawer, EmptyState, Modal, Segmented,
   initials, timeAgo, contactStatusMeta, EMAIL_TYPE_META,
 } from '../ui'
 import { useApp } from '../App'

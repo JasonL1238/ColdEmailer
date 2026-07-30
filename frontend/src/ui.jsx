@@ -19,8 +19,8 @@ export function Chip({ tone = 'gray', title, children }) {
   return <span className={`chip chip-${tone}`} title={title}>{children}</span>
 }
 
-export function Spinner({ lg }) {
-  return <div className={`spinner ${lg ? 'lg' : ''}`} />
+export function Spinner() {
+  return <div className="spinner" />
 }
 
 export function ProgressBar({ current, total, indeterminate }) {
@@ -159,7 +159,7 @@ export function useJobPolling(onUpdate, interval = 1500, maxFailures = 8) {
   }, [interval, maxFailures, stop])
 
   useEffect(() => stop, [stop])
-  return { job, track, clear: () => { stop(); setJob(null) } }
+  return { job, track }
 }
 
 /* ---------- utils ---------- */

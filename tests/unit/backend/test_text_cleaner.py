@@ -33,31 +33,40 @@ class TestTextCleaner:
         assert "    " not in result
     
     def test_clean_removes_short_lines(self, cleaner):
-        """Test that short lines are removed"""
-        text = "This is a short line\nThis is a much longer line that should be kept\nHi"
+        """Lines under MIN_LINE_LENGTH are labels and nav crumbs, not prose."""
+        text = "Pricing\nDocs v2\nAcme builds industrial robots for warehouse fulfilment centres."
         result = cleaner.clean(text)
-        # Short lines (< 20 chars) should be removed, but "This is a short line" is 22 chars
-        # So it might be kept. Let's test with actually short lines
-        text2 = "Hi\nVery short\nThis is a much longer line that should definitely be kept"
-        result2 = cleaner.clean(text2)
-        assert "much longer line" in result2
-        # Very short lines should be removed
-        assert len([line for line in text2.split('\n') if len(line.strip()) < 20]) > 0
-    
+        assert "Acme builds industrial robots" in result
+        assert "Pricing" not in result
+        assert "Docs v2" not in result
+
+    def test_one_nav_line_does_not_discard_the_whole_page(self, cleaner):
+        """The filter is per line. Collapsing every whitespace character first
+        (\\s+ instead of [^\\S\\n]+) merged the page into one line, so a single
+        'Careers' anywhere threw the entire page away — about one real company
+        site in five, each surfacing to the user as a scrape failure."""
+        text = ("Acme builds industrial robots for warehouse fulfilment centres in Europe.\n"
+                "Careers\n"
+                "Their flagship system moves twelve thousand totes an hour.")
+        result = cleaner.clean(text)
+        assert "Careers" not in result
+        assert "Acme builds industrial robots" in result
+        assert "twelve thousand totes" in result
+
+
     def test_clean_removes_nav_words(self, cleaner):
         """Test that navigation words are removed"""
         # First line has no nav words, second line has nav words
         text = "Product features are great and innovative with many capabilities that customers love using daily\nSubscribe to newsletter"
         result = cleaner.clean(text)
         # Lines with nav words should be removed
-        assert "Subscribe" not in result.lower()
+        assert "subscribe" not in result.lower()
         assert "newsletter" not in result.lower()
-        # Valid content without nav words should be preserved
-        # If result is empty, the test still validates nav word removal logic
-        if len(result) > 0:
-            assert "Product" in result or "features" in result.lower() or "innovative" in result.lower() or "capabilities" in result.lower()
-        # At minimum, verify nav words are removed
-        assert "Subscribe" not in result and "newsletter" not in result
+        # ...and the content line must survive. Guarding this behind
+        # `if len(result) > 0` made it unfalsifiable: an empty result satisfies
+        # every "not in" assertion above, which is how a cleaner that discarded
+        # whole pages passed this file for so long.
+        assert "Product features are great" in result
     
     def test_clean_removes_cookie_policy(self, cleaner):
         """Test that cookie policy text is removed"""
@@ -68,12 +77,8 @@ class TestTextCleaner:
         # Lines with cookie-related nav words should be removed
         assert "Accept cookies" not in result
         assert "browsing" not in result
-        # Valid content without nav words should be preserved
-        # If result is empty, the test still validates nav word removal logic
-        if len(result) > 0:
-            assert "amazing things" in result or "technology" in result or "Company" in result
-        # At minimum, verify nav words are removed
-        assert "Accept cookies" not in result
+        # ...without taking the real content with them.
+        assert "amazing things with technology" in result
     
     def test_clean_removes_repetition(self, cleaner):
         """Test that repeated sentences are removed"""
@@ -110,10 +115,14 @@ class TestTextCleaner:
     
     def test_clean_removes_mostly_punctuation_lines(self, cleaner):
         """Test that lines with mostly punctuation are removed"""
-        text = "Valid content here\n!!!\nMore valid content"
+        text = ("Acme builds industrial robots for fulfilment centres.\n"
+                "!!! *** ??? --- +++ ///\n"
+                "They deploy across twelve warehouses in Europe.")
         result = cleaner.clean(text)
         assert "!!!" not in result
-        assert "Valid content" in result
+        assert "***" not in result
+        assert "Acme builds industrial robots" in result
+        assert "twelve warehouses" in result
     
     def test_clean_handles_newlines(self, cleaner):
         """Test that newlines are handled correctly"""
@@ -164,12 +173,8 @@ class TestTextCleaner:
         text = "Content provided here has sufficient length to pass filters and provides value to users\nSUBSCRIBE NOW and newsletter signup\nFollow Us on Twitter"
         result = cleaner.clean(text)
         # Nav words should be removed (case insensitive)
-        assert "SUBSCRIBE" not in result
-        assert "Follow Us" not in result
-        assert "Twitter" not in result
-        # Test that case doesn't matter - nav words removed regardless of case
-        # If result is empty, the test still validates nav word removal logic
-        if len(result) > 0:
-            assert "Content" in result or "sufficient length" in result or "provides value" in result or "users" in result
-        # At minimum, verify nav words are removed (case insensitive)
-        assert "SUBSCRIBE" not in result and "subscribe" not in result
+        assert "subscribe" not in result.lower()
+        assert "follow us" not in result.lower()
+        assert "twitter" not in result.lower()
+        # ...and the one line with no nav words is kept.
+        assert "Content provided here has sufficient length" in result

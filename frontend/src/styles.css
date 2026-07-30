@@ -123,7 +123,6 @@ a:hover { text-decoration: underline; }
 }
 .nav-item:hover { background: var(--surface-hover); color: var(--text); }
 .nav-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.nav-item .badge { margin-left: auto; }
 
 .nav-foot {
   border-top: 1px solid var(--border);
@@ -220,14 +219,6 @@ a:hover { text-decoration: underline; }
 .chip-red { background: var(--red-soft); color: var(--red); }
 .chip-sky { background: var(--sky-soft); color: var(--sky); }
 .chip-violet { background: var(--violet-soft); color: var(--violet); }
-
-.badge {
-  display: inline-grid; place-items: center;
-  min-width: 19px; height: 19px; padding: 0 6px;
-  border-radius: 999px;
-  background: var(--accent-soft); color: var(--accent);
-  font-size: 11px; font-weight: 700;
-}
 
 /* cards */
 .card {
@@ -399,7 +390,6 @@ a:hover { text-decoration: underline; }
   animation: spin 0.7s linear infinite;
   flex-shrink: 0;
 }
-.spinner.lg { width: 26px; height: 26px; border-width: 3px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* skeleton */
@@ -572,13 +562,6 @@ a:hover { text-decoration: underline; }
 }
 .feed-text { font-size: 12.8px; }
 .feed-time { font-size: 11px; color: var(--text-3); margin-top: 1px; }
-
-/* funnel */
-.funnel { display: flex; gap: 8px; align-items: stretch; }
-.funnel-step { flex: 1; padding: 12px 14px; border-radius: var(--r-md); background: var(--surface-hover); border: 1px solid var(--border); position: relative; }
-.funnel-num { font-size: 20px; font-weight: 750; letter-spacing: -0.02em; }
-.funnel-label { font-size: 11.5px; color: var(--text-2); font-weight: 600; }
-.funnel-arrow { display: grid; place-items: center; color: var(--text-3); }
 
 /* toast overrides */
 .toast-base { font-size: 13.5px !important; font-weight: 500; }

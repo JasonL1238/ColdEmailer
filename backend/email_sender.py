@@ -12,8 +12,7 @@ from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from typing import List, Dict, Optional
-import time
+from typing import Dict, Optional
 
 # One plain address only: no commas/semicolons/angle-brackets/whitespace.
 # RFC 5322 treats a comma as a recipient separator, so 'a@x.com, b@y.com'
@@ -68,7 +67,7 @@ class EmailSender:
         'https://www.googleapis.com/auth/gmail.readonly'  # To check for replies
     ]
 
-    def __init__(self, credentials_path: str = "credentials.json", token_path: str = "token.json", project_root: Optional[str] = None):
+    def __init__(self, credentials_path: str = "credentials.json", token_path: str = "token.json"):
         self.credentials_path = credentials_path
         self.token_path = token_path
         self.service = None
@@ -387,25 +386,9 @@ class EmailSender:
             return False
         return floor_epoch is None or internal >= floor_epoch
 
-    def send_batch(self, emails: List[Dict], from_email: str,
-                   resume_paths: Optional[List[Optional[str]]] = None) -> List[Dict]:
-        """
-        Send multiple emails with rate limiting. resume_paths aligns with emails
-        (per-email attachment path, or None for no attachment).
-        Returns: List of {success, message_id/error, email_id}
-        """
-        results = []
-
-        for i, email in enumerate(emails):
-            # Rate limiting between sends
-            if i > 0:
-                time.sleep(self.send_delay)
-
-            resume_path = resume_paths[i] if resume_paths and i < len(resume_paths) else None
-            result = self.send_email(email, from_email, resume_path)
-            results.append(result)
-
-            if not result['success']:
-                print(f"Failed to send email to {email.get('contact_email')}: {result.get('error')}")
-
-        return results
+    # There is deliberately no send_batch() here. Batch sending lives in
+    # main._send_batch_job, which is the only path that holds the send lock,
+    # honours the daily cap, refuses an already-delivered email, stamps
+    # send_attempted_at before calling Gmail, and dedupes two drafts aimed at
+    # the same person. A convenience wrapper on this class would look like the
+    # obvious thing to call and would skip all of it.

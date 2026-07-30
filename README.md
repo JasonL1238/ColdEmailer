@@ -133,7 +133,7 @@ All optional, set in `.env`:
 ## Tests
 
 ```bash
-cd tests && ../backend/venv/bin/python -m pytest     # 355 backend tests
+cd tests && ../backend/venv/bin/python -m pytest     # 366 backend tests
 ```
 
 ```bash

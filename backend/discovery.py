@@ -6,14 +6,14 @@ Runs as a background thread reporting progress through the jobs table:
   Stage 1  find candidate companies (cloud LLM + DuckDuckGo, deduped)
   Stage 2  per company: find site, scrape, extract emails + metadata
 """
-import json
 import re
 import threading
 from typing import Dict, List, Optional
 
 from db import Database
 from ddg_search import ddg_text_search
-from enrichment import EnrichmentService, registered_domain, select_outreach_emails
+from enrichment import (EnrichmentService, registered_domain,
+                        scrape_status_for, select_outreach_emails)
 
 try:
     from llm_client import complete_json, get_cloud_llm_provider
@@ -95,6 +95,25 @@ def _role_for_email(local: str) -> Optional[str]:
     return mapping.get(local)
 
 
+def discovery_scrape_status(enriched: dict) -> str:
+    """The status a freshly discovered company gets.
+
+    Deliberately built on enrichment.scrape_status_for rather than repeating
+    it: discovery used to carry its own hand-rolled copy of the mapping, and
+    that copy had no identity_verified case. A company found on an unrelated
+    website was therefore filed as "Research failed", which reads as transient
+    — so the user re-runs research and gets the same wrong site — instead of
+    "Wrong site found", which tells them the domain is what needs fixing.
+
+    The one addition is discovery-specific: a page that was read but listed no
+    addresses is not a failure, and the summary it produced is real evidence.
+    """
+    status = scrape_status_for(enriched)
+    if status == "scraped" and not enriched.get("emails"):
+        return "no_emails_found"
+    return status
+
+
 class DiscoveryService:
     def __init__(self, db: Database, enrichment: EnrichmentService):
         self.db = db
@@ -171,13 +190,7 @@ class DiscoveryService:
                 continue
 
             enriched = self.enrichment.enrich(name, cand.get("website"))
-            status = "scraped"
-            if not enriched.get("url"):
-                status = "no_website"
-            elif not enriched.get("ok") and not enriched.get("emails"):
-                status = "scrape_failed"
-            elif not enriched.get("emails"):
-                status = "no_emails_found"
+            status = discovery_scrape_status(enriched)
 
             company = self.db.create_company(
                 name,

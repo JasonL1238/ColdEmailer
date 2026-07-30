@@ -1,7 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 import trafilatura
-from typing import Optional, Tuple
+from typing import Optional
 from text_cleaner import TextCleaner
 import ipaddress
 import socket
@@ -64,7 +64,6 @@ class WebScraper:
     def _check_robots_txt(self, url: str) -> bool:
         """Check if we're allowed to scrape this URL"""
         try:
-            from urllib.parse import urljoin, urlparse
             parsed = urlparse(url)
             robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
             rp = RobotFileParser()
@@ -77,7 +76,6 @@ class WebScraper:
     
     def _rate_limit(self, url: str):
         """Rate limit requests to same domain"""
-        from urllib.parse import urlparse
         domain = urlparse(url).netloc
         if domain in self.last_request_time:
             elapsed = time.time() - self.last_request_time[domain]
@@ -143,46 +141,3 @@ class WebScraper:
             return self.text_cleaner.clean(soup.get_text())
         except Exception:
             return None
-
-    def scrape(self, url: str) -> Tuple[Optional[str], bool]:
-        """
-        Scrape a URL and return cleaned text.
-        Returns: (cleaned_text, success)
-        """
-        try:
-            # Fetch HTML (SSRF-checked + robots-checked + rate-limited)
-            html = self.fetch_html(url)
-            if not html:
-                return None, False
-
-            # Extract main content with trafilatura
-            extracted = trafilatura.extract(html)
-
-            if extracted:
-                # Clean the text
-                cleaned = self.text_cleaner.clean(extracted)
-                return cleaned, len(cleaned) > 100  # Success if we got substantial text
-
-            # Fallback: try BeautifulSoup extraction
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Remove script and style elements
-            for script in soup(["script", "style", "nav", "footer", "header"]):
-                script.decompose()
-            
-            # Get text
-            text = soup.get_text()
-            
-            # Clean it
-            cleaned = self.text_cleaner.clean(text)
-            
-            return cleaned, len(cleaned) > 100
-            
-        except Exception as e:
-            print(f"Error scraping {url}: {e}")
-            return None, False
-    
-    def get_text_length(self, url: str) -> int:
-        """Get text length without full scraping (for checking if we need Playwright)"""
-        text, success = self.scrape(url)
-        return len(text) if text else 0

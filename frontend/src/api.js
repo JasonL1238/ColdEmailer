@@ -32,7 +32,6 @@ export const companiesAPI = {
   list: (search) => api.get('/companies', { params: search ? { search } : {} }),
   get: (id) => api.get(`/companies/${id}`),
   create: (name, url) => api.post('/companies', { name, url: url || null }),
-  update: (id, data) => api.put(`/companies/${id}`, data),
   enrich: (id) => api.post(`/companies/${id}/enrich`),
   delete: (id, force = false) => api.delete(`/companies/${id}`, { params: { force } }),
 }
@@ -65,14 +64,11 @@ export const resumesAPI = {
 }
 
 export const emailsAPI = {
-  types: () => api.get('/email-types'),
   generate: (payload) => api.post('/emails/generate', payload),
   cancelGeneration: (jobId) => api.post(`/emails/generate/${jobId}/cancel`),
   list: (status) => api.get('/emails', { params: status ? { status } : {} }),
-  get: (id) => api.get(`/emails/${id}`),
   update: (id, data) => api.patch(`/emails/${id}`, data),
   bulkStatus: (emailIds, status) => api.post('/emails/bulk-status', { email_ids: emailIds, status }),
-  delete: (id) => api.delete(`/emails/${id}`),
   bulkDelete: (ids) => api.post('/emails/bulk-delete', { ids }),
   regenerate: (id) => api.post(`/emails/${id}/regenerate`),
   send: (payload) => api.post('/emails/send', payload),
@@ -87,8 +83,5 @@ export const dashboardAPI = {
 }
 
 export const gmailAPI = {
-  status: () => api.get('/gmail/status'),
   disconnect: () => api.post('/gmail/disconnect'),
 }
-
-export default api

@@ -1,5 +1,4 @@
 import re
-from typing import List
 
 
 class TextCleaner:
@@ -25,13 +24,19 @@ class TextCleaner:
         """Clean extracted text"""
         if not text:
             return ""
-        
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text)
-        
+
+        # Collapse runs of spaces/tabs but KEEP newlines. Collapsing every
+        # whitespace character (\s+) turns the page into a single line, and
+        # then the per-line filtering below sees one giant line: a page is
+        # either kept whole or — if any nav word appears anywhere in it —
+        # thrown away entirely. On real company sites that lost about one page
+        # in five, reported as a scrape failure.
+        text = re.sub(r'[^\S\n]+', ' ', text)
+        text = re.sub(r'\n{2,}', '\n', text)
+
         # Split into lines
         lines = text.split('\n')
-        
+
         # Filter lines
         cleaned_lines = []
         for line in lines:

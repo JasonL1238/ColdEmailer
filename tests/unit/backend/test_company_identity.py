@@ -106,6 +106,47 @@ class TestScrapeStatusFor:
         assert scrape_status_for({"url": "https://acme.com", "ok": True}) == "scraped"
 
 
+class TestDiscoveryUsesTheSharedStatusMapping:
+    """Discovery kept its own copy of the mapping, and that copy had no
+    identity_verified case. A company found on an unrelated website was filed
+    as "Research failed" — which reads as transient, so the user re-runs
+    research and gets the same wrong site — instead of "Wrong site found".
+    """
+
+    def _status(self, enriched):
+        """The exact function the discovery loop calls."""
+        from discovery import discovery_scrape_status
+        return discovery_scrape_status(enriched)
+
+    def test_wrong_site_is_not_reported_as_a_research_failure(self):
+        enriched = {"url": "https://epson.com.pe", "domain": "epson.com.pe",
+                    "identity_verified": False, "ok": False, "emails": []}
+        assert self._status(enriched) == "wrong_site"
+
+    def test_a_read_page_with_no_addresses_is_not_a_failure(self):
+        enriched = {"url": "https://honeycomb.io", "identity_verified": True,
+                    "ok": True, "emails": []}
+        assert self._status(enriched) == "no_emails_found"
+
+    def test_a_genuine_failure_is_still_a_failure(self):
+        enriched = {"url": "https://acme.com", "identity_verified": True,
+                    "ok": False, "emails": []}
+        assert self._status(enriched) == "scrape_failed"
+
+    def test_a_good_scrape_with_addresses_is_scraped(self):
+        enriched = {"url": "https://acme.com", "identity_verified": True,
+                    "ok": True, "emails": ["hi@acme.com"]}
+        assert self._status(enriched) == "scraped"
+
+    def test_the_discovery_loop_uses_that_function(self):
+        """Guard against a second copy of the mapping reappearing inline."""
+        import pathlib
+        src = pathlib.Path(__file__).resolve().parents[3] / "backend" / "discovery.py"
+        body = src.read_text()
+        assert "status = discovery_scrape_status(enriched)" in body
+        assert 'status = "no_website"' not in body
+
+
 class TestRepairMismatchedCompanySites:
     """Rows scraped before identity checking existed still read as
     authoritative; their invented summaries must not reach an email."""

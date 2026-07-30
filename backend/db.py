@@ -722,7 +722,7 @@ def _domain_from_url(url: Optional[str]) -> Optional[str]:
     return m.group(1).lower() if m else None
 
 
-def migrate_legacy_data(db: Database, project_root: str, backend_dir: str) -> Dict[str, int]:
+def migrate_legacy_data(db: Database, backend_dir: str) -> Dict[str, int]:
     """One-time import of legacy CSV/JSON data. Safe to call repeatedly —
     skips anything already imported (marker setting + duplicate checks)."""
     if db.get_setting("legacy_migrated"):
