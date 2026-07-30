@@ -21,7 +21,7 @@ except ImportError:
     complete_json = None
     get_cloud_llm_provider = lambda: None
 
-MAX_COMPANIES_PER_RUN = 25
+MAX_COMPANIES_PER_RUN = 100
 
 # Domains that are lists/aggregators/socials — never actual companies to email
 AGGREGATOR_DOMAINS = {

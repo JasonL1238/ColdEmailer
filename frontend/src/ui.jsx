@@ -191,7 +191,7 @@ export const EMAIL_TYPE_META = {
   follow_up: { label: 'Follow-up', tone: 'amber' },
 }
 
-export const CONTACT_STATUS_META = {
+const CONTACT_STATUS_META = {
   new: { label: 'New', tone: 'gray' },
   drafted: { label: 'Drafted', tone: 'accent' },
   sent: { label: 'Sent', tone: 'sky' },

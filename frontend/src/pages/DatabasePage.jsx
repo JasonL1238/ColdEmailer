@@ -1,15 +1,15 @@
 /* Database: unified view of scraped companies and their contacts */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import toast from 'react-hot-toast'
 import {
-  Search, Plus, Upload, Download, Trash2, RefreshCw, Globe, Building2,
+  Search, Plus, Upload, Download, Trash2, RefreshCw, Building2,
   Users, Sparkles, ExternalLink, AlertTriangle, Archive, ArchiveRestore,
   ChevronLeft, ChevronRight, MessageSquare, Copy, Check,
 } from 'lucide-react'
 import { companiesAPI, contactsAPI, errMessage } from '../api'
 import {
   Button, Chip, EmptyState, Modal, Segmented,
-  initials, timeAgo, contactStatusMeta,
+  initials, contactStatusMeta,
 } from '../ui'
 import { useApp } from '../App'
 import ComposeModal from './ComposeModal'

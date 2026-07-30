@@ -109,9 +109,11 @@ export default function Discover() {
   const start = async (q) => {
     const searchQuery = (q ?? query).trim()
     if (!searchQuery) return
+    const n = Math.min(100, Math.max(1, Math.round(Number(count) || 10)))
+    setCount(n)
     setStarting(true)
     try {
-      const { data } = await discoveryAPI.start(searchQuery, count)
+      const { data } = await discoveryAPI.start(searchQuery, n)
       setQuery(searchQuery)
       setRun(data)
       pollRun(data.id)
@@ -163,15 +165,22 @@ export default function Discover() {
               disabled={isRunning}
             />
           </div>
-          <select
-            className="select"
-            style={{ width: 130 }}
-            value={count}
-            onChange={(e) => setCount(Number(e.target.value))}
-            disabled={isRunning}
-          >
-            {[5, 10, 15, 20, 25].map((n) => <option key={n} value={n}>{n} companies</option>)}
-          </select>
+          <label className="discover-count" title="How many companies to scrape (1–100)">
+            <input
+              className="discover-count-input"
+              type="number"
+              min={1}
+              max={100}
+              value={count}
+              onChange={(e) => {
+                const n = Number(e.target.value)
+                if (!Number.isFinite(n)) return
+                setCount(Math.min(100, Math.max(1, Math.round(n))))
+              }}
+              disabled={isRunning}
+            />
+            <span>companies</span>
+          </label>
           {isRunning ? (
             <Button variant="danger" icon={X} onClick={cancel}>Cancel</Button>
           ) : (
