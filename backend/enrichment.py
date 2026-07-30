@@ -270,7 +270,9 @@ _ROLE_PATTERNS = [
     ("VP", r"\b(?:vice president|vp)\b", 5),
     ("Head", r"\bhead of\b", 6),
     ("Director", r"\bdirector\b", 7),
-    ("Recruiting", r"\b(?:recruiter|recruiting|talent acquisition)\b", 8),
+    ("Hiring manager", r"\bhiring manager\b", 7),
+    ("Engineering manager", r"\bengineering manager\b", 7),
+    ("Recruiting", r"\b(?:recruiter|recruiting|talent acquisition|talent partner)\b", 8),
 ]
 
 
@@ -294,6 +296,45 @@ def _school_match(context: str, preferred_school: Optional[str]) -> bool:
             marker in text for marker in ("university of pennsylvania", "upenn", "wharton")):
         return False
     return any(alias in text for alias in _school_aliases(preferred_school))
+
+
+def _affiliation_terms(preferred_affiliations: Optional[str]) -> List[str]:
+    """User-supplied former employers/communities, one per line or comma."""
+    return [
+        term.strip()
+        for term in re.split(r"[,;\n]+", preferred_affiliations or "")
+        if len(term.strip()) >= 3
+    ][:30]
+
+
+def _affinity_matches(context: str, preferred_school: Optional[str],
+                      preferred_affiliations: Optional[str]) -> List[str]:
+    matches = []
+    if _school_match(context, preferred_school):
+        matches.append(preferred_school or "Same school")
+    lowered = (context or "").lower()
+    for term in _affiliation_terms(preferred_affiliations):
+        if re.search(rf"(?<!\w){re.escape(term.lower())}(?!\w)", lowered):
+            matches.append(f"Shared: {term}")
+    return list(dict.fromkeys(matches))
+
+
+def _linkedin_profile_url(value: str) -> Optional[str]:
+    """Normalize a LinkedIn member URL already linked from a first-party page.
+
+    We record the link but never fetch LinkedIn itself.
+    """
+    try:
+        parsed = urlparse((value or "").strip())
+    except ValueError:
+        return None
+    if parsed.scheme != "https":
+        return None
+    if (parsed.hostname or "").lower() not in {"linkedin.com", "www.linkedin.com"}:
+        return None
+    if not parsed.path.lower().startswith("/in/"):
+        return None
+    return f"https://www.linkedin.com{parsed.path.rstrip('/')}"
 
 
 def _infer_role(context: str, local: str) -> Tuple[Optional[str], int]:
@@ -339,10 +380,11 @@ def _infer_name(context: str, local: str) -> str:
     return ""
 
 
-def extract_contact_candidates(pages: List[Dict[str, str]],
-                               company_domain: Optional[str],
-                               preferred_school: Optional[str] = None) -> List[Dict]:
-    """Build evidence-backed contact records from each email's page context."""
+def extract_contact_candidates(
+        pages: List[Dict[str, str]], company_domain: Optional[str],
+        preferred_school: Optional[str] = None,
+        preferred_affiliations: Optional[str] = None) -> List[Dict]:
+    """Build evidence-backed people from emails and first-party profile links."""
     merged: Dict[str, Dict] = {}
     for page in pages:
         html = page.get("html") or ""
@@ -401,13 +443,18 @@ def extract_contact_candidates(pages: List[Dict[str, str]],
             role, seniority = _infer_role(context, local)
             name = _infer_name(context, local)
             school_match = _school_match(context, preferred_school)
+            affinities = _affinity_matches(
+                context, preferred_school, preferred_affiliations)
             candidate = {
                 "email": addr,
+                "linkedin_url": None,
                 "name": name,
                 "role": role,
                 "source_url": page_url,
+                "evidence": context[:500],
                 "school_match": school_match,
                 "school": preferred_school if school_match else None,
+                "affinity": affinities,
                 "seniority_rank": seniority,
                 "on_domain": bool(
                     company_domain and registered_domain(domain) == company_domain),
@@ -419,6 +466,69 @@ def extract_contact_candidates(pages: List[Dict[str, str]],
                     old["school_match"], -old["seniority_rank"], bool(old["name"])):
                 merged[addr.lower()] = candidate
 
+        # A company-owned team page may identify a real leader and link to
+        # their public profile without publishing an email. Preserve that
+        # useful, auditable lead without crawling the LinkedIn destination.
+        for anchor in soup.find_all("a", href=True):
+            linkedin_url = _linkedin_profile_url(anchor.get("href") or "")
+            if not linkedin_url:
+                continue
+            contexts = []
+            node = anchor
+            for _ in range(5):
+                if node is None or getattr(node, "name", None) in {
+                        "body", "html", "main", "[document]"}:
+                    break
+                value = node.get_text(" ", strip=True)
+                if value:
+                    contexts.append(value)
+                node = node.parent
+            context = min(
+                (c for c in contexts if c), key=lambda c: abs(len(c) - 300),
+                default=anchor.get_text(" ", strip=True),
+            )[:1200]
+            role, seniority = _infer_role(context, "")
+            name = _infer_name(context, "")
+            anchor_name = anchor.get_text(" ", strip=True)
+            if not name and re.fullmatch(
+                    r"[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}",
+                    anchor_name):
+                name = anchor_name
+            # A /in/ link proves a person exists, but keep only links the
+            # company page associates with a name or a target decision role.
+            if not name and not role:
+                continue
+            school_match = _school_match(context, preferred_school)
+            affinities = _affinity_matches(
+                context, preferred_school, preferred_affiliations)
+            person = {
+                "email": "",
+                "linkedin_url": linkedin_url,
+                "name": name,
+                "role": role,
+                "source_url": page_url,
+                "evidence": context[:500],
+                "school_match": school_match,
+                "school": preferred_school if school_match else None,
+                "affinity": affinities,
+                "seniority_rank": seniority,
+                "on_domain": True,
+            }
+            same_name = next((
+                existing for existing in merged.values()
+                if name and existing.get("name")
+                and existing["name"].strip().lower() == name.strip().lower()
+            ), None)
+            if same_name:
+                same_name["linkedin_url"] = linkedin_url
+                same_name["affinity"] = list(dict.fromkeys(
+                    (same_name.get("affinity") or []) + affinities))
+                if school_match:
+                    same_name["school_match"] = True
+                    same_name["school"] = preferred_school
+            else:
+                merged[f"linkedin:{linkedin_url.lower()}"] = person
+
     generic_locals = set(_LOCAL_PRIORITY)
     return sorted(
         merged.values(),
@@ -427,15 +537,15 @@ def extract_contact_candidates(pages: List[Dict[str, str]],
             c["seniority_rank"],
             0 if c["on_domain"] else 1,
             0 if c["name"] else 1,
-            1 if c["email"].split("@", 1)[0].lower() in generic_locals else 0,
-            c["email"].lower(),
+            1 if (c.get("email") or "").split("@", 1)[0].lower() in generic_locals else 0,
+            (c.get("email") or c.get("linkedin_url") or "").lower(),
         ),
     )
 
 
 def select_outreach_contacts(candidates: List[Dict], emails: List[str],
                              company_domain: Optional[str],
-                             limit: int = 3) -> List[Dict]:
+                             limit: int = 5) -> List[Dict]:
     """Prefer same-school senior leaders, then other named/on-domain contacts."""
     by_email = {c.get("email", "").lower(): dict(c)
                 for c in candidates or [] if c.get("email")}
@@ -469,6 +579,23 @@ def select_outreach_contacts(candidates: List[Dict], emails: List[str],
         c.get("seniority_rank", 20),
         0 if c.get("name") else 1,
     ))
+    selected_keys = {
+        ((c.get("email") or "").lower(), (c.get("linkedin_url") or "").lower())
+        for c in selected
+    }
+    linkedin_only = [
+        dict(c) for c in (candidates or [])
+        if c.get("linkedin_url") and not c.get("email")
+        and ((c.get("email") or "").lower(),
+             (c.get("linkedin_url") or "").lower()) not in selected_keys
+    ]
+    linkedin_only.sort(key=lambda c: (
+        0 if c.get("school_match") else 1,
+        0 if c.get("affinity") else 1,
+        c.get("seniority_rank", 20),
+        0 if c.get("name") else 1,
+    ))
+    selected.extend(linkedin_only)
     return selected[:limit]
 
 
@@ -691,7 +818,8 @@ class EnrichmentService:
         return "low"
 
     def enrich(self, company_name: str, url: Optional[str] = None,
-               preferred_school: Optional[str] = None) -> Dict:
+               preferred_school: Optional[str] = None,
+               preferred_affiliations: Optional[str] = None) -> Dict:
         """Full enrichment: returns dict with url, domain, metadata fields,
         evidence-backed contacts, crawl diagnostics, and an ok flag."""
         if not url:
@@ -802,7 +930,8 @@ class EnrichmentService:
             all_emails.extend(extract_emails_from_html(page["html"]))
         result["emails"] = rank_outreach_emails(all_emails, result["domain"])[:12]
         result["contacts"] = extract_contact_candidates(
-            page_records, result["domain"], preferred_school)
+            page_records, result["domain"], preferred_school,
+            preferred_affiliations)
         if combined:
             meta = llm_metadata(
                 company_name, combined, result["emails"], preferred_school)
@@ -833,14 +962,14 @@ class EnrichmentService:
                     contact["school"] = preferred_school
                 _, contact["seniority_rank"] = _infer_role(
                     f"{contact.get('role') or ''} {grounded.get('evidence') or ''}",
-                    contact["email"].split("@", 1)[0],
+                    (contact.get("email") or "").split("@", 1)[0],
                 )
             result["contacts"].sort(key=lambda c: (
                 0 if c.get("school_match") else 1,
                 c.get("seniority_rank", 20),
                 0 if c.get("on_domain") else 1,
                 0 if c.get("name") else 1,
-                c["email"].lower(),
+                (c.get("email") or c.get("linkedin_url") or "").lower(),
             ))
         result["research_quality"] = self._research_quality(
             result["pages_scraped"], result.get("summary"), result["contacts"])

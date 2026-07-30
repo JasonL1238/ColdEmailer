@@ -40,6 +40,8 @@ export const contactsAPI = {
   list: (params = {}) => api.get('/contacts', { params }),
   create: (data) => api.post('/contacts', data),
   update: (id, data) => api.put(`/contacts/${id}`, data),
+  linkedinDraft: (id, customInstructions = null) =>
+    api.post(`/contacts/${id}/linkedin-draft`, { custom_instructions: customInstructions }),
   delete: (id, force = false) => api.delete(`/contacts/${id}`, { params: { force } }),
   bulkDelete: (ids, force = false) => api.post('/contacts/bulk-delete', { ids }, { params: { force } }),
   import: (file) => {

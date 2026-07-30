@@ -18,9 +18,9 @@ Opens the app at **http://localhost:5173** (API docs at http://localhost:8000/do
 
 ## What it does
 
-**Discover** — Type what you're looking for in plain English ("seed-stage fintech startups in New York"). Reach asks the LLM for real matching companies, cross-checks with a web search, finds each company's website, follows its real first-party navigation (leadership, team, about, contact, careers, press, news, and blog pages), and extracts a structured company profile plus public contact addresses. It records every source page and crawl count so you can audit the research. Runs in the background with live progress.
+**Discover** — Type what you're looking for in plain English ("seed-stage fintech startups in New York"). Reach asks the LLM for real matching companies, cross-checks with a web search, finds each company's website, follows its real first-party navigation (leadership, team, about, contact, careers, press, news, and blog pages), and extracts a structured company profile plus public contact addresses. It keeps evidence-backed CEO/COO/CTO, hiring, recruiting, and engineering leads when a company page publishes either an email or a LinkedIn member link. It records every source page and crawl count so you can audit the research. Runs in the background with live progress.
 
-**Database** — Every company and contact in one place. Drill into a company to see its scraped research, its contacts, and the full email history with that company. Import contacts from CSV (`name, company, email` header) or add them by hand. Re-run research on any company at any time.
+**Database** — Every company and contact in one place. Drill into a company to see its scraped research, its contacts, and the full email history with that company. Warm matches are ranked from your configured school and past employers/communities. For a contact with a verified LinkedIn URL, Reach can draft and copy a message, then open the profile for you to review and send manually. Import a Reach CSV (`name, company` plus `email` and/or `linkedin_url`) or your LinkedIn Connections CSV export; imported LinkedIn rows are marked as direct connections. Re-run research on any company at any time.
 
 **Resumes** — Upload multiple PDF versions ("ML research", "Full-stack", "2029 general"). Reach extracts the text so the AI can weave your real projects into emails, and attaches the PDF you pick when sending. One is marked default. PDFs preview inline in the app, with separate open-in-tab and download actions.
 
@@ -88,7 +88,7 @@ The first time you hit Send, a Google sign-in window opens on the machine runnin
 
 ### 3. Your profile
 
-Open **Settings** and fill in your name, email, school, website, and a concrete background one-liner. The AI writes every email as you, so specifics here ("built computer-vision pipelines with OpenCV and YOLO") produce far better emails than generalities.
+Open **Settings** and fill in your name, email, school, past employers/communities, website, and a concrete background one-liner. School and employer entries are used to flag warm matches in public company biographies. The AI writes every email as you, so specifics here ("built computer-vision pipelines with OpenCV and YOLO") produce far better emails than generalities.
 
 ## Architecture
 
@@ -134,11 +134,11 @@ All optional, set in `.env`:
 ## Tests
 
 ```bash
-cd tests && ../backend/venv/bin/python -m pytest     # 366 backend tests
+backend/venv/bin/python -m pytest                    # 400 backend tests
 ```
 
 ```bash
-cd frontend && npm test                              # 48 frontend tests
+cd frontend && npm test                              # 53 frontend tests
 ```
 
 The backend suite runs against a throwaway database (`tests/conftest.py` sets `COLD_DB_PATH`), so it never touches your real data or Gmail credentials.

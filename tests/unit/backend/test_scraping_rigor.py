@@ -107,6 +107,41 @@ class TestAffinityAndSeniorityRanking:
         chosen = select_outreach_contacts(candidates, emails, "acme.com")
         assert [c["email"] for c in chosen] == ["hello@acme.com"]
 
+    def test_keeps_linkedin_only_leader_linked_from_company_team_page(self):
+        pages = [{
+            "url": "https://acme.com/leadership",
+            "html": """
+              <section>
+                <h2>Jane Doe — Chief Technology Officer</h2>
+                <p>Jane earned her MBA from Wharton and previously worked at Stripe.</p>
+                <a href="https://www.linkedin.com/in/jane-doe">LinkedIn</a>
+              </section>
+            """,
+        }]
+        candidates = extract_contact_candidates(
+            pages, "acme.com", "University of Pennsylvania", "Stripe\nGoogle")
+        chosen = select_outreach_contacts(candidates, [], "acme.com")
+
+        assert len(chosen) == 1
+        assert chosen[0]["email"] == ""
+        assert chosen[0]["linkedin_url"] == "https://www.linkedin.com/in/jane-doe"
+        assert chosen[0]["name"] == "Jane Doe"
+        assert chosen[0]["role"] == "CTO"
+        assert chosen[0]["school_match"] is True
+        assert "Shared: Stripe" in chosen[0]["affinity"]
+
+    def test_ignores_company_and_non_linkedin_profile_links(self):
+        pages = [{
+            "url": "https://acme.com/team",
+            "html": """
+              <h2>Jane Doe — CEO</h2>
+              <a href="https://www.linkedin.com/company/acme">Company LinkedIn</a>
+              <a href="https://evil.example/in/jane-doe">Profile</a>
+            """,
+        }]
+        candidates = extract_contact_candidates(pages, "acme.com")
+        assert candidates == []
+
 
 class TestGroundedAIContactAssociation:
     def test_accepts_only_scraped_addresses_with_exact_biography_evidence(

@@ -45,6 +45,7 @@ class ProfileUpdate(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     school: Optional[str] = None
+    affiliations: Optional[str] = None
     website: Optional[str] = None
     background: Optional[str] = None
     signature: Optional[str] = None
@@ -89,6 +90,7 @@ class CompanyUpdate(BaseModel):
 class ContactCreate(BaseModel):
     name: str = ""
     email: str = ""
+    linkedin_url: Optional[str] = None
     role: Optional[str] = None
     company_id: Optional[str] = None
     company_name: Optional[str] = None  # create/link company by name
@@ -99,10 +101,16 @@ class ContactCreate(BaseModel):
     def _check_email(cls, v):
         return validate_email_address(v)
 
+    @field_validator("linkedin_url")
+    @classmethod
+    def _check_linkedin(cls, v):
+        return validate_linkedin_profile_url(v)
+
 
 class ContactUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[str] = None
+    linkedin_url: Optional[str] = None
     role: Optional[str] = None
     company_id: Optional[str] = None
     status: Optional[str] = None
@@ -112,6 +120,34 @@ class ContactUpdate(BaseModel):
     @classmethod
     def _check_email(cls, v):
         return validate_email_address(v)
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def _check_linkedin(cls, v):
+        return validate_linkedin_profile_url(v)
+
+
+def validate_linkedin_profile_url(value: Optional[str]) -> Optional[str]:
+    """Accept only public LinkedIn member profile URLs, never arbitrary links."""
+    if value is None:
+        return value
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        raise ValueError("LinkedIn URL is invalid")
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host not in {"linkedin.com", "www.linkedin.com"}:
+        raise ValueError("Use a full https://www.linkedin.com/in/... profile URL")
+    if not parsed.path.lower().startswith("/in/"):
+        raise ValueError("LinkedIn URL must point to a member profile")
+    return f"https://www.linkedin.com{parsed.path.rstrip('/')}"
+
+
+class LinkedInDraftRequest(BaseModel):
+    custom_instructions: Optional[str] = Field(None, max_length=1000)
 
 
 class BulkIds(BaseModel):

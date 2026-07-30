@@ -53,6 +53,26 @@ def test_deleting_company_cascades_to_contacts_and_emails(db):
     assert db.get_email(email["id"]) is None
 
 
+def test_contact_can_be_linkedin_only_and_is_searchable_by_affinity(db):
+    company = db.create_company("Acme")
+    contact = db.create_contact(
+        company_id=company["id"],
+        name="Jane Doe",
+        email="",
+        linkedin_url="https://www.linkedin.com/in/jane-doe",
+        role="CTO",
+        affinity="University of Pennsylvania, Shared: Stripe",
+        source_url="https://acme.com/team",
+        evidence="Jane Doe is Acme's CTO and a Wharton alumna.",
+        seniority_rank=3,
+    )
+
+    found = db.find_contact_by_linkedin(
+        "https://www.linkedin.com/in/jane-doe")
+    assert found["id"] == contact["id"]
+    assert db.list_contacts(search="Stripe")[0]["id"] == contact["id"]
+
+
 def test_contact_email_lookup_is_case_insensitive(db):
     db.create_contact(email="Jane@Example.com")
     assert db.find_contact_by_email("jane@example.com") is not None

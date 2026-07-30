@@ -128,6 +128,19 @@ class TestDiscoveryUsesTheSharedStatusMapping:
                     "ok": True, "emails": []}
         assert self._status(enriched) == "no_emails_found"
 
+    def test_a_linkedin_only_contact_counts_as_successful_research(self):
+        enriched = {
+            "url": "https://acme.com",
+            "identity_verified": True,
+            "ok": True,
+            "emails": [],
+            "contacts": [{
+                "name": "Jane Doe",
+                "linkedin_url": "https://www.linkedin.com/in/jane-doe",
+            }],
+        }
+        assert self._status(enriched) == "scraped"
+
     def test_a_genuine_failure_is_still_a_failure(self):
         enriched = {"url": "https://acme.com", "identity_verified": True,
                     "ok": False, "emails": []}

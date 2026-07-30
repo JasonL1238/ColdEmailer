@@ -36,10 +36,12 @@ from models import (
     EMAIL_ADDRESS_RE, BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
     ContactCreate, ContactUpdate, DiscoveryRequest, EmailUpdate,
     GenerateRequest, ProfileUpdate, ResumeUpdate, SendRequest,
+    LinkedInDraftRequest, validate_linkedin_profile_url,
 )
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
 from response_checker import ResponseChecker
+from linkedin_outreach import draft_linkedin_message
 
 try:
     from llm_client import get_cloud_llm_provider
@@ -277,6 +279,7 @@ def _enrich_company_async(company_id: str):
         enriched = enrichment.enrich(
             company["name"], company.get("url"),
             preferred_school=db.get_profile().get("school"),
+            preferred_affiliations=db.get_profile().get("affiliations"),
         )
         research_fields = {
             "url", "domain", "summary", "industry", "product", "hook",
@@ -305,8 +308,12 @@ def _enrich_company_async(company_id: str):
         for candidate in select_outreach_contacts(
                 enriched.get("contacts") or [],
                 enriched.get("emails") or [], domain):
-            addr = candidate["email"]
-            existing_contact = db.find_contact_by_email(addr)
+            addr = candidate.get("email") or ""
+            linkedin_url = candidate.get("linkedin_url") or ""
+            existing_contact = (
+                db.find_contact_by_email(addr) if addr else
+                db.find_contact_by_linkedin(linkedin_url)
+            )
             if existing_contact:
                 if existing_contact.get("company_id") == company_id:
                     richer = {}
@@ -314,6 +321,8 @@ def _enrich_company_async(company_id: str):
                         richer["name"] = candidate["name"]
                     if not existing_contact.get("role") and candidate.get("role"):
                         richer["role"] = candidate["role"]
+                    if not existing_contact.get("linkedin_url") and linkedin_url:
+                        richer["linkedin_url"] = linkedin_url
                     new_notes = contact_notes(candidate)
                     if new_notes and not existing_contact.get("notes"):
                         richer["notes"] = new_notes
@@ -322,12 +331,19 @@ def _enrich_company_async(company_id: str):
                 continue
             local = addr.split("@", 1)[0]
             db.create_contact(company_id=company_id, email=addr,
+                              linkedin_url=linkedin_url,
                               name=(candidate.get("name")
                                     or _guess_name_from_email(local)),
                               role=(candidate.get("role")
                                     or _role_for_email(local)),
                               source="discovery", status="new",
-                              notes=contact_notes(candidate))
+                              notes=contact_notes(candidate),
+                              source_url=candidate.get("source_url"),
+                              evidence=candidate.get("evidence"),
+                              affinity=", ".join(
+                                  candidate.get("affinity") or []) or None,
+                              seniority_rank=candidate.get(
+                                  "seniority_rank", 20))
         # Log what actually happened — an unconditional "researched" here made
         # the activity feed claim success for wrong-site and failed scrapes.
         status = updates["scrape_status"]
@@ -432,6 +448,8 @@ async def create_contact(payload: ContactCreate):
     email = (payload.email or "").strip()
     if email and db.find_contact_by_email(email):
         raise HTTPException(409, f"A contact with email {email} already exists")
+    if payload.linkedin_url and db.find_contact_by_linkedin(payload.linkedin_url):
+        raise HTTPException(409, "That LinkedIn profile is already a contact")
     company_id = payload.company_id
     if company_id and not db.get_company(company_id):
         raise HTTPException(404, "That company no longer exists")
@@ -441,6 +459,7 @@ async def create_contact(payload: ContactCreate):
             payload.company_name, source="manual")["id"]
     contact = db.create_contact(
         name=payload.name, email=email, role=payload.role,
+        linkedin_url=payload.linkedin_url,
         company_id=company_id, notes=payload.notes, source="manual",
     )
     return db.get_contact(contact["id"])
@@ -460,8 +479,36 @@ async def update_contact(contact_id: str, payload: ContactUpdate):
         clash = db.find_contact_by_email(new_email)
         if clash and clash["id"] != contact_id:
             raise HTTPException(409, f"Another contact already uses {new_email}")
+    new_linkedin = (updates.get("linkedin_url") or "").strip()
+    if new_linkedin:
+        clash = db.find_contact_by_linkedin(new_linkedin)
+        if clash and clash["id"] != contact_id:
+            raise HTTPException(409, "Another contact already uses that LinkedIn profile")
     db.update_contact(contact_id, updates)
     return db.get_contact(contact_id)
+
+
+@app.post("/api/contacts/{contact_id}/linkedin-draft")
+async def create_linkedin_draft(
+        contact_id: str, payload: LinkedInDraftRequest):
+    """Draft only. The user reviews and sends in LinkedIn themselves."""
+    contact = db.get_contact(contact_id)
+    if not contact:
+        raise HTTPException(404, "Contact not found")
+    if not contact.get("linkedin_url"):
+        raise HTTPException(
+            400, "No verified LinkedIn profile URL is stored for this contact")
+    company = (
+        db.get_company(contact["company_id"])
+        if contact.get("company_id") else None
+    )
+    message = draft_linkedin_message(
+        contact, company, db.get_profile(), payload.custom_instructions)
+    return {
+        "message": message,
+        "linkedin_url": contact["linkedin_url"],
+        "manual_send_required": True,
+    }
 
 
 @app.delete("/api/contacts/{contact_id}")
@@ -530,8 +577,7 @@ def _decode_csv(raw: bytes) -> str:
 
 @app.post("/api/contacts/import")
 async def import_contacts_csv(file: UploadFile = File(...)):
-    """CSV import. Columns: name, company, email (header required). Extra
-    columns 'role' and 'notes' are picked up when present."""
+    """CSV import. Requires name/company plus email and/or linkedin_url."""
     import csv as _csv
     try:
         raw = await file.read()
@@ -542,35 +588,73 @@ async def import_contacts_csv(file: UploadFile = File(...)):
         if not reader.fieldnames:
             raise ValueError("CSV has no header row")
         cols = {c.strip().lower(): c for c in reader.fieldnames}
-        missing = {"name", "company", "email"} - set(cols)
-        if missing:
+        linkedin_export = {
+            "first name", "last name", "url", "company", "position",
+        }.issubset(cols)
+        missing = {"name", "company"} - set(cols)
+        if missing and not linkedin_export:
             raise ValueError(
                 f"Missing required column(s): {', '.join(sorted(missing))}. "
-                "Header must include: name, company, email")
+                "Use a Reach CSV (name, company, email/linkedin_url) or a "
+                "LinkedIn Connections export")
+        if not linkedin_export and not ({"email", "linkedin_url"} & set(cols)):
+            raise ValueError(
+                "Header must include at least one contact method: email or linkedin_url")
         # Report why rows were dropped separately — "duplicates skipped" is a
         # misleading thing to tell someone whose addresses were malformed.
         added = duplicates = invalid = 0
         invalid_samples = []
         for row in reader:
-            get = lambda k: (row.get(cols[k]) or "").strip() if k in cols else ""
-            email = get("email")
-            if not email or not EMAIL_ADDRESS_RE.fullmatch(email):
+            def get(key):
+                return (row.get(cols[key]) or "").strip() if key in cols else ""
+
+            if linkedin_export:
+                name = " ".join(
+                    part for part in (get("first name"), get("last name"))
+                    if part
+                )
+                email = get("email address")
+                linkedin_url = get("url")
+                company_name = get("company")
+                role = get("position")
+                notes = "Imported from your LinkedIn Connections export."
+                affinity = "Direct LinkedIn connection"
+                source = "linkedin_export"
+            else:
+                name = get("name")
+                email = get("email")
+                linkedin_url = get("linkedin_url")
+                company_name = get("company")
+                role = get("role")
+                notes = get("notes") or None
+                affinity = get("affinity") or None
+                source = "csv"
+            try:
+                linkedin_url = validate_linkedin_profile_url(linkedin_url)
+            except ValueError:
+                linkedin_url = None
+                invalid_linkedin = True
+            else:
+                invalid_linkedin = False
+            if ((email and not EMAIL_ADDRESS_RE.fullmatch(email))
+                    or invalid_linkedin or (not email and not linkedin_url)):
                 invalid += 1
                 if len(invalid_samples) < 5:
-                    invalid_samples.append(email or "(blank)")
+                    invalid_samples.append(email or get("linkedin_url") or "(blank)")
                 continue
-            if db.find_contact_by_email(email):
+            if ((email and db.find_contact_by_email(email))
+                    or (linkedin_url and db.find_contact_by_linkedin(linkedin_url))):
                 duplicates += 1
                 continue
             company_id = None
-            company_name = get("company")
             if company_name:
                 existing = db.find_company_by_name(company_name)
                 company_id = existing["id"] if existing else db.create_company(
                     company_name, source="csv")["id"]
             db.create_contact(
-                name=get("name"), email=email, company_id=company_id,
-                role=get("role") or None, notes=get("notes") or None, source="csv",
+                name=name, email=email, company_id=company_id,
+                linkedin_url=linkedin_url,
+                role=role or None, notes=notes, affinity=affinity, source=source,
             )
             added += 1
         db.log_event("contact", None, "imported", f"{added} contacts from CSV")
@@ -599,11 +683,15 @@ async def export_contacts_csv():
     contacts = db.list_contacts()
     output = io.StringIO()
     writer = _csv.writer(output)
-    writer.writerow(["name", "email", "company", "role", "status", "source", "created_at"])
+    writer.writerow([
+        "name", "email", "linkedin_url", "company", "role", "affinity",
+        "source_url", "status", "source", "created_at",
+    ])
     for c in contacts:
         writer.writerow([_csv_safe(c.get(k)) for k in
-                         ("name", "email", "company_name", "role", "status",
-                          "source", "created_at")])
+                         ("name", "email", "linkedin_url", "company_name", "role",
+                          "affinity", "source_url", "status", "source",
+                          "created_at")])
     return Response(
         content=output.getvalue(), media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=contacts.csv"},

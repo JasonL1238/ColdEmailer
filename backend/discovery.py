@@ -103,6 +103,9 @@ def contact_notes(candidate: Dict) -> Optional[str]:
         notes.append(
             f"Same-school match: {school} is mentioned in this person's "
             "public company biography. Verify before referencing it.")
+    for affinity in candidate.get("affinity") or []:
+        if affinity and affinity not in (candidate.get("school") or ""):
+            notes.append(f"Warm match: {affinity}. Verify before referencing it.")
     if candidate.get("source_url"):
         notes.append(f"Source: {candidate['source_url']}")
     if candidate.get("evidence"):
@@ -126,7 +129,8 @@ def discovery_scrape_status(enriched: dict) -> str:
     addresses is not a failure, and the summary it produced is real evidence.
     """
     status = scrape_status_for(enriched)
-    if status == "scraped" and not enriched.get("emails"):
+    if (status == "scraped" and not enriched.get("emails")
+            and not enriched.get("contacts")):
         return "no_emails_found"
     return status
 
@@ -209,6 +213,7 @@ class DiscoveryService:
             enriched = self.enrichment.enrich(
                 name, cand.get("website"),
                 preferred_school=self.db.get_profile().get("school"),
+                preferred_affiliations=self.db.get_profile().get("affiliations"),
             )
             status = discovery_scrape_status(enriched)
             trusted_site = status != "wrong_site"
@@ -241,21 +246,28 @@ class DiscoveryService:
             for candidate in select_outreach_contacts(
                     enriched.get("contacts") or [],
                     enriched.get("emails") or [], company.get("domain")):
-                addr = candidate["email"]
-                if self.db.find_contact_by_email(addr):
+                addr = candidate.get("email") or ""
+                linkedin_url = candidate.get("linkedin_url") or ""
+                if ((addr and self.db.find_contact_by_email(addr))
+                        or (linkedin_url and self.db.find_contact_by_linkedin(linkedin_url))):
                     continue
-                local = addr.split("@", 1)[0]
+                local = addr.split("@", 1)[0] if addr else ""
                 self.db.create_contact(
                     company_id=company["id"],
                     name=candidate.get("name") or _guess_name_from_email(local),
                     email=addr,
+                    linkedin_url=linkedin_url,
                     role=candidate.get("role") or _role_for_email(local),
                     source="discovery",
                     status="new",
                     notes=contact_notes(candidate),
+                    source_url=candidate.get("source_url"),
+                    evidence=candidate.get("evidence"),
+                    affinity=", ".join(candidate.get("affinity") or []) or None,
+                    seniority_rank=candidate.get("seniority_rank", 20),
                 )
                 contacts_added += 1
-                emails_this_company += 1
+                emails_this_company += bool(addr)
 
             results.append({"company_id": company["id"], "name": name,
                             "status": status, "emails_found": emails_this_company})

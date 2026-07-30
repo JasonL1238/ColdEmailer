@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, "data", "coldemailer.db")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -58,10 +58,15 @@ CREATE TABLE IF NOT EXISTS contacts (
     company_id TEXT REFERENCES companies(id) ON DELETE CASCADE,
     name       TEXT DEFAULT '',
     email      TEXT DEFAULT '',
+    linkedin_url TEXT,
     role       TEXT,
     source     TEXT DEFAULT 'manual',
     status     TEXT DEFAULT 'new',
     notes      TEXT,
+    source_url TEXT,
+    evidence   TEXT,
+    affinity   TEXT,
+    seniority_rank INTEGER DEFAULT 20,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -153,6 +158,13 @@ _ADDED_COLUMNS = {
         "pages_scraped": "INTEGER DEFAULT 0",
         "pages_attempted": "INTEGER DEFAULT 0",
         "research_quality": "TEXT DEFAULT 'low'",
+    },
+    "contacts": {
+        "linkedin_url": "TEXT",
+        "source_url": "TEXT",
+        "evidence": "TEXT",
+        "affinity": "TEXT",
+        "seniority_rank": "INTEGER DEFAULT 20",
     },
 }
 
@@ -287,6 +299,7 @@ class Database:
         "email": "",
         "phone": "",
         "school": "",
+        "affiliations": "",  # past employers / communities used for warm-match research
         "website": "",
         "background": "",   # short bio / positioning used in prompts
         "signature": "",    # extra signature lines
@@ -433,10 +446,15 @@ class Database:
             "company_id": kwargs.get("company_id"),
             "name": (kwargs.get("name") or "").strip(),
             "email": (kwargs.get("email") or "").strip(),
+            "linkedin_url": (kwargs.get("linkedin_url") or "").strip() or None,
             "role": kwargs.get("role"),
             "source": kwargs.get("source", "manual"),
             "status": kwargs.get("status", "new"),
             "notes": kwargs.get("notes"),
+            "source_url": kwargs.get("source_url"),
+            "evidence": kwargs.get("evidence"),
+            "affinity": kwargs.get("affinity"),
+            "seniority_rank": kwargs.get("seniority_rank", 20),
             "created_at": ts,
             "updated_at": ts,
         }
@@ -458,8 +476,20 @@ class Database:
             "SELECT * FROM contacts WHERE email=? COLLATE NOCASE", (email.strip(),)
         )
 
+    def find_contact_by_linkedin(self, linkedin_url: str) -> Optional[Dict[str, Any]]:
+        if not linkedin_url:
+            return None
+        return self.query_one(
+            "SELECT * FROM contacts WHERE linkedin_url=? COLLATE NOCASE",
+            (linkedin_url.strip().rstrip("/"),),
+        )
+
     def update_contact(self, contact_id: str, updates: Dict[str, Any]):
-        allowed = {"company_id", "name", "email", "role", "status", "notes", "source"}
+        allowed = {
+            "company_id", "name", "email", "linkedin_url", "role", "status",
+            "notes", "source", "source_url", "evidence", "affinity",
+            "seniority_rank",
+        }
         updates = {k: v for k, v in updates.items() if k in allowed}
         if updates:
             updates["updated_at"] = now_iso()
@@ -492,9 +522,12 @@ class Database:
             clauses.append("ct.company_id=?")
             params.append(company_id)
         if search:
-            clauses.append("(ct.name LIKE ? OR ct.email LIKE ? OR c.name LIKE ?)")
+            clauses.append(
+                "(ct.name LIKE ? OR ct.email LIKE ? OR ct.role LIKE ? "
+                "OR ct.affinity LIKE ? OR c.name LIKE ?)"
+            )
             like = f"%{search}%"
-            params += [like, like, like]
+            params += [like, like, like, like, like]
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY ct.created_at DESC"

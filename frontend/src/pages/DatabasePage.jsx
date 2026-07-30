@@ -4,6 +4,7 @@ import toast from 'react-hot-toast'
 import {
   Search, Plus, Upload, Download, Trash2, RefreshCw, Globe, Building2,
   Users, Sparkles, ExternalLink, AlertTriangle, Archive, ArchiveRestore,
+  ChevronLeft, ChevronRight, MessageSquare, Copy, Check,
 } from 'lucide-react'
 import { companiesAPI, contactsAPI, errMessage } from '../api'
 import {
@@ -23,10 +24,16 @@ const SCRAPE_STATUS = {
   scrape_failed: { label: 'Research failed', tone: 'red' },
 }
 
+const PAGE_SIZE_OPTIONS = [10, 15, 25, 50]
+
 export default function DatabasePage() {
   const { navigate } = useApp()
   const [tab, setTab] = useState('companies')
   const [search, setSearch] = useState('')
+  const [viewFilter, setViewFilter] = useState('all')
+  const [sortBy, setSortBy] = useState('newest')
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(15)
   const [companies, setCompanies] = useState(null)
   const [contacts, setContacts] = useState(null)
   const [selected, setSelected] = useState(new Set())   // contact ids
@@ -34,6 +41,7 @@ export default function DatabasePage() {
   const [showAddCompany, setShowAddCompany] = useState(false)
   const [showAddContact, setShowAddContact] = useState(false)
   const [composeIds, setComposeIds] = useState(null)
+  const [linkedinContact, setLinkedinContact] = useState(null)
 
   const [loadError, setLoadError] = useState(null)
 
@@ -57,14 +65,77 @@ export default function DatabasePage() {
   useEffect(() => { load() }, [load])
 
   const q = search.trim().toLowerCase()
-  const filteredCompanies = useMemo(() =>
-    (companies || []).filter((c) =>
-      !q || [c.name, c.industry, c.summary, c.domain].some((v) => v?.toLowerCase().includes(q))),
-    [companies, q])
-  const filteredContacts = useMemo(() =>
-    (contacts || []).filter((c) =>
-      !q || [c.name, c.email, c.company_name, c.role].some((v) => v?.toLowerCase().includes(q))),
-    [contacts, q])
+  const filteredCompanies = useMemo(() => {
+    const rows = (companies || []).filter((c) => {
+      const matchesSearch = !q ||
+        [c.name, c.industry, c.summary, c.domain].some((v) => v?.toLowerCase().includes(q))
+      const matchesFilter = viewFilter === 'all'
+        || (viewFilter === 'researched' && c.scrape_status === 'scraped')
+        || (viewFilter === 'needs_research' && c.scrape_status !== 'scraped')
+        || (viewFilter === 'with_contacts' && Number(c.contact_count || 0) > 0)
+        || (viewFilter === 'without_contacts' && Number(c.contact_count || 0) === 0)
+      return matchesSearch && matchesFilter
+    })
+    return rows.sort((a, b) => {
+      if (sortBy === 'name') return (a.name || '').localeCompare(b.name || '')
+      if (sortBy === 'contacts') return Number(b.contact_count || 0) - Number(a.contact_count || 0)
+      if (sortBy === 'research') {
+        const rank = (c) => c.scrape_status === 'scraped' ? 1 : 0
+        return rank(a) - rank(b) || (a.name || '').localeCompare(b.name || '')
+      }
+      return (Date.parse(b.created_at || '') || 0) - (Date.parse(a.created_at || '') || 0)
+    })
+  }, [companies, q, sortBy, viewFilter])
+  const filteredContacts = useMemo(() => {
+    const rows = (contacts || []).filter((c) => {
+      const matchesSearch = !q ||
+        [c.name, c.email, c.company_name, c.role].some((v) => v?.toLowerCase().includes(q))
+      const matchesFilter = viewFilter === 'all'
+        || (viewFilter === 'active' && c.status !== 'archived')
+        || (viewFilter === 'uncontacted' && Number(c.email_count || 0) === 0)
+        || (viewFilter === 'replied' && Number(c.verified_reply_count || 0) > 0)
+        || (viewFilter === 'archived' && c.status === 'archived')
+      return matchesSearch && matchesFilter
+    })
+    return rows.sort((a, b) => {
+      if (sortBy === 'name') return (a.name || a.email || '').localeCompare(b.name || b.email || '')
+      if (sortBy === 'company') {
+        return (a.company_name || '').localeCompare(b.company_name || '')
+          || (a.name || a.email || '').localeCompare(b.name || b.email || '')
+      }
+      if (sortBy === 'status') return (a.status || '').localeCompare(b.status || '')
+      return (Date.parse(b.created_at || '') || 0) - (Date.parse(a.created_at || '') || 0)
+    })
+  }, [contacts, q, sortBy, viewFilter])
+
+  const activeRows = tab === 'companies' ? filteredCompanies : filteredContacts
+  const pageCount = Math.max(1, Math.ceil(activeRows.length / pageSize))
+  const currentPage = Math.min(page, pageCount)
+  const pageStart = (currentPage - 1) * pageSize
+  const pagedCompanies = filteredCompanies.slice(pageStart, pageStart + pageSize)
+  const pagedContacts = filteredContacts.slice(pageStart, pageStart + pageSize)
+
+  useEffect(() => {
+    if (page > pageCount) setPage(pageCount)
+  }, [page, pageCount])
+
+  const resetView = () => {
+    setPage(1)
+    setSelected(new Set())
+  }
+
+  const changeTab = (nextTab) => {
+    setTab(nextTab)
+    setSearch('')
+    setViewFilter('all')
+    setSortBy('newest')
+    resetView()
+  }
+
+  const changePage = (nextPage) => {
+    setPage(Math.max(1, Math.min(pageCount, nextPage)))
+    setSelected(new Set())
+  }
 
   const toggleContact = (id) => {
     setSelected((prev) => {
@@ -73,15 +144,15 @@ export default function DatabasePage() {
       return next
     })
   }
-  const allVisibleSelected = filteredContacts.length > 0 &&
-    filteredContacts.every((c) => selected.has(c.id))
+  const allVisibleSelected = pagedContacts.length > 0 &&
+    pagedContacts.every((c) => selected.has(c.id))
   const toggleAll = () => {
-    setSelected(allVisibleSelected ? new Set() : new Set(filteredContacts.map((c) => c.id)))
+    setSelected(allVisibleSelected ? new Set() : new Set(pagedContacts.map((c) => c.id)))
   }
 
   // Only ever act on rows the user can actually see. Selecting contacts, then
   // typing a search, must not leave hidden contacts armed for Delete/Generate.
-  const visibleIds = useMemo(() => new Set(filteredContacts.map((c) => c.id)), [filteredContacts])
+  const visibleIds = useMemo(() => new Set(pagedContacts.map((c) => c.id)), [pagedContacts])
   const actionable = useMemo(
     () => [...selected].filter((id) => visibleIds.has(id)), [selected, visibleIds])
 
@@ -125,7 +196,7 @@ export default function DatabasePage() {
       if (data.duplicates) parts.push(`${data.duplicates} already in your database`)
       if (data.invalid) {
         const sample = (data.invalid_samples || []).slice(0, 2).join(', ')
-        parts.push(`${data.invalid} with an invalid email${sample ? ` (e.g. ${sample})` : ''}`)
+        parts.push(`${data.invalid} with an invalid contact method${sample ? ` (e.g. ${sample})` : ''}`)
       }
       toast.success(
         `Imported ${data.added} contact${data.added === 1 ? '' : 's'}` +
@@ -139,7 +210,7 @@ export default function DatabasePage() {
   const loading = companies === null
 
   return (
-    <div className="page wide">
+    <div className="page wide database-page">
       <div className="page-head">
         <div>
           <div className="page-title">Database</div>
@@ -148,32 +219,78 @@ export default function DatabasePage() {
           </div>
         </div>
         <div className="page-actions">
-          <label className="btn btn-secondary" style={{ marginBottom: 0 }}>
+          <label className="btn btn-secondary btn-sm" style={{ marginBottom: 0 }}
+            title="Import a Reach contacts CSV or LinkedIn Connections export">
             <Upload size={14} /> Import CSV
             <input type="file" accept=".csv" hidden
               onChange={(e) => { importCsv(e.target.files[0]); e.target.value = '' }} />
           </label>
-          <Button icon={Download} onClick={() => window.open(contactsAPI.exportUrl(), '_blank')}>
+          <Button size="sm" icon={Download} onClick={() => window.open(contactsAPI.exportUrl(), '_blank')}>
             Export
           </Button>
           {tab === 'companies' ? (
-            <Button variant="primary" icon={Plus} onClick={() => setShowAddCompany(true)}>Add company</Button>
+            <Button size="sm" variant="primary" icon={Plus} onClick={() => setShowAddCompany(true)}>Add company</Button>
           ) : (
-            <Button variant="primary" icon={Plus} onClick={() => setShowAddContact(true)}>Add contact</Button>
+            <Button size="sm" variant="primary" icon={Plus} onClick={() => setShowAddContact(true)}>Add contact</Button>
           )}
         </div>
       </div>
 
-      <div className="row-between mb-16">
-        <Segmented
-          value={tab}
-          onChange={(t) => { setTab(t); }}
-          options={[
-            { value: 'companies', label: 'Companies', count: companies?.length ?? 0 },
-            { value: 'contacts', label: 'Contacts', count: contacts?.length ?? 0 },
-          ]}
-        />
-        <div className="row">
+      <div className="database-toolbar">
+        <div className="database-toolbar-group">
+          <Segmented
+            value={tab}
+            onChange={changeTab}
+            options={[
+              { value: 'companies', label: 'Companies', count: companies?.length ?? 0 },
+              { value: 'contacts', label: 'Contacts', count: contacts?.length ?? 0 },
+            ]}
+          />
+          <select
+            className="select compact-select"
+            aria-label={`Filter ${tab}`}
+            value={viewFilter}
+            onChange={(e) => { setViewFilter(e.target.value); resetView() }}
+          >
+            <option value="all">All {tab}</option>
+            {tab === 'companies' ? (
+              <>
+                <option value="researched">Researched</option>
+                <option value="needs_research">Needs research</option>
+                <option value="with_contacts">Has contacts</option>
+                <option value="without_contacts">No contacts</option>
+              </>
+            ) : (
+              <>
+                <option value="active">Active</option>
+                <option value="uncontacted">Not contacted</option>
+                <option value="replied">Replied</option>
+                <option value="archived">Archived</option>
+              </>
+            )}
+          </select>
+          <select
+            className="select compact-select"
+            aria-label={`Sort ${tab}`}
+            value={sortBy}
+            onChange={(e) => { setSortBy(e.target.value); resetView() }}
+          >
+            <option value="newest">Newest</option>
+            <option value="name">A–Z</option>
+            {tab === 'companies' ? (
+              <>
+                <option value="research">Needs research first</option>
+                <option value="contacts">Most contacts</option>
+              </>
+            ) : (
+              <>
+                <option value="company">By company</option>
+                <option value="status">By status</option>
+              </>
+            )}
+          </select>
+        </div>
+        <div className="database-toolbar-group">
           {tab === 'contacts' && actionable.length > 0 && (
             <>
               <span className="small muted">{actionable.length} selected</span>
@@ -183,10 +300,10 @@ export default function DatabasePage() {
               </Button>
             </>
           )}
-          <div className="search-wrap" style={{ width: 260 }}>
+          <div className="search-wrap database-search">
             <Search size={14} />
             <input className="input" placeholder={`Search ${tab}…`} value={search}
-              onChange={(e) => setSearch(e.target.value)} />
+              onChange={(e) => { setSearch(e.target.value); resetView() }} />
           </div>
         </div>
       </div>
@@ -204,47 +321,60 @@ export default function DatabasePage() {
             action={<Button variant="primary" icon={RefreshCw} onClick={load}>Try again</Button>}
           />
         </div>
-      ) : tab === 'companies' ? (
-        <CompaniesTable
-          companies={filteredCompanies}
-          onOpen={async (c) => {
-            try { setDrawerCompany((await companiesAPI.get(c.id)).data) }
-            catch (e) { toast.error(errMessage(e)) }
-          }}
-          onDiscover={() => navigate('discover')}
-          anyData={(companies || []).length > 0}
-        />
       ) : (
-        <ContactsTable
-          contacts={filteredContacts}
-          selected={selected}
-          onToggle={toggleContact}
-          onToggleAll={toggleAll}
-          allSelected={allVisibleSelected}
-          onCompose={(id) => setComposeIds([id])}
-          onArchive={toggleArchive}
-          onDelete={async (c) => {
-            if (!window.confirm(`Delete ${c.name || c.email}?`)) return
-            try {
-              await contactsAPI.delete(c.id)
-              toast.success('Contact deleted')
-              load()
-            } catch (e) {
-              // 409 = has sent history; offer an explicit second confirmation
-              if (e?.response?.status === 409 && window.confirm(`${errMessage(e)}\n\nDelete anyway?`)) {
+        <div className="database-results">
+          {tab === 'companies' ? (
+            <CompaniesTable
+              companies={pagedCompanies}
+              onOpen={async (c) => {
+                try { setDrawerCompany((await companiesAPI.get(c.id)).data) }
+                catch (e) { toast.error(errMessage(e)) }
+              }}
+              onDiscover={() => navigate('discover')}
+              anyData={(companies || []).length > 0}
+            />
+          ) : (
+            <ContactsTable
+              contacts={pagedContacts}
+              selected={selected}
+              onToggle={toggleContact}
+              onToggleAll={toggleAll}
+              allSelected={allVisibleSelected}
+              onCompose={(id) => setComposeIds([id])}
+              onLinkedIn={setLinkedinContact}
+              onArchive={toggleArchive}
+              onDelete={async (c) => {
+                if (!window.confirm(`Delete ${c.name || c.email}?`)) return
                 try {
-                  await contactsAPI.delete(c.id, true)
-                  toast.success('Contact and its email history deleted')
+                  await contactsAPI.delete(c.id)
+                  toast.success('Contact deleted')
                   load()
-                } catch (e2) { toast.error(errMessage(e2)) }
-              } else if (e?.response?.status !== 409) {
-                toast.error(errMessage(e))
-              }
-            }
-          }}
-          onDiscover={() => navigate('discover')}
-          anyData={(contacts || []).length > 0}
-        />
+                } catch (e) {
+                  // 409 = has sent history; offer an explicit second confirmation
+                  if (e?.response?.status === 409 && window.confirm(`${errMessage(e)}\n\nDelete anyway?`)) {
+                    try {
+                      await contactsAPI.delete(c.id, true)
+                      toast.success('Contact and its email history deleted')
+                      load()
+                    } catch (e2) { toast.error(errMessage(e2)) }
+                  } else if (e?.response?.status !== 409) {
+                    toast.error(errMessage(e))
+                  }
+                }
+              }}
+              onDiscover={() => navigate('discover')}
+              anyData={(contacts || []).length > 0}
+            />
+          )}
+          <PaginationBar
+            page={currentPage}
+            pageCount={pageCount}
+            pageSize={pageSize}
+            total={activeRows.length}
+            onPage={changePage}
+            onPageSize={(size) => { setPageSize(size); resetView() }}
+          />
+        </div>
       )}
 
       {drawerCompany && (
@@ -271,6 +401,12 @@ export default function DatabasePage() {
         <ComposeModal contactIds={composeIds} onClose={() => setComposeIds(null)}
           onDone={() => { setSelected(new Set()); load() }} />
       )}
+      {linkedinContact && (
+        <LinkedInMessageModal
+          contact={linkedinContact}
+          onClose={() => setLinkedinContact(null)}
+        />
+      )}
     </div>
   )
 }
@@ -284,19 +420,20 @@ function CompaniesTable({ companies, onOpen, onDiscover, anyData }) {
         <EmptyState
           icon={Building2}
           title={anyData ? 'No companies match your search' : 'No companies yet'}
-          desc={anyData ? 'Try a different search term.' : 'Discover companies with AI search, or add one manually.'}
+          desc={anyData ? 'Try a different search or filter.' : 'Discover companies with AI search, or add one manually.'}
           action={!anyData && <Button variant="primary" onClick={onDiscover}>Discover companies</Button>}
         />
       </div>
     )
   }
   return (
-    <div className="card table-wrap">
-      <table className="table">
+    <div className="card database-table-card">
+      <div className="database-table-scroll">
+      <table className="table database-table companies-table">
         <thead>
           <tr>
             <th>Company</th><th>Industry</th><th>Research</th>
-            <th>Contacts</th><th>Sent</th><th>Replies</th><th>Added</th>
+            <th>Contacts</th><th>Sent</th><th>Replies</th>
           </tr>
         </thead>
         <tbody>
@@ -306,7 +443,7 @@ function CompaniesTable({ companies, onOpen, onDiscover, anyData }) {
               <tr key={c.id} className="clickable" onClick={() => onOpen(c)}>
                 <td>
                   <div className="row" style={{ gap: 10 }}>
-                    <div className="company-favicon" style={{ width: 30, height: 30, fontSize: 12.5 }}>
+                    <div className="company-favicon compact-favicon">
                       {initials(c.name)}
                     </div>
                     <div>
@@ -315,7 +452,7 @@ function CompaniesTable({ companies, onOpen, onDiscover, anyData }) {
                     </div>
                   </div>
                 </td>
-                <td className="td-dim">{c.industry || '—'}</td>
+                <td className="td-dim truncate-cell">{c.industry || '—'}</td>
                 <td><Chip tone={st.tone}>{st.label}</Chip></td>
                 <td>{c.contact_count}</td>
                 <td>{c.sent_count}</td>
@@ -330,41 +467,42 @@ function CompaniesTable({ companies, onOpen, onDiscover, anyData }) {
                       </Chip>
                       : <span className="muted">0</span>}
                 </td>
-                <td className="td-dim">{timeAgo(c.created_at)}</td>
               </tr>
             )
           })}
         </tbody>
       </table>
+      </div>
     </div>
   )
 }
 
 /* ---------- contacts table ---------- */
 
-function ContactsTable({ contacts, selected, onToggle, onToggleAll, allSelected, onCompose, onDelete, onArchive, onDiscover, anyData }) {
+function ContactsTable({ contacts, selected, onToggle, onToggleAll, allSelected, onCompose, onLinkedIn, onDelete, onArchive, onDiscover, anyData }) {
   if (contacts.length === 0) {
     return (
       <div className="card">
         <EmptyState
           icon={Users}
           title={anyData ? 'No contacts match your search' : 'No contacts yet'}
-          desc={anyData ? 'Try a different search term.' : 'Contacts appear automatically when discovery finds emails, or import a CSV.'}
+          desc={anyData ? 'Try a different search or filter.' : 'Contacts appear when research finds an email or a LinkedIn profile on the company site.'}
           action={!anyData && <Button variant="primary" onClick={onDiscover}>Discover companies</Button>}
         />
       </div>
     )
   }
   return (
-    <div className="card table-wrap">
-      <table className="table">
+    <div className="card database-table-card">
+      <div className="database-table-scroll">
+      <table className="table database-table contacts-table">
         <thead>
           <tr>
             <th style={{ width: 34 }}>
               <input type="checkbox" className="checkbox" checked={allSelected} onChange={onToggleAll} />
             </th>
             <th>Contact</th><th>Company</th><th>Role</th><th>Status</th>
-            <th>Emails</th><th>Added</th><th style={{ width: 80 }}></th>
+            <th style={{ width: 112 }}></th>
           </tr>
         </thead>
         <tbody>
@@ -386,15 +524,21 @@ function ContactsTable({ contacts, selected, onToggle, onToggleAll, allSelected,
                     )}
                   </div>
                   <div className="td-sub mono">{c.email || 'no email'}</div>
+                  {c.affinity && <div className="td-sub warm-match">{c.affinity}</div>}
                 </td>
-                <td className="td-dim">{c.company_name || '—'}</td>
-                <td className="td-dim">{c.role || '—'}</td>
+                <td className="td-dim truncate-cell">{c.company_name || '—'}</td>
+                <td className="td-dim truncate-cell">{c.role || '—'}</td>
                 <td><Chip tone={st.tone} title={st.title}>{st.label}</Chip></td>
-                <td>{c.email_count || 0}</td>
-                <td className="td-dim">{timeAgo(c.created_at)}</td>
                 <td>
                   <div className="row" style={{ gap: 2, justifyContent: 'flex-end' }}>
-                    <button className="icon-btn" title="Generate email" onClick={() => onCompose(c.id)}>
+                    {c.linkedin_url && (
+                      <button className="icon-btn linkedin-action" title="Draft LinkedIn message"
+                        onClick={() => onLinkedIn(c)}>
+                        <MessageSquare size={14} />
+                      </button>
+                    )}
+                    <button className="icon-btn" title={c.email ? 'Generate email' : 'No email address found'}
+                      disabled={!c.email} onClick={() => onCompose(c.id)}>
                       <Sparkles size={14} />
                     </button>
                     <button className="icon-btn"
@@ -412,6 +556,41 @@ function ContactsTable({ contacts, selected, onToggle, onToggleAll, allSelected,
           })}
         </tbody>
       </table>
+      </div>
+    </div>
+  )
+}
+
+function PaginationBar({ page, pageCount, pageSize, total, onPage, onPageSize }) {
+  const start = total === 0 ? 0 : (page - 1) * pageSize + 1
+  const end = Math.min(total, page * pageSize)
+  return (
+    <div className="database-pager">
+      <span>{start}–{end} of {total}</span>
+      <div className="database-pager-controls">
+        <label className="database-page-size">
+          Rows
+          <select
+            className="select compact-select"
+            aria-label="Rows per page"
+            value={pageSize}
+            onChange={(e) => onPageSize(Number(e.target.value))}
+          >
+            {PAGE_SIZE_OPTIONS.map((size) => (
+              <option key={size} value={size}>{size}</option>
+            ))}
+          </select>
+        </label>
+        <span>Page {page} of {pageCount}</span>
+        <button className="icon-btn" aria-label="Previous page"
+          disabled={page <= 1} onClick={() => onPage(page - 1)}>
+          <ChevronLeft size={15} />
+        </button>
+        <button className="icon-btn" aria-label="Next page"
+          disabled={page >= pageCount} onClick={() => onPage(page + 1)}>
+          <ChevronRight size={15} />
+        </button>
+      </div>
     </div>
   )
 }
@@ -676,13 +855,13 @@ function AddCompanyModal({ onClose, onAdded }) {
 }
 
 function AddContactModal({ companies, onClose, onAdded }) {
-  const [form, setForm] = useState({ name: '', email: '', role: '', company_id: '', company_name: '' })
+  const [form, setForm] = useState({ name: '', email: '', linkedin_url: '', role: '', company_id: '', company_name: '' })
   const [saving, setSaving] = useState(false)
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }))
 
   const save = async () => {
-    if (!form.email.trim() && !form.name.trim()) {
-      toast.error('A contact needs at least a name or an email')
+    if (!form.email.trim() && !form.linkedin_url.trim() && !form.name.trim()) {
+      toast.error('A contact needs a name, email, or LinkedIn profile')
       return
     }
     setSaving(true)
@@ -690,6 +869,7 @@ function AddContactModal({ companies, onClose, onAdded }) {
       await contactsAPI.create({
         name: form.name.trim(),
         email: form.email.trim(),
+        linkedin_url: form.linkedin_url.trim() || null,
         role: form.role.trim() || null,
         company_id: form.company_id || null,
         company_name: form.company_id ? null : (form.company_name.trim() || null),
@@ -721,6 +901,12 @@ function AddContactModal({ companies, onClose, onAdded }) {
         <input className="input" type="email" value={form.email} onChange={(e) => set('email', e.target.value)} placeholder="jane@company.com" />
       </div>
       <div className="field">
+        <div className="field-label">LinkedIn profile</div>
+        <input className="input" type="url" value={form.linkedin_url}
+          onChange={(e) => set('linkedin_url', e.target.value)}
+          placeholder="https://www.linkedin.com/in/..." />
+      </div>
+      <div className="field">
         <div className="field-label">Company</div>
         <select className="select" value={form.company_id} onChange={(e) => set('company_id', e.target.value)}>
           <option value="">— New or none —</option>
@@ -732,6 +918,89 @@ function AddContactModal({ companies, onClose, onAdded }) {
           <div className="field-label">New company name (optional)</div>
           <input className="input" value={form.company_name} onChange={(e) => set('company_name', e.target.value)}
             placeholder="Creates the company and researches it later" />
+        </div>
+      )}
+    </Modal>
+  )
+}
+
+function LinkedInMessageModal({ contact, onClose }) {
+  const [message, setMessage] = useState('')
+  const [instructions, setInstructions] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [copied, setCopied] = useState(false)
+
+  const generate = useCallback(async () => {
+    setLoading(true)
+    try {
+      const { data } = await contactsAPI.linkedinDraft(
+        contact.id, instructions.trim() || null)
+      setMessage(data.message)
+    } catch (e) {
+      toast.error(errMessage(e, 'Could not draft LinkedIn message'))
+    } finally {
+      setLoading(false)
+    }
+  }, [contact.id, instructions])
+
+  useEffect(() => { generate() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(message)
+      setCopied(true)
+      toast.success('Message copied')
+      window.setTimeout(() => setCopied(false), 1600)
+    } catch {
+      toast.error('Copy failed — select the message and copy it manually')
+    }
+  }
+
+  const openProfile = () => {
+    window.open(contact.linkedin_url, '_blank', 'noopener,noreferrer')
+  }
+
+  return (
+    <Modal title={`Message ${contact.name || 'contact'} on LinkedIn`} onClose={onClose}
+      footer={<>
+        <Button icon={copied ? Check : Copy} onClick={copy} disabled={!message}>
+          {copied ? 'Copied' : 'Copy message'}
+        </Button>
+        <Button variant="primary" icon={ExternalLink} onClick={openProfile}>
+          Open profile to send
+        </Button>
+      </>}>
+      <div className="linkedin-manual-note">
+        This prepares the message and opens the verified profile. You review it and click Send in LinkedIn.
+      </div>
+      <div className="field">
+        <div className="field-label">Optional direction</div>
+        <div className="row" style={{ gap: 8 }}>
+          <input className="input grow" value={instructions}
+            onChange={(e) => setInstructions(e.target.value)}
+            placeholder="e.g. Ask about engineering internships" />
+          <Button onClick={generate} disabled={loading}>
+            {loading ? 'Drafting…' : 'Redraft'}
+          </Button>
+        </div>
+      </div>
+      <div className="field">
+        <div className="field-label">Message</div>
+        <textarea className="textarea linkedin-draft" value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          placeholder={loading ? 'Drafting…' : 'Write a message…'} />
+        <div className="field-hint">{message.length}/700 characters</div>
+      </div>
+      {(contact.affinity || contact.source_url) && (
+        <div className="linkedin-evidence">
+          {contact.affinity && <div><b>Warm match:</b> {contact.affinity}</div>}
+          {contact.source_url && (
+            <div><b>Found on:</b>{' '}
+              <a href={contact.source_url} target="_blank" rel="noreferrer">
+                company source <ExternalLink size={11} />
+              </a>
+            </div>
+          )}
         </div>
       )}
     </Modal>

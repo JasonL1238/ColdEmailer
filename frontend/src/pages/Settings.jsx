@@ -11,6 +11,11 @@ const FIELDS = [
   { key: 'email', label: 'Email', placeholder: 'you@school.edu', hint: 'The From address your emails send from. Kept out of the signature — the recipient already sees it' },
   { key: 'phone', label: 'Phone', placeholder: '555-000-0000' },
   { key: 'school', label: 'School / affiliation', placeholder: 'University of…' },
+  {
+    key: 'affiliations', label: 'Past employers / communities', span2: true,
+    textarea: true, placeholder: 'One per line, e.g. Penn Labs, Microsoft, Stripe',
+    hint: 'Research flags leaders whose public company bio mentions one of these.',
+  },
   { key: 'website', label: 'Website', placeholder: 'https://yoursite.com', span2: true },
   {
     key: 'background', label: 'Background one-liner', span2: true, textarea: true,

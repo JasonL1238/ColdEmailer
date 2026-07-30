@@ -269,6 +269,144 @@ a:hover { text-decoration: underline; }
 .td-dim { color: var(--text-2); }
 .checkbox { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
 
+/* compact database browser */
+.database-page {
+  height: 100%;
+  min-height: 0;
+  padding-top: 20px;
+  padding-bottom: 18px;
+  display: flex;
+  flex-direction: column;
+}
+.database-page .page-head { margin-bottom: 12px; }
+.database-page .page-desc { font-size: 12.5px; }
+.database-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.database-toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.compact-select {
+  width: auto;
+  min-width: 128px;
+  padding: 6px 28px 6px 9px;
+  font-size: 12.5px;
+}
+.database-search { width: min(240px, 30vw); }
+.database-search .input { padding-top: 6px; padding-bottom: 6px; font-size: 12.5px; }
+.database-results {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.database-table-card {
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-md);
+}
+.database-table-scroll { min-height: 0; flex: 1; overflow: auto; }
+.database-table { min-width: 780px; table-layout: fixed; }
+.contacts-table { min-width: 680px; }
+.database-table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 7px 11px;
+  font-size: 10.5px;
+}
+.database-table td {
+  padding: 6px 11px;
+  height: 43px;
+  line-height: 1.25;
+}
+.companies-table th:first-child,
+.companies-table td:first-child { width: 28%; }
+.contacts-table th:nth-child(2),
+.contacts-table td:nth-child(2) { width: 25%; }
+.contacts-table th:nth-child(3),
+.contacts-table td:nth-child(3) { width: 20%; }
+.contacts-table th:nth-child(4),
+.contacts-table td:nth-child(4) { width: 16%; }
+.database-table .td-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.database-table .td-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compact-favicon {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  font-size: 11px;
+}
+.truncate-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.database-table .chip { padding: 2px 7px; font-size: 10.5px; }
+.database-table .icon-btn { width: 25px; height: 25px; }
+.database-pager {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-3);
+  font-size: 11.5px;
+  padding: 0 4px;
+}
+.database-pager-controls,
+.database-page-size {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.database-page-size .compact-select { min-width: 58px; padding-right: 22px; }
+.database-pager .icon-btn:disabled { opacity: 0.35; cursor: default; }
+.database-table .icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.linkedin-action { color: #0a66c2; }
+.warm-match {
+  color: #8a5800;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.linkedin-manual-note,
+.linkedin-evidence {
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.linkedin-draft { min-height: 150px; resize: vertical; }
+.linkedin-evidence a {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
 /* segmented control */
 .segmented {
   display: inline-flex;
@@ -597,4 +735,21 @@ a:hover { text-decoration: underline; }
   .type-grid { grid-template-columns: 1fr; }
   .sidebar { width: 64px; }
   .brand-name, .brand-sub, .nav-item span, .nav-section, .nav-foot { display: none; }
+  .database-page { padding: 16px 18px; }
+  .database-page .page-head { align-items: center; }
+  .database-page .page-desc { display: none; }
+  .database-toolbar { align-items: stretch; }
+  .database-toolbar-group { flex-wrap: wrap; }
+  .database-search { width: min(100%, 280px); }
+}
+
+@media (max-width: 680px) {
+  .database-page .page-head { flex-direction: column; align-items: stretch; }
+  .database-page .page-actions { flex-wrap: wrap; }
+  .database-toolbar,
+  .database-toolbar-group { width: 100%; }
+  .database-toolbar-group .segmented { flex-shrink: 0; }
+  .database-search { width: 100%; }
+  .database-pager { align-items: flex-start; }
+  .database-page-size { display: none; }
 }
