@@ -62,7 +62,20 @@ cp .env.example .env
 - `GOOGLE_AI_API_KEY` — Gemini, has a free tier, recommended
 - `OPENAI_API_KEY` or `OPENROUTER_API_KEY` — alternatives
 
-Without a key the app still runs: emails fall back to plain templates and discovery relies on web search alone.
+### Running without any AI key
+
+The app works keyless, with a narrower feature set. Nothing silently degrades — the UI shows which mode you are in:
+
+| | With a key | No key |
+|---|---|---|
+| Find companies | LLM suggests them, web search cross-checks | Web search only — noisier, returns some VCs and directories alongside real companies |
+| Company research | Structured profile (product, industry, hook, recent news) | Summary only, taken from the first lines of the scraped page |
+| Contact email scraping | ✅ | ✅ identical |
+| Application / coffee chat / sales emails | Written per company | Filled-in template, still personalized with the scraped summary and your profile |
+| Custom emails | ✅ | ✗ refused rather than ignoring your instructions |
+| Send, attachments, reply tracking, follow-ups | ✅ | ✅ identical |
+
+Keyless discovery depends on the `ddgs` package. If searches return nothing, check it is installed (`pip install -r requirements.txt`) — the older `duckduckgo-search` package is deprecated and silently returns zero results.
 
 ### 2. Gmail (required for sending)
 

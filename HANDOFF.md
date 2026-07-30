@@ -69,6 +69,13 @@ Rebuilt from a CSV/JSON pipeline onto SQLite. Architecture and setup are in
    was ever committed, it should be rotated. Not audited.
 4. Legacy migration reads `backend/backend/data/` (a nested duplicate path).
    Harmless, but odd — could be cleaned up once no one needs re-migration.
+5. **`google-generativeai` is deprecated** upstream in favour of `google-genai`.
+   It still works (the app runs on it today), but the SDK will stop getting
+   fixes. Migration touches only `llm_client.py`.
+6. Keyless discovery quality is mediocre — web search alone returns VC firms
+   and startup directories alongside real companies. `discovery.py` has
+   `AGGREGATOR_DOMAINS` and `is_junk_site()` to filter these; both could be
+   extended.
 
 ## Suggested prompt for the next session
 
