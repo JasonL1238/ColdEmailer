@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, "data", "coldemailer.db")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS companies (
     why_care    TEXT,
     location    TEXT,
     discovery_note TEXT,
+    research_sources TEXT,
+    pages_scraped INTEGER DEFAULT 0,
+    pages_attempted INTEGER DEFAULT 0,
+    research_quality TEXT DEFAULT 'low',
     source      TEXT DEFAULT 'manual',
     job_id      TEXT,
     scraped_at  TEXT,
@@ -143,7 +147,13 @@ _ADDED_COLUMNS = {
     # Why the search matched this company, per the model that suggested it.
     # Kept apart from `summary` on purpose: summary is scraped evidence and is
     # quoted into emails, this is an unverified guess and must not be.
-    "companies": {"discovery_note": "TEXT"},
+    "companies": {
+        "discovery_note": "TEXT",
+        "research_sources": "TEXT",
+        "pages_scraped": "INTEGER DEFAULT 0",
+        "pages_attempted": "INTEGER DEFAULT 0",
+        "research_quality": "TEXT DEFAULT 'low'",
+    },
 }
 
 
@@ -332,6 +342,10 @@ class Database:
             "why_care": kwargs.get("why_care"),
             "location": kwargs.get("location"),
             "discovery_note": kwargs.get("discovery_note"),
+            "research_sources": json.dumps(kwargs.get("research_sources") or []),
+            "pages_scraped": int(kwargs.get("pages_scraped") or 0),
+            "pages_attempted": int(kwargs.get("pages_attempted") or 0),
+            "research_quality": kwargs.get("research_quality") or "low",
             "source": kwargs.get("source", "manual"),
             "job_id": kwargs.get("job_id"),
             "scraped_at": kwargs.get("scraped_at"),
@@ -340,23 +354,44 @@ class Database:
             "updated_at": ts,
         }
         self._insert("companies", data)
-        return data
+        return self._decode_company(data)
+
+    @staticmethod
+    def _decode_company(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        out = dict(row)
+        raw = out.get("research_sources")
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                out["research_sources"] = parsed if isinstance(parsed, list) else []
+            except (TypeError, ValueError):
+                out["research_sources"] = []
+        elif raw is None:
+            out["research_sources"] = []
+        return out
 
     def get_company(self, company_id: str) -> Optional[Dict[str, Any]]:
-        return self.query_one("SELECT * FROM companies WHERE id=?", (company_id,))
+        return self._decode_company(
+            self.query_one("SELECT * FROM companies WHERE id=?", (company_id,)))
 
     def find_company_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        return self.query_one(
+        return self._decode_company(self.query_one(
             "SELECT * FROM companies WHERE name=? COLLATE NOCASE", (name.strip(),)
-        )
+        ))
 
     def find_company_by_domain(self, domain: str) -> Optional[Dict[str, Any]]:
         if not domain:
             return None
-        return self.query_one("SELECT * FROM companies WHERE domain=?", (domain.lower(),))
+        return self._decode_company(self.query_one(
+            "SELECT * FROM companies WHERE domain=?", (domain.lower(),)))
 
     def update_company(self, company_id: str, updates: Dict[str, Any]):
         updates = dict(updates)
+        if "research_sources" in updates and not isinstance(
+                updates["research_sources"], str):
+            updates["research_sources"] = json.dumps(updates["research_sources"] or [])
         updates["updated_at"] = now_iso()
         self._update("companies", company_id, updates)
 
@@ -387,7 +422,7 @@ class Database:
             like = f"%{search}%"
             params = (like, like, like)
         sql += " ORDER BY c.created_at DESC"
-        return self.query(sql, params)
+        return [self._decode_company(row) for row in self.query(sql, params)]
 
     # ---------- contacts ----------
 

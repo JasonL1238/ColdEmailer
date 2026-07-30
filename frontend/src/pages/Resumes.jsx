@@ -1,7 +1,10 @@
 /* Resume versions: upload PDFs, label them, pick a default */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
-import { FileText, Star, Trash2, Download, Pencil, UploadCloud, Check } from 'lucide-react'
+import {
+  FileText, Star, Trash2, Download, Pencil, UploadCloud, Check,
+  Eye, ExternalLink,
+} from 'lucide-react'
 import { resumesAPI, errMessage } from '../api'
 import { Button, Chip, EmptyState, Modal, fmtDate } from '../ui'
 
@@ -9,6 +12,7 @@ export default function Resumes() {
   const [resumes, setResumes] = useState(null)
   const [drag, setDrag] = useState(false)
   const [renaming, setRenaming] = useState(null)
+  const [previewing, setPreviewing] = useState(null)
   const inputRef = useRef(null)
 
   const load = useCallback(async () => {
@@ -129,8 +133,12 @@ export default function Resumes() {
                 )}
                 <div className="row" style={{ gap: 4 }}>
                   <button className="icon-btn" title="Rename" onClick={() => setRenaming(r)}><Pencil size={14} /></button>
-                  <button className="icon-btn" title="Download"
-                    onClick={() => window.open(resumesAPI.fileUrl(r.id), '_blank')}>
+                  <button className="icon-btn" title="Preview PDF" aria-label={`Preview ${r.label}`}
+                    onClick={() => setPreviewing(r)}>
+                    <Eye size={14} />
+                  </button>
+                  <button className="icon-btn" title="Download PDF" aria-label={`Download ${r.label}`}
+                    onClick={() => window.open(resumesAPI.downloadUrl(r.id), '_blank')}>
                     <Download size={14} />
                   </button>
                   <button className="icon-btn danger" title="Delete" onClick={() => remove(r)}><Trash2 size={14} /></button>
@@ -144,6 +152,25 @@ export default function Resumes() {
       {renaming && (
         <RenameModal resume={renaming} onClose={() => setRenaming(null)}
           onSaved={() => { setRenaming(null); load() }} />
+      )}
+      {previewing && (
+        <Modal title={previewing.label} onClose={() => setPreviewing(null)} large
+          footer={<>
+            <Button variant="ghost" icon={ExternalLink}
+              onClick={() => window.open(resumesAPI.fileUrl(previewing.id), '_blank')}>
+              Open in new tab
+            </Button>
+            <Button icon={Download}
+              onClick={() => window.open(resumesAPI.downloadUrl(previewing.id), '_blank')}>
+              Download
+            </Button>
+          </>}>
+          <iframe
+            className="pdf-preview"
+            title={`${previewing.label} PDF preview`}
+            src={resumesAPI.fileUrl(previewing.id)}
+          />
+        </Modal>
       )}
     </div>
   )

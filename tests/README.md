@@ -6,7 +6,7 @@
 cd tests && ../backend/venv/bin/python -m pytest
 ```
 
-366 tests. `conftest.py` points `COLD_DB_PATH` at a throwaway database and stubs
+393 tests. `conftest.py` points `COLD_DB_PATH` at a throwaway database and stubs
 the Gmail credential paths, so the suite never touches real data or sends mail.
 
 | File | Covers |
@@ -24,6 +24,8 @@ the Gmail credential paths, so the suite never touches real data or sends mail.
 | `test_company_identity.py` | A search hit only becomes the company's site if it demonstrably belongs to them |
 | `test_junk_sites.py` | Parked pages, aggregators and content farms are rejected as company sites |
 | `test_outreach_selection.py` | Prefers the company's own domain; flags addresses that belong to someone else |
+| `test_scraping_rigor.py` | Nonstandard navigation, obfuscated emails, grounded senior/UPenn ranking, domain safety, crawl coverage |
+| `test_pdf_viewing.py` | Inline PDF preview versus explicit attachment download |
 | `test_discovery_note.py` | The model's guess at why a company matched is never quoted as research |
 | `test_data_safety.py` | Data-loss and quota-integrity guards (CSV handling, destructive deletes) |
 
@@ -33,7 +35,7 @@ the Gmail credential paths, so the suite never touches real data or sends mail.
 cd frontend && npm test
 ```
 
-48 tests over the API client's request shapes and the screens where a wrong
+49 tests over the API client's request shapes and the screens where a wrong
 render would cause a real mistake: the compose modal, the company drawer, and
 the email list's delivered / attachment-claim / reply-verification / send-safety
 states.

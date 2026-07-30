@@ -2,11 +2,14 @@
 Company enrichment: scrape a company's site, extract structured metadata
 (cloud LLM first, heuristic fallback) and contact email addresses.
 """
+import html as html_lib
 import re
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
+
+from bs4 import BeautifulSoup
 
 from web_scraper import WebScraper, is_safe_public_url
 
@@ -16,8 +19,26 @@ except ImportError:
     complete_json = None
     get_cloud_llm_provider = lambda: None
 
-# Pages likely to contain company info / contact emails
-SUBPAGES = ["/about", "/about-us", "/company", "/contact", "/contact-us", "/team", "/careers"]
+# Fallbacks for sites whose home page exposes no usable navigation. Normal
+# crawling follows the site's real links instead of assuming these paths exist.
+SUBPAGES = [
+    "/about", "/about-us", "/company", "/contact", "/contact-us", "/team",
+    "/leadership", "/people", "/careers", "/news", "/press", "/blog",
+]
+
+MAX_PAGES_FETCHED = 8
+MAX_PAGE_ATTEMPTS = 16
+
+_LINK_PRIORITY = {
+    "leadership": 0, "team": 0, "people": 0, "founder": 0, "management": 0,
+    "about": 1, "company": 1, "who-we-are": 1,
+    "contact": 2, "careers": 2, "jobs": 2,
+    "press": 3, "news": 3, "blog": 4, "insights": 4,
+}
+_SKIP_PATH_WORDS = {
+    "login", "signin", "sign-in", "signup", "sign-up", "privacy", "terms",
+    "legal", "cookies", "cart", "checkout", "account", "docs", "documentation",
+}
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
@@ -111,24 +132,100 @@ def page_mentions_company(company_name: str, text: str) -> bool:
 
 
 def extract_emails_from_html(html: str) -> List[str]:
-    """All plausible email addresses in a page (mailto links + visible text)."""
+    """All plausible addresses, including common public obfuscation schemes."""
     if not html:
         return []
     found = []
     seen = set()
+    decoded = html_lib.unescape(html)
+
+    # Cloudflare's email-protection markup stores an XOR-encoded address.
+    for encoded in re.findall(
+            r'(?:data-cfemail=["\']|/cdn-cgi/l/email-protection#)([0-9a-f]+)',
+            decoded, re.IGNORECASE):
+        try:
+            key = int(encoded[:2], 16)
+            addr = "".join(
+                chr(int(encoded[i:i + 2], 16) ^ key)
+                for i in range(2, len(encoded), 2)
+            )
+            if EMAIL_RE.fullmatch(addr):
+                found.append(addr)
+        except (ValueError, IndexError):
+            continue
+
     # mailto: links first — highest signal
-    for m in re.finditer(r'mailto:([^"\'\s?>]+)', html, re.IGNORECASE):
-        addr = m.group(1).strip().rstrip(".,;")
+    for m in re.finditer(r'mailto:([^"\'\s?>]+)', decoded, re.IGNORECASE):
+        addr = m.group(1).split("?", 1)[0].strip().rstrip(".,;")
         if EMAIL_RE.fullmatch(addr) and addr.lower() not in seen:
             seen.add(addr.lower())
             found.append(addr)
+
+    # "jane [at] acme [dot] com" and the equivalent parenthesized/plain forms.
+    # Requiring a full local/domain/TLD shape avoids turning ordinary prose
+    # containing the words "at" and "dot" into addresses.
+    visible = BeautifulSoup(decoded, "html.parser").get_text(" ", strip=True)
+    obfuscated_re = re.compile(
+        r"\b([A-Z0-9._%+-]+)\s*(?:\[at\]|\(at\)|\bat\b)\s*"
+        r"([A-Z0-9-]+(?:\.[A-Z0-9-]+)*)\s*"
+        r"(?:\[dot\]|\(dot\)|\bdot\b)\s*([A-Z]{2,24})\b",
+        re.IGNORECASE,
+    )
+    for m in obfuscated_re.finditer(visible):
+        domain = f"{m.group(2)}.{m.group(3)}"
+        addr = f"{m.group(1)}@{domain}"
+        if EMAIL_RE.fullmatch(addr):
+            found.append(addr)
+
     # then any email-looking text
-    for m in EMAIL_RE.finditer(html):
+    for m in EMAIL_RE.finditer(decoded):
         addr = m.group(0).strip().rstrip(".,;")
         if addr.lower() not in seen:
             seen.add(addr.lower())
             found.append(addr)
-    return [a for a in found if _is_valid_outreach_email(a)]
+    out = []
+    for addr in found:
+        key = addr.lower()
+        if key not in seen:
+            seen.add(key)
+        if _is_valid_outreach_email(addr) and key not in {a.lower() for a in out}:
+            out.append(addr)
+    return out
+
+
+def discover_internal_links(html: str, base_url: str,
+                            company_domain: Optional[str],
+                            limit: int = 24) -> List[str]:
+    """Return useful same-company links in research priority order."""
+    if not html or not base_url:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    ranked = []
+    seen = set()
+    for order, anchor in enumerate(soup.find_all("a", href=True)):
+        raw = (anchor.get("href") or "").strip()
+        if not raw or raw.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        absolute = urljoin(base_url, raw).split("#", 1)[0]
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if company_domain and registered_domain(absolute) != company_domain:
+            continue
+        path_signal = f"{parsed.path} {anchor.get_text(' ', strip=True)}".lower()
+        if any(word in path_signal for word in _SKIP_PATH_WORDS):
+            continue
+        scores = [score for word, score in _LINK_PRIORITY.items()
+                  if word in path_signal]
+        if not scores:
+            continue
+        normalized = absolute.rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ranked.append((min(scores), order, normalized))
+    ranked.sort()
+    return [url for _, _, url in ranked[:limit]]
 
 
 def _is_valid_outreach_email(addr: str) -> bool:
@@ -159,6 +256,220 @@ def rank_outreach_emails(emails: List[str], company_domain: Optional[str]) -> Li
             local_score = len(_LOCAL_PRIORITY) if "." in local or len(local) <= 12 else len(_LOCAL_PRIORITY) + 5
         return (domain_score, local_score, addr)
     return sorted(dict.fromkeys(emails), key=score)
+
+
+_ROLE_PATTERNS = [
+    ("CEO", r"\b(?:chief executive officer|ceo)\b", 0),
+    ("Founder", r"\b(?:co-?founder|founder)\b", 1),
+    ("President", r"\bpresident\b", 2),
+    ("CTO", r"\b(?:chief technology officer|cto)\b", 3),
+    ("COO", r"\b(?:chief operating officer|coo)\b", 3),
+    ("CFO", r"\b(?:chief financial officer|cfo)\b", 3),
+    ("Chief", r"\bchief [a-z -]+ officer\b", 3),
+    ("Partner", r"\b(?:managing )?partner\b", 4),
+    ("VP", r"\b(?:vice president|vp)\b", 5),
+    ("Head", r"\bhead of\b", 6),
+    ("Director", r"\bdirector\b", 7),
+    ("Recruiting", r"\b(?:recruiter|recruiting|talent acquisition)\b", 8),
+]
+
+
+def _school_aliases(preferred_school: Optional[str]) -> List[str]:
+    school = (preferred_school or "").strip()
+    if not school:
+        return []
+    lowered = school.lower()
+    aliases = [school]
+    if "pennsylvania" in lowered or "upenn" in lowered or "wharton" in lowered:
+        aliases += [
+            "University of Pennsylvania", "UPenn", "Wharton",
+            "Penn Engineering", "Penn alumnus", "Penn alumna", "Penn alumni",
+        ]
+    return list(dict.fromkeys(a.lower() for a in aliases if a))
+
+
+def _school_match(context: str, preferred_school: Optional[str]) -> bool:
+    text = (context or "").lower()
+    if "penn state" in text and not any(
+            marker in text for marker in ("university of pennsylvania", "upenn", "wharton")):
+        return False
+    return any(alias in text for alias in _school_aliases(preferred_school))
+
+
+def _infer_role(context: str, local: str) -> Tuple[Optional[str], int]:
+    text = context or ""
+    for label, pattern, rank in _ROLE_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return label, rank
+    generic = {
+        "ceo": ("CEO", 0), "founder": ("Founder", 1),
+        "founders": ("Founders", 1), "careers": ("Careers inbox", 10),
+        "jobs": ("Careers inbox", 10), "recruiting": ("Recruiting", 8),
+        "talent": ("Recruiting", 8),
+    }
+    return generic.get(local.lower(), (None, 20))
+
+
+def _infer_name(context: str, local: str) -> str:
+    """Best-effort person name, grounded in nearby page text or the address."""
+    role_words = (
+        r"(?:CEO|Chief Executive Officer|Founder|Co-Founder|President|CTO|"
+        r"Chief Technology Officer|COO|CFO|Vice President|VP|Head of [A-Za-z &-]+|"
+        r"Director(?: of [A-Za-z &-]+)?)"
+    )
+    name = r"([A-Z][a-z]+(?:\s+[A-Z][a-z.'-]+){1,3})"
+    for pattern in (
+        rf"{name}\s*(?:,|–|—|-|\|)\s*{role_words}",
+        rf"{role_words}\s*(?:,|:|–|—|-|\|)?\s*{name}",
+    ):
+        m = re.search(pattern, context or "")
+        if m:
+            # One pattern captures the role first; select the group that looks
+            # like a multi-word capitalized name.
+            for value in m.groups():
+                if value and re.fullmatch(name, value):
+                    return value
+    parts = [p for p in re.split(r"[._-]", local) if p.isalpha() and len(p) > 1]
+    if len(parts) >= 2:
+        return " ".join(p.capitalize() for p in parts[:3])
+    if len(parts) == 1 and local.lower() not in set(_LOCAL_PRIORITY) | _BAD_LOCAL:
+        # Public startup addresses are often first-name-only (kim@...). This
+        # is a modest inference, so keep it to alphabetic non-generic locals.
+        return parts[0].capitalize()
+    return ""
+
+
+def extract_contact_candidates(pages: List[Dict[str, str]],
+                               company_domain: Optional[str],
+                               preferred_school: Optional[str] = None) -> List[Dict]:
+    """Build evidence-backed contact records from each email's page context."""
+    merged: Dict[str, Dict] = {}
+    for page in pages:
+        html = page.get("html") or ""
+        page_url = page.get("url") or ""
+        soup = BeautifulSoup(html_lib.unescape(html), "html.parser")
+        page_text = soup.get_text(" ", strip=True)
+        page_emails = extract_emails_from_html(html)
+        for addr in page_emails:
+            local, _, domain = addr.lower().partition("@")
+            contexts = []
+            origins = list(soup.find_all(
+                href=re.compile(re.escape(addr), re.I)))
+            origins += [
+                text_node.parent
+                for text_node in soup.find_all(string=re.compile(re.escape(addr), re.I))
+            ]
+            for origin in origins:
+                node = origin
+                for _ in range(4):
+                    if node is None or getattr(node, "name", None) in {
+                            "body", "html", "main", "[document]"}:
+                        break
+                    candidate = node.get_text(" ", strip=True)
+                    if candidate:
+                        contexts.append(candidate)
+                    # Some team pages put a bio paragraph immediately before
+                    # its email link without a wrapping card/section. Include
+                    # only nearby siblings and stop at another address, so one
+                    # leader's education does not leak onto every contact.
+                    nearby = []
+                    for sibling in list(node.previous_siblings)[:3]:
+                        sibling_html = str(sibling)
+                        if extract_emails_from_html(sibling_html):
+                            break
+                        sibling_text = (sibling.get_text(" ", strip=True)
+                                        if hasattr(sibling, "get_text")
+                                        else str(sibling).strip())
+                        if sibling_text:
+                            nearby.append(sibling_text)
+                    if nearby and candidate:
+                        contexts.append(" ".join(reversed(nearby)) + " " + candidate)
+                    node = node.parent
+            if not contexts:
+                # Obfuscated addresses no longer appear literally in the DOM.
+                # The page-level text is still grounded evidence, just weaker.
+                contexts = [page_text[:1200]]
+            context = max(
+                (c for c in contexts if c),
+                key=lambda c: (
+                    1 if _school_match(c, preferred_school) else 0,
+                    1 if _infer_role(c, local)[1] < 20 else 0,
+                    min(len(c), 1200),
+                ),
+                default=page_text[:1200],
+            )[:1200]
+            role, seniority = _infer_role(context, local)
+            name = _infer_name(context, local)
+            school_match = _school_match(context, preferred_school)
+            candidate = {
+                "email": addr,
+                "name": name,
+                "role": role,
+                "source_url": page_url,
+                "school_match": school_match,
+                "school": preferred_school if school_match else None,
+                "seniority_rank": seniority,
+                "on_domain": bool(
+                    company_domain and registered_domain(domain) == company_domain),
+            }
+            old = merged.get(addr.lower())
+            if old is None or (
+                    candidate["school_match"], -candidate["seniority_rank"],
+                    bool(candidate["name"])) > (
+                    old["school_match"], -old["seniority_rank"], bool(old["name"])):
+                merged[addr.lower()] = candidate
+
+    generic_locals = set(_LOCAL_PRIORITY)
+    return sorted(
+        merged.values(),
+        key=lambda c: (
+            0 if c["school_match"] else 1,
+            c["seniority_rank"],
+            0 if c["on_domain"] else 1,
+            0 if c["name"] else 1,
+            1 if c["email"].split("@", 1)[0].lower() in generic_locals else 0,
+            c["email"].lower(),
+        ),
+    )
+
+
+def select_outreach_contacts(candidates: List[Dict], emails: List[str],
+                             company_domain: Optional[str],
+                             limit: int = 3) -> List[Dict]:
+    """Prefer same-school senior leaders, then other named/on-domain contacts."""
+    by_email = {c.get("email", "").lower(): dict(c)
+                for c in candidates or [] if c.get("email")}
+    ranked = rank_outreach_emails(emails, company_domain)
+    on_domain = [
+        addr for addr in ranked
+        if company_domain
+        and registered_domain(addr.split("@", 1)[-1]) == company_domain
+    ]
+    safe_pool = on_domain if on_domain else ranked[:1]
+    warning = None
+    if safe_pool and not on_domain:
+        warning = (
+            f"Found on the site but not on {company_domain}. Verify this reaches "
+            f"the right company before sending." if company_domain else
+            "Company domain unknown — verify this address before sending."
+        )
+    selected = []
+    for addr in safe_pool:
+        candidate = by_email.get(addr.lower(), {
+            "email": addr, "name": "", "role": None, "source_url": None,
+            "school_match": False, "school": None,
+        })
+        candidate["warning"] = warning
+        selected.append(candidate)
+
+    # select_outreach_emails ranks only addresses. Re-rank its safe, on-domain
+    # subset using the richer person evidence.
+    selected.sort(key=lambda c: (
+        0 if c.get("school_match") else 1,
+        c.get("seniority_rank", 20),
+        0 if c.get("name") else 1,
+    ))
+    return selected[:limit]
 
 
 def select_outreach_emails(emails: List[str], company_domain: Optional[str],
@@ -197,7 +508,9 @@ def heuristic_metadata(company_name: str, text: str) -> Dict[str, Optional[str]]
             "hook": None, "why_care": None, "recent_news": None}
 
 
-def llm_metadata(company_name: str, text: str) -> Optional[Dict[str, Optional[str]]]:
+def llm_metadata(company_name: str, text: str,
+                 known_emails: Optional[List[str]] = None,
+                 preferred_school: Optional[str] = None) -> Optional[Dict]:
     """Cloud-LLM structured extraction. Returns None when no provider/parse failure."""
     if not complete_json or not get_cloud_llm_provider():
         return None
@@ -205,8 +518,13 @@ def llm_metadata(company_name: str, text: str) -> Optional[Dict[str, Optional[st
 
 Company name: {company_name}
 
-Website text:
-{text[:6000]}
+Website text from multiple first-party pages:
+{text[:12000]}
+
+Known emails actually present in the supplied pages:
+{", ".join(known_emails or []) or "none"}
+
+Preferred school/affiliation: {preferred_school or "none"}
 
 Return ONLY a JSON object with these keys (use null when the text doesn't say):
 {{
@@ -216,7 +534,16 @@ Return ONLY a JSON object with these keys (use null when the text doesn't say):
   "hook": "one specific, compelling detail usable to personalize a cold email",
   "why_care": "why a candidate or customer would find this company exciting",
   "recent_news": "recent launch/announcement if mentioned, else null",
-  "location": "HQ city if mentioned, else null"
+  "location": "HQ city if mentioned, else null",
+  "contacts": [
+    {{
+      "email": "must be one of the known emails above",
+      "name": "person's full name if the page states it, else null",
+      "role": "their role if the page states it, else null",
+      "source_url": "the SOURCE URL containing the evidence",
+      "evidence": "an exact short quote from that source supporting name/role/education"
+    }}
+  ]
 }}"""
     data = complete_json(prompt, max_tokens=1024)
     if not isinstance(data, dict):
@@ -226,6 +553,34 @@ Return ONLY a JSON object with these keys (use null when the text doesn't say):
                 "recent_news", "location"):
         val = data.get(key)
         out[key] = str(val).strip() if val and str(val).strip().lower() != "null" else None
+    known = {e.lower(): e for e in (known_emails or [])}
+    normalized_text = re.sub(r"\s+", " ", text).lower()
+    grounded_contacts = []
+    for contact in data.get("contacts") or []:
+        if not isinstance(contact, dict):
+            continue
+        email = str(contact.get("email") or "").strip().lower()
+        evidence = re.sub(r"\s+", " ", str(contact.get("evidence") or "")).strip()
+        source_url = str(contact.get("source_url") or "").strip()
+        # The model may organize facts, but it may not invent an address,
+        # biography, or source. Exact evidence grounding keeps this auditable.
+        if email not in known or len(evidence) < 20:
+            continue
+        if evidence.lower() not in normalized_text:
+            continue
+        if source_url and source_url not in text:
+            continue
+        grounded_contacts.append({
+            "email": known[email],
+            "name": str(contact.get("name") or "").strip(),
+            "role": str(contact.get("role") or "").strip() or None,
+            "source_url": source_url or None,
+            "evidence": evidence,
+            "school_match": _school_match(evidence, preferred_school),
+            "school": (preferred_school
+                       if _school_match(evidence, preferred_school) else None),
+        })
+    out["_contacts"] = grounded_contacts
     return out if any(out.values()) else None
 
 
@@ -296,40 +651,135 @@ class EnrichmentService:
                 continue
         return None
 
-    def enrich(self, company_name: str, url: Optional[str] = None) -> Dict:
+    def _school_research_pages(self, company_name: str, domain: Optional[str],
+                               preferred_school: Optional[str]) -> List[str]:
+        """Find first-party bios the site's own navigation may not expose.
+
+        Search results are used only as a map back into the verified company
+        domain. We never turn a search snippet or an off-domain profile into a
+        contact or claim.
+        """
+        if not domain or not preferred_school:
+            return []
+        try:
+            from ddg_search import ddg_text_search
+            school_terms = " OR ".join(
+                f'"{alias}"' for alias in _school_aliases(preferred_school)[:5])
+            query = (
+                f'site:{domain} "{company_name}" '
+                f'({school_terms}) '
+                f'(CEO OR founder OR leadership OR team)'
+            )
+            out = []
+            for result in ddg_text_search(query, max_results=6):
+                candidate = result.get("href") or result.get("url") or ""
+                if (candidate and registered_domain(candidate) == domain
+                        and is_safe_public_url(candidate)):
+                    out.append(candidate.split("#", 1)[0].rstrip("/"))
+            return list(dict.fromkeys(out))[:4]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _research_quality(pages_scraped: int, summary: Optional[str],
+                          contacts: List[Dict]) -> str:
+        if summary and pages_scraped >= 4 and any(
+                c.get("name") or c.get("role") for c in contacts):
+            return "high"
+        if summary and pages_scraped >= 2:
+            return "medium"
+        return "low"
+
+    def enrich(self, company_name: str, url: Optional[str] = None,
+               preferred_school: Optional[str] = None) -> Dict:
         """Full enrichment: returns dict with url, domain, metadata fields,
-        emails (ranked), text_sample, and ok flag."""
+        evidence-backed contacts, crawl diagnostics, and an ok flag."""
         if not url:
             url = self.find_website(company_name)
         result: Dict = {
             "url": url,
             "domain": registered_domain(url) if url else None,
             "emails": [],
+            "contacts": [],
             "ok": False,
             "scraped_at": datetime.now().isoformat(timespec="seconds"),
+            "pages_attempted": 0,
+            "pages_scraped": 0,
+            "research_sources": [],
+            "research_quality": "low",
         }
         if not url:
             return result
 
+        domain = result["domain"]
         texts: List[str] = []
-        emails: List[str] = []
-        pages = [url] + [urljoin(url.rstrip("/") + "/", p.lstrip("/")) for p in SUBPAGES]
-        fetched = 0
-        for page_url in pages:
-            if fetched >= 4 and (texts and emails):
-                break  # enough signal; don't hammer the site
+        page_records: List[Dict[str, str]] = []
+        queue = [url]
+        queued = {url.rstrip("/")}
+        # Keep path guesses as fallbacks. Real navigation discovered from the
+        # home page is inserted ahead of them.
+        fallback_pages = [
+            urljoin(url.rstrip("/") + "/", p.lstrip("/")) for p in SUBPAGES
+        ]
+        attempted = 0
+        while queue and attempted < MAX_PAGE_ATTEMPTS \
+                and len(page_records) < MAX_PAGES_FETCHED:
+            page_url = queue.pop(0)
+            attempted += 1
             html = self.scraper.fetch_html(page_url)
             if not html:
+                if not queue:
+                    for fallback in fallback_pages:
+                        key = fallback.rstrip("/")
+                        if key not in queued:
+                            queued.add(key)
+                            queue.append(fallback)
                 continue
-            fetched += 1
-            emails += extract_emails_from_html(html)
             text = self.scraper.extract_text(html)
-            if text and len(text) > 100:
-                texts.append(text)
-            if fetched >= 6:
-                break
+            page_records.append({"url": page_url, "html": html, "text": text or ""})
+            if text and len(text) > 80:
+                texts.append(f"SOURCE: {page_url}\n{text[:5000]}")
 
-        combined = "\n\n".join(texts)[:12000]
+            discovered = discover_internal_links(html, page_url, domain)
+            insert_at = 0
+            for discovered_url in discovered:
+                key = discovered_url.rstrip("/")
+                if key not in queued:
+                    queued.add(key)
+                    queue.insert(insert_at, discovered_url)
+                    insert_at += 1
+            if not queue:
+                for fallback in fallback_pages:
+                    key = fallback.rstrip("/")
+                    if key not in queued:
+                        queued.add(key)
+                        queue.append(fallback)
+
+        # Alumni bios are often orphaned from the current nav. Search may find
+        # them, but only verified same-domain pages are fetched or trusted.
+        school_pages = self._school_research_pages(
+            company_name, domain, preferred_school)
+        if school_pages and not any(
+                _school_match(p.get("text") or "", preferred_school)
+                for p in page_records):
+            for page_url in school_pages:
+                if attempted >= MAX_PAGE_ATTEMPTS or len(page_records) >= MAX_PAGES_FETCHED:
+                    break
+                if any(p["url"].rstrip("/") == page_url.rstrip("/") for p in page_records):
+                    continue
+                attempted += 1
+                html = self.scraper.fetch_html(page_url)
+                if not html:
+                    continue
+                text = self.scraper.extract_text(html)
+                page_records.append({"url": page_url, "html": html, "text": text or ""})
+                if text and len(text) > 80:
+                    texts.append(f"SOURCE: {page_url}\n{text[:5000]}")
+
+        combined = "\n\n".join(texts)[:24000]
+        result["pages_attempted"] = attempted
+        result["pages_scraped"] = len(page_records)
+        result["research_sources"] = [p["url"] for p in page_records]
 
         # Confirm this site is actually the company's before believing anything
         # on it. A search result can easily be an unrelated business; scraping
@@ -347,9 +797,51 @@ class EnrichmentService:
             result["emails"] = []
             return result
 
-        result["emails"] = rank_outreach_emails(emails, result["domain"])[:8]
+        all_emails = []
+        for page in page_records:
+            all_emails.extend(extract_emails_from_html(page["html"]))
+        result["emails"] = rank_outreach_emails(all_emails, result["domain"])[:12]
+        result["contacts"] = extract_contact_candidates(
+            page_records, result["domain"], preferred_school)
         if combined:
-            meta = llm_metadata(company_name, combined) or heuristic_metadata(company_name, combined)
+            meta = llm_metadata(
+                company_name, combined, result["emails"], preferred_school)
+            llm_contacts = []
+            if meta:
+                llm_contacts = meta.pop("_contacts", []) or []
+            meta = meta or heuristic_metadata(company_name, combined)
             result.update({k: v for k, v in (meta or {}).items()})
             result["ok"] = bool((meta or {}).get("summary"))
+            by_email = {
+                contact["email"].lower(): contact
+                for contact in result["contacts"]
+            }
+            for grounded in llm_contacts:
+                contact = by_email.get(grounded["email"].lower())
+                if not contact:
+                    continue
+                if grounded.get("name"):
+                    contact["name"] = grounded["name"]
+                if grounded.get("role"):
+                    contact["role"] = grounded["role"]
+                if grounded.get("source_url"):
+                    contact["source_url"] = grounded["source_url"]
+                if grounded.get("evidence"):
+                    contact["evidence"] = grounded["evidence"]
+                if grounded.get("school_match"):
+                    contact["school_match"] = True
+                    contact["school"] = preferred_school
+                _, contact["seniority_rank"] = _infer_role(
+                    f"{contact.get('role') or ''} {grounded.get('evidence') or ''}",
+                    contact["email"].split("@", 1)[0],
+                )
+            result["contacts"].sort(key=lambda c: (
+                0 if c.get("school_match") else 1,
+                c.get("seniority_rank", 20),
+                0 if c.get("on_domain") else 1,
+                0 if c.get("name") else 1,
+                c["email"].lower(),
+            ))
+        result["research_quality"] = self._research_quality(
+            result["pages_scraped"], result.get("summary"), result["contacts"])
         return result

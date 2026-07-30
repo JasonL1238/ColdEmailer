@@ -61,6 +61,7 @@ export const resumesAPI = {
   update: (id, data) => api.put(`/resumes/${id}`, data),
   delete: (id, force = false) => api.delete(`/resumes/${id}`, { params: { force } }),
   fileUrl: (id) => `${API_BASE_URL}/resumes/${id}/file`,
+  downloadUrl: (id) => `${API_BASE_URL}/resumes/${id}/file?download=true`,
 }
 
 export const emailsAPI = {

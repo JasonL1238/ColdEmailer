@@ -492,6 +492,33 @@ function CompanyDrawer({ company, onClose, onChanged, onDeleted, onCompose }) {
           {company.product && <Info label="Product" value={company.product} />}
           {company.hook && <Info label="Personalization hook" value={company.hook} />}
           {company.recent_news && <Info label="Recent news" value={company.recent_news} />}
+          <div className="card card-pad" style={{ background: 'var(--surface-hover)' }}>
+            <div className="row-between" style={{ gap: 8 }}>
+              <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Research coverage
+              </div>
+              <Chip tone={company.research_quality === 'high' ? 'green'
+                : company.research_quality === 'medium' ? 'sky' : 'amber'}>
+                {company.research_quality || 'legacy'}
+              </Chip>
+            </div>
+            <div className="small" style={{ marginTop: 6 }}>
+              {company.pages_scraped || 0} page{company.pages_scraped === 1 ? '' : 's'} read
+              {company.pages_attempted
+                ? ` from ${company.pages_attempted} attempted`
+                : ''}
+            </div>
+            {Array.isArray(company.research_sources) && company.research_sources.length > 0 && (
+              <div className="stack" style={{ gap: 3, marginTop: 7 }}>
+                {company.research_sources.slice(0, 8).map((source) => (
+                  <a key={source} href={source} target="_blank" rel="noreferrer"
+                    className="tiny row" style={{ gap: 4, overflowWrap: 'anywhere' }}>
+                    <ExternalLink size={10} /> {source}
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       ) : (
         <div className="card card-pad small muted">
@@ -536,7 +563,12 @@ function CompanyDrawer({ company, onClose, onChanged, onDeleted, onCompose }) {
                   <div>
                     <div style={{ fontWeight: 600, fontSize: 13 }}>{c.name || 'Unnamed'}</div>
                     <div className="tiny mono">{c.email}</div>
-                    {c.role && <div className="tiny">{c.role}</div>}
+                    <div className="row" style={{ gap: 5, marginTop: 2 }}>
+                      {c.role && <div className="tiny">{c.role}</div>}
+                      {c.notes?.startsWith('Same-school match:') && (
+                        <Chip tone="violet">Penn affinity</Chip>
+                      )}
+                    </div>
                     {c.notes && (
                       <div className="tiny row" style={{ gap: 4, color: 'var(--amber)', marginTop: 2 }}>
                         <AlertTriangle size={11} /> {c.notes}

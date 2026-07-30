@@ -274,24 +274,60 @@ def _enrich_company_async(company_id: str):
         return
     db.update_company(company_id, {"scrape_status": "scraping"})
     try:
-        enriched = enrichment.enrich(company["name"], company.get("url"))
+        enriched = enrichment.enrich(
+            company["name"], company.get("url"),
+            preferred_school=db.get_profile().get("school"),
+        )
+        research_fields = {
+            "url", "domain", "summary", "industry", "product", "hook",
+            "recent_news", "why_care", "location", "scraped_at",
+            "research_sources", "pages_scraped", "pages_attempted",
+            "research_quality",
+        }
         updates = {k: v for k, v in enriched.items()
-                   if k in ("url", "domain", "summary", "industry", "product", "hook",
-                            "recent_news", "why_care", "location", "scraped_at") and v}
+                   if k in research_fields and v is not None}
         updates["scrape_status"] = scrape_status_for(enriched)
+        if updates["scrape_status"] == "wrong_site":
+            # Do not leave the rejected URL or an older profile in place. A
+            # later retry must search again instead of scraping the same wrong
+            # company forever, and stale research must not reach a draft.
+            updates.update({
+                key: None for key in (
+                    "url", "domain", "summary", "industry", "product", "hook",
+                    "recent_news", "why_care", "location",
+                )
+            })
         db.update_company(company_id, updates)
-        # Add newly found contacts (max 2, skip duplicates)
-        from discovery import _guess_name_from_email, _role_for_email
-        from enrichment import select_outreach_emails
+        # Add evidence-backed contacts, preferring same-school senior leaders.
+        from discovery import _guess_name_from_email, _role_for_email, contact_notes
+        from enrichment import select_outreach_contacts
         domain = (db.get_company(company_id) or {}).get("domain")
-        for addr, note in select_outreach_emails(enriched.get("emails") or [], domain):
-            if db.find_contact_by_email(addr):
+        for candidate in select_outreach_contacts(
+                enriched.get("contacts") or [],
+                enriched.get("emails") or [], domain):
+            addr = candidate["email"]
+            existing_contact = db.find_contact_by_email(addr)
+            if existing_contact:
+                if existing_contact.get("company_id") == company_id:
+                    richer = {}
+                    if not existing_contact.get("name") and candidate.get("name"):
+                        richer["name"] = candidate["name"]
+                    if not existing_contact.get("role") and candidate.get("role"):
+                        richer["role"] = candidate["role"]
+                    new_notes = contact_notes(candidate)
+                    if new_notes and not existing_contact.get("notes"):
+                        richer["notes"] = new_notes
+                    if richer:
+                        db.update_contact(existing_contact["id"], richer)
                 continue
             local = addr.split("@", 1)[0]
             db.create_contact(company_id=company_id, email=addr,
-                              name=_guess_name_from_email(local),
-                              role=_role_for_email(local),
-                              source="discovery", status="new", notes=note)
+                              name=(candidate.get("name")
+                                    or _guess_name_from_email(local)),
+                              role=(candidate.get("role")
+                                    or _role_for_email(local)),
+                              source="discovery", status="new",
+                              notes=contact_notes(candidate))
         # Log what actually happened — an unconditional "researched" here made
         # the activity feed claim success for wrong-site and failed scrapes.
         status = updates["scrape_status"]
@@ -635,12 +671,19 @@ async def delete_resume(resume_id: str, force: bool = Query(False)):
 
 
 @app.get("/api/resumes/{resume_id}/file")
-async def get_resume_file(resume_id: str):
+async def get_resume_file(resume_id: str, download: bool = Query(False)):
     row = resumes.get(resume_id)
     if not row or not os.path.isfile(row["path"]):
         raise HTTPException(404, "Resume file not found")
-    return FileResponse(row["path"], media_type="application/pdf",
-                        filename=row["filename"])
+    if download:
+        return FileResponse(row["path"], media_type="application/pdf",
+                            filename=row["filename"])
+    # No filename= here: Starlette treats it as an attachment. Inline lets the
+    # browser's PDF viewer render it in the app or a normal tab.
+    return FileResponse(
+        row["path"], media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{row["filename"]}"'},
+    )
 
 
 # ---------- email types ----------

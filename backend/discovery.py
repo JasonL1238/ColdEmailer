@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 from db import Database
 from ddg_search import ddg_text_search
 from enrichment import (EnrichmentService, registered_domain,
-                        scrape_status_for, select_outreach_emails)
+                        scrape_status_for, select_outreach_contacts)
 
 try:
     from llm_client import complete_json, get_cloud_llm_provider
@@ -93,6 +93,23 @@ def _role_for_email(local: str) -> Optional[str]:
         "press": "Press", "sales": "Sales", "support": "Support",
     }
     return mapping.get(local)
+
+
+def contact_notes(candidate: Dict) -> Optional[str]:
+    """Human-readable provenance for affinity matches and risky addresses."""
+    notes = []
+    if candidate.get("school_match"):
+        school = candidate.get("school") or "your school"
+        notes.append(
+            f"Same-school match: {school} is mentioned in this person's "
+            "public company biography. Verify before referencing it.")
+    if candidate.get("source_url"):
+        notes.append(f"Source: {candidate['source_url']}")
+    if candidate.get("evidence"):
+        notes.append(f'Evidence: "{candidate["evidence"][:240]}"')
+    if candidate.get("warning"):
+        notes.append(candidate["warning"])
+    return " ".join(notes) or None
 
 
 def discovery_scrape_status(enriched: dict) -> str:
@@ -189,13 +206,18 @@ class DiscoveryService:
                                 "status": "already_in_database", "emails_found": 0})
                 continue
 
-            enriched = self.enrichment.enrich(name, cand.get("website"))
+            enriched = self.enrichment.enrich(
+                name, cand.get("website"),
+                preferred_school=self.db.get_profile().get("school"),
+            )
             status = discovery_scrape_status(enriched)
+            trusted_site = status != "wrong_site"
 
             company = self.db.create_company(
                 name,
-                url=enriched.get("url"),
-                domain=enriched.get("domain") or cand.get("domain"),
+                url=enriched.get("url") if trusted_site else None,
+                domain=((enriched.get("domain") or cand.get("domain"))
+                        if trusted_site else None),
                 summary=enriched.get("summary"),
                 discovery_note=cand.get("reason"),
                 industry=enriched.get("industry"),
@@ -208,23 +230,29 @@ class DiscoveryService:
                 job_id=job_id,
                 scraped_at=enriched.get("scraped_at"),
                 scrape_status=status,
+                research_sources=enriched.get("research_sources"),
+                pages_scraped=enriched.get("pages_scraped"),
+                pages_attempted=enriched.get("pages_attempted"),
+                research_quality=enriched.get("research_quality"),
             )
             companies_added += 1
 
             emails_this_company = 0
-            for addr, note in select_outreach_emails(
+            for candidate in select_outreach_contacts(
+                    enriched.get("contacts") or [],
                     enriched.get("emails") or [], company.get("domain")):
+                addr = candidate["email"]
                 if self.db.find_contact_by_email(addr):
                     continue
                 local = addr.split("@", 1)[0]
                 self.db.create_contact(
                     company_id=company["id"],
-                    name=_guess_name_from_email(local),
+                    name=candidate.get("name") or _guess_name_from_email(local),
                     email=addr,
-                    role=_role_for_email(local),
+                    role=candidate.get("role") or _role_for_email(local),
                     source="discovery",
                     status="new",
-                    notes=note,
+                    notes=contact_notes(candidate),
                 )
                 contacts_added += 1
                 emails_this_company += 1

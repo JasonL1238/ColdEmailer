@@ -18,11 +18,11 @@ Opens the app at **http://localhost:5173** (API docs at http://localhost:8000/do
 
 ## What it does
 
-**Discover** — Type what you're looking for in plain English ("seed-stage fintech startups in New York"). Reach asks the LLM for real matching companies, cross-checks with a web search, finds each company's website, scrapes the homepage plus `/about`, `/contact`, `/team`, and `/careers`, and extracts both a structured company profile (what they do, product, industry, personalization hook, recent news) and any contact email addresses it finds. Runs in the background with live progress.
+**Discover** — Type what you're looking for in plain English ("seed-stage fintech startups in New York"). Reach asks the LLM for real matching companies, cross-checks with a web search, finds each company's website, follows its real first-party navigation (leadership, team, about, contact, careers, press, news, and blog pages), and extracts a structured company profile plus public contact addresses. It records every source page and crawl count so you can audit the research. Runs in the background with live progress.
 
 **Database** — Every company and contact in one place. Drill into a company to see its scraped research, its contacts, and the full email history with that company. Import contacts from CSV (`name, company, email` header) or add them by hand. Re-run research on any company at any time.
 
-**Resumes** — Upload multiple PDF versions ("ML research", "Full-stack", "2029 general"). Reach extracts the text so the AI can weave your real projects into emails, and attaches the PDF you pick when sending. One is marked default.
+**Resumes** — Upload multiple PDF versions ("ML research", "Full-stack", "2029 general"). Reach extracts the text so the AI can weave your real projects into emails, and attaches the PDF you pick when sending. One is marked default. PDFs preview inline in the app, with separate open-in-tab and download actions.
 
 **Emails** — Pick contacts, choose an email type, and Reach writes each one individually using that company's scraped research plus your selected resume and profile:
 
@@ -45,6 +45,7 @@ Cold outreach is easy to get wrong in ways that are embarrassing rather than mer
 - **Scraped text can't hijack your emails.** Company research is untrusted input: it is fenced as data in the prompt, and any page that tries to inject instructions has its text dropped rather than quoted.
 - **The website has to actually be the company's.** A search result is only accepted if the domain matches the name or the page names the company; otherwise the row is marked *Wrong site found* instead of inventing a profile. Existing bad rows are cleaned up on first startup.
 - **Emails don't claim attachments they don't have.** The "resume is attached" line only appears when a real PDF will be attached, and sales emails never attach one.
+- **Affinity never overrides address safety.** Public same-school matches (including UPenn/Wharton when that is your configured school) and senior leaders rank first, but only addresses actually found in the scraped evidence are accepted; a personal/off-domain address never displaces a company-domain address.
 - **Sent mail is not deletable.** It is the record of what a real person received, and it is what prevents double-contacting.
 - **Addresses are validated twice** — on the way in and again at send time — so a comma or newline can never add a recipient or a `Bcc:` header.
 - **Archive, don't delete.** Archiving keeps the history and stops future outreach.
@@ -145,3 +146,16 @@ The backend suite runs against a throwaway database (`tests/conftest.py` sets `C
 ## Notes on responsible use
 
 Reach respects `robots.txt` when scraping and rate-limits requests per domain. Cold email is regulated in most jurisdictions (CAN-SPAM, GDPR, CASL) — send to people plausibly interested in hearing from you, keep volumes sane, and honor opt-outs.
+
+To run the deterministic scraping benchmark:
+
+```bash
+backend/venv/bin/python scripts/evaluate_scraping.py
+```
+
+For a read-only live diagnostic (results vary with site changes and bot controls):
+
+```bash
+backend/venv/bin/python scripts/evaluate_scraping.py \
+  --live 'Openlayer=https://www.openlayer.com'
+```

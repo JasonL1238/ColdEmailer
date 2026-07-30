@@ -306,7 +306,7 @@ a:hover { text-decoration: underline; }
   display: flex; flex-direction: column;
   animation: popIn 0.16s cubic-bezier(0.2, 0.9, 0.3, 1.2);
 }
-.modal.modal-lg { width: min(720px, calc(100vw - 40px)); }
+.modal.modal-lg { width: min(960px, calc(100vw - 40px)); }
 .modal-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 16px 20px 0;
@@ -317,6 +317,13 @@ a:hover { text-decoration: underline; }
   display: flex; justify-content: flex-end; gap: 8px;
   padding: 14px 20px;
   border-top: 1px solid var(--border);
+}
+.pdf-preview {
+  width: 100%;
+  height: min(72vh, 820px);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: #f4f4f4;
 }
 
 .drawer-overlay {

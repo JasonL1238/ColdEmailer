@@ -134,12 +134,24 @@ class GenerationService:
         if not can:
             return company
         self.rate_limiter.record_company_research()
-        enriched = self.enrichment.enrich(company["name"], company.get("url"))
+        enriched = self.enrichment.enrich(
+            company["name"], company.get("url"),
+            preferred_school=self.db.get_profile().get("school"),
+        )
         updates = {k: v for k, v in enriched.items()
                    if k in ("url", "domain", "summary", "industry", "product",
                             "hook", "recent_news", "why_care", "location",
-                            "scraped_at") and v}
+                            "scraped_at", "research_sources", "pages_scraped",
+                            "pages_attempted", "research_quality")
+                   and v is not None}
         updates["scrape_status"] = scrape_status_for(enriched)
+        if updates["scrape_status"] == "wrong_site":
+            updates.update({
+                key: None for key in (
+                    "url", "domain", "summary", "industry", "product", "hook",
+                    "recent_news", "why_care", "location",
+                )
+            })
         self.db.update_company(company["id"], updates)
         return self.db.get_company(company["id"])
 
