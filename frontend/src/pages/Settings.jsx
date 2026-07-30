@@ -8,7 +8,7 @@ import { useApp } from '../App'
 
 const FIELDS = [
   { key: 'full_name', label: 'Full name', placeholder: 'Jane Smith' },
-  { key: 'email', label: 'Email', placeholder: 'you@school.edu', hint: 'Used in your signature and as the From address' },
+  { key: 'email', label: 'Email', placeholder: 'you@school.edu', hint: 'The From address your emails send from. Kept out of the signature — the recipient already sees it' },
   { key: 'phone', label: 'Phone', placeholder: '555-000-0000' },
   { key: 'school', label: 'School / affiliation', placeholder: 'University of…' },
   { key: 'website', label: 'Website', placeholder: 'https://yoursite.com', span2: true },

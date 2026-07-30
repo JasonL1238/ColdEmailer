@@ -31,7 +31,6 @@ EMAIL_TYPES = {
             "Introduce the sender and weave their single strongest, most relevant experience "
             "or project (from the resume) directly into why they fit THIS company",
             "One concrete way they could contribute",
-            "Mention the resume is attached",
             "Low-pressure ask for a 10-15 minute chat; offer to be redirected if the "
             "recipient is busy",
         ],
@@ -204,8 +203,9 @@ class EmailComposer:
             lines.append(f"Name: {profile['full_name']}")
         if profile.get("school"):
             lines.append(f"School/affiliation: {profile['school']}")
-        if profile.get("email"):
-            lines.append(f"Email: {profile['email']}")
+        # The sender's own address is deliberately absent. It is already the
+        # From header, so a model that sees it here tends to repeat it in the
+        # body, and the signature no longer carries it either.
         if profile.get("website"):
             lines.append(f"Website: {profile['website']}")
         if profile.get("background"):
@@ -230,7 +230,28 @@ class EmailComposer:
                 lines.append(f"{label}: {_as_data(val)}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _already_signed(body: str, signature: str) -> bool:
+        """True only if the writer already signed off, i.e. the sender's name
+        stands alone on one of the closing lines.
+
+        The old test was `signature.split("\\n")[0] not in body` — the name
+        anywhere in the body at all. But every email type's structure asks the
+        writer to introduce the sender, so "My name is Jason Li, a CS student
+        at Penn" counted as a signature and the real one was dropped: no name
+        line, no phone, no website, the message just ending at "Thanks so
+        much,".
+        """
+        first = (signature.split("\n")[0] or "").strip()
+        if not first:
+            return False
+        closing = [ln.strip() for ln in body.rstrip().splitlines() if ln.strip()][-3:]
+        return first in closing
+
     def _signature(self, profile: Dict[str, str]) -> str:
+        """No email address here on purpose: it is the From address of the very
+        message the reader is looking at, so printing it again is noise. Add it
+        back through the profile's free-text signature field if you want it."""
         lines = []
         if profile.get("full_name"):
             lines.append(profile["full_name"])
@@ -238,8 +259,6 @@ class EmailComposer:
             lines.append(profile["school"])
         if profile.get("phone"):
             lines.append(f"Phone: {profile['phone']}")
-        if profile.get("email"):
-            lines.append(f"Email: {profile['email']}")
         if profile.get("website"):
             lines.append(f"Website: {profile['website']}")
         if profile.get("signature"):
@@ -248,23 +267,24 @@ class EmailComposer:
 
     def _build_prompt(self, contact: Dict, company: Optional[Dict],
                       email_type: str, profile: Dict[str, str],
-                      resume_text: str, custom_instructions: Optional[str],
-                      resume_attached: bool = False) -> str:
+                      resume_text: str, custom_instructions: Optional[str]) -> str:
         spec = EMAIL_TYPES.get(email_type, EMAIL_TYPES[DEFAULT_TYPE])
         company_name = contact.get("company_name") or (company or {}).get("name") or "the company"
-        structure = [s for s in spec["structure"]
-                     if resume_attached or "resume is attached" not in s.lower()]
-        structure = "\n".join(f"{i+1}. {s}" for i, s in enumerate(structure))
+        structure = "\n".join(f"{i+1}. {s}" for i, s in enumerate(spec["structure"]))
         custom_block = (
             f"\nCUSTOM INSTRUCTIONS FROM THE SENDER (these override style rules when "
             f"they conflict):\n{custom_instructions.strip()}\n"
             if custom_instructions and custom_instructions.strip() else ""
         )
         greeting_name = (contact.get("name") or "").split(" ")[0] if contact.get("name") else "there"
+        # The resume rides along as a real attachment; the body never announces
+        # it. "My resume is attached" is a line the reader can see for
+        # themselves, and every sentence spent on it is a sentence not spent on
+        # them. It also removes a whole failure mode: a body that promises a
+        # file can go out with the wrong file, or none.
         attachment_rule = (
-            "- You may mention that a resume is attached; one genuinely will be."
-            if resume_attached else
-            "- Do NOT claim a resume, portfolio, or any file is attached. Nothing is attached."
+            "- Do NOT mention a resume, portfolio, CV or any attachment, even if one "
+            "is attached. The reader can see the attachment; describing it wastes words."
         )
 
         return f"""You are an expert cold-email writer. Write ONE email that maximizes the chance of a reply.
@@ -309,8 +329,7 @@ Body:
     # ---------- template fallbacks ----------
 
     def _template_email(self, contact: Dict, company: Optional[Dict],
-                        email_type: str, profile: Dict[str, str],
-                        resume_attached: bool = False) -> Dict[str, str]:
+                        email_type: str, profile: Dict[str, str]) -> Dict[str, str]:
         company_name = contact.get("company_name") or (company or {}).get("name") or "your company"
         first = (contact.get("name") or "").split(" ")[0] or "there"
         # With no name configured the old form produced the literal "I'm I."
@@ -357,11 +376,10 @@ Body:
             lead = f"I'm {name}" if (name and has_self_intro(background)) else who
             fit = (f" {background.rstrip('.')}, and that's what drew me to your work."
                    if background else "")
-            attach_line = " My resume is attached for convenience." if resume_attached else ""
             body = (f"Hi {first},\n\n{about}I had to reach out.\n\n{lead}.{fit}\n\n"
                     f"I'm not coming in with a big ask, I'd love to find a way to "
                     f"contribute and learn at {company_name}, even in a limited capacity."
-                    f"{attach_line}\n\nIf you'd be up for a 15-minute "
+                    f"\n\nIf you'd be up for a 15-minute "
                     f"chat, I'd make it worth your time, and if someone else is better "
                     f"placed, I'd appreciate being pointed in the right direction.\n\n"
                     f"Thanks so much,")
@@ -384,24 +402,19 @@ Body:
         profile = self.db.get_profile()
         spec = EMAIL_TYPES[email_type]
         resume_text = "" if spec["resume_weight"] == "none" else self.resumes.get_text(resume_id)
-        # Only promise an attachment when a real PDF will actually go out.
-        resume_attached = bool(
-            spec["resume_weight"] != "none"
-            and (self.resumes.resolve_attachment_path(resume_id)
-                 or self.resumes.resolve_attachment_path(
-                     (self.db.get_default_resume() or {}).get("id")))
-        )
+        # There is no resume_attached flag any more. Whether a PDF goes out is
+        # decided at send time; the body never refers to it either way, so the
+        # two no longer have to be kept in agreement.
 
         if not use_template_only and llm_complete and get_cloud_llm_provider():
             prompt = self._build_prompt(contact, company, email_type, profile,
-                                        resume_text, custom_instructions,
-                                        resume_attached=resume_attached)
+                                        resume_text, custom_instructions)
             out = llm_complete(prompt=prompt, system=None, max_tokens=2048)
             parsed = _parse_subject_body(_clean_llm_email_text(out or ""))
             if parsed:
                 body = parsed["body"]
                 signature = self._signature(profile)
-                if signature and signature.split("\n")[0] not in body:
+                if signature and not self._already_signed(body, signature):
                     body = body.rstrip() + "\n" + signature
                 return {"subject": parsed["subject"], "body": body,
                         "used_template_fallback": False, "fallback_reason": None}
@@ -414,8 +427,7 @@ Body:
                 'Custom emails need AI — the plain template cannot follow your '
                 'instructions. Uncheck "Skip AI", or set an AI provider in Settings.')
 
-        tpl = self._template_email(contact, company, email_type, profile,
-                                   resume_attached=resume_attached)
+        tpl = self._template_email(contact, company, email_type, profile)
         signature = self._signature(profile)
         body = tpl["body"].rstrip() + ("\n" + signature if signature else "")
         return {"subject": tpl["subject"], "body": body,
@@ -423,30 +435,17 @@ Body:
                 "fallback_reason": "user_requested" if use_template_only else "llm_unavailable"}
 
     def compose_follow_up(self, contact: Dict, company: Optional[Dict],
-                          original: Dict,
-                          resume_attached: Optional[bool] = None) -> Dict:
+                          original: Dict) -> Dict:
         """Short follow-up referencing the original sent email."""
         profile = self.db.get_profile()
         sent_date = (original.get("sent_at") or "")[:10] or "recently"
         signature = self._signature(profile)
         first = (contact.get("name") or "").split(" ")[0] or "there"
         company_name = contact.get("company_name") or (company or {}).get("name") or "your company"
-        if resume_attached is None:
-            # Same rule as a first-contact email: only promise an attachment
-            # when one genuinely goes out. A follow-up inherits the original's
-            # premise, so a sales follow-up gets (and mentions) nothing.
-            spec = EMAIL_TYPES.get(original.get("email_type") or "")
-            resume_attached = bool(
-                spec and spec["resume_weight"] != "none"
-                and (self.resumes.resolve_attachment_path(original.get("resume_id"))
-                     or self.resumes.resolve_attachment_path(
-                         (self.db.get_default_resume() or {}).get("id")))
-            )
+        # Same rule as a first-contact email: the attachment is never narrated.
         attachment_rule = (
-            "- You may mention that a resume is attached; one genuinely will be."
-            if resume_attached else
-            "- Do NOT claim a resume, portfolio, or any file is attached. "
-            "Nothing is attached to this follow-up."
+            "- Do NOT mention a resume, portfolio, CV or any attachment, even if one "
+            "is attached."
         )
 
         if llm_complete and get_cloud_llm_provider():
@@ -473,7 +472,9 @@ Body:
             out = llm_complete(prompt=prompt, system=None, max_tokens=1024)
             parsed = _parse_subject_body(_clean_llm_email_text(out or ""))
             if parsed:
-                body = parsed["body"].rstrip() + ("\n" + signature if signature else "")
+                body = parsed["body"]
+                if signature and not self._already_signed(body, signature):
+                    body = body.rstrip() + "\n" + signature
                 return {"subject": parsed["subject"], "body": body,
                         "used_template_fallback": False, "fallback_reason": None}
 

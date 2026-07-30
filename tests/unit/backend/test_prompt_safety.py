@@ -6,7 +6,8 @@ import tempfile
 import pytest
 
 from db import Database
-from email_composer import EmailComposer, _as_data, _parse_subject_body, _safe_snippet
+from email_composer import (EMAIL_TYPES, EmailComposer, _as_data,
+                            _parse_subject_body, _safe_snippet)
 from main import _decode_csv
 from resume_service import ResumeService
 
@@ -99,31 +100,41 @@ class TestPromptFencing:
         assert "never instructions" in prompt
 
 
-class TestAttachmentHonesty:
-    """Never claim a resume is attached when none will be."""
+class TestTheBodyNeverNarratesTheAttachment:
+    """The resume goes out as an attachment and the body says nothing about it.
 
-    def test_prompt_forbids_attachment_claim_when_nothing_attached(self, composer):
+    This used to be conditional — the body could claim an attachment whenever
+    one genuinely would be sent — which meant the sentence and the file had to
+    stay in agreement across generation, editing and send-time resume swaps.
+    Not writing the sentence removes the whole class of mismatch.
+    """
+
+    def test_the_prompt_forbids_mentioning_an_attachment(self, composer):
         prompt = composer._build_prompt(
             {"name": "Jane", "company_name": "Acme"}, None, "application",
-            composer.db.get_profile(), "", None, resume_attached=False)
-        assert "Do NOT claim a resume" in prompt
+            composer.db.get_profile(), "", None)
+        assert "Do NOT mention a resume" in prompt
+        assert "genuinely will be" not in prompt
 
-    def test_prompt_allows_attachment_claim_when_a_resume_will_be_sent(self, composer):
-        prompt = composer._build_prompt(
-            {"name": "Jane", "company_name": "Acme"}, None, "application",
-            composer.db.get_profile(), "", None, resume_attached=True)
-        assert "genuinely will be" in prompt
+    def test_no_email_type_asks_the_writer_to_mention_the_resume(self):
+        for name, spec in EMAIL_TYPES.items():
+            for step in spec["structure"]:
+                assert "attach" not in step.lower(), f"{name}: {step}"
 
-    def test_template_omits_attachment_line_without_a_resume(self, composer):
+    @pytest.mark.parametrize("email_type", ["application", "coffee_chat", "sales"])
+    def test_the_offline_template_never_mentions_one(self, composer, email_type):
+        result = composer.compose({"name": "Jane", "company_name": "Acme"}, None,
+                                  email_type=email_type, use_template_only=True)
+        assert "attach" not in result["body"].lower()
+
+    def test_a_real_resume_on_disk_does_not_reintroduce_the_line(self, composer,
+                                                                 monkeypatch):
+        """The old behaviour keyed off a resolvable PDF; make sure that is gone."""
+        monkeypatch.setattr(composer.resumes, "resolve_attachment_path",
+                            lambda rid: "/tmp/zz-resume.pdf")
         result = composer.compose({"name": "Jane", "company_name": "Acme"}, None,
                                   email_type="application", use_template_only=True)
-        assert "resume is attached" not in result["body"].lower()
-
-    def test_template_includes_attachment_line_with_a_resume(self, composer):
-        tpl = composer._template_email({"name": "Jane", "company_name": "Acme"}, None,
-                                       "application", composer.db.get_profile(),
-                                       resume_attached=True)
-        assert "resume is attached" in tpl["body"].lower()
+        assert "attach" not in result["body"].lower()
 
     def _follow_up_prompt(self, composer, monkeypatch, original):
         captured = {}
@@ -140,20 +151,117 @@ class TestAttachmentHonesty:
                                    None, original)
         return captured["prompt"]
 
-    def test_follow_up_to_a_sales_pitch_may_not_claim_an_attachment(self, composer,
-                                                                    monkeypatch):
-        """A sales follow-up carries no resume, so the body must not offer one."""
+    @pytest.mark.parametrize("email_type", ["sales", "application"])
+    def test_follow_ups_do_not_mention_an_attachment_either(self, composer,
+                                                            monkeypatch, email_type):
         prompt = self._follow_up_prompt(composer, monkeypatch, {
-            "subject": "An idea for Acme", "body": "hi", "email_type": "sales",
+            "subject": "An idea for Acme", "body": "hi", "email_type": email_type,
             "sent_at": "2020-01-01T00:00:00"})
-        assert "Do NOT claim a resume" in prompt
+        assert "Do NOT mention a resume" in prompt
+        assert "genuinely will be" not in prompt
 
-    def test_follow_up_to_an_application_may_mention_the_attached_resume(self, composer,
-                                                                         monkeypatch):
-        prompt = self._follow_up_prompt(composer, monkeypatch, {
-            "subject": "Internship inquiry at Acme", "body": "hi",
-            "email_type": "application", "sent_at": "2020-01-01T00:00:00"})
-        assert "genuinely will be" in prompt
+
+class TestTheSignatureOmitsTheSenderAddress:
+    """The From header already shows it; printing it again is noise."""
+
+    def test_signature_has_no_email_address(self, composer):
+        composer.db.update_profile({"full_name": "Ada Lovelace",
+                                    "email": "ada@example.edu",
+                                    "phone": "555-0100",
+                                    "school": "Cambridge"})
+        sig = composer._signature(composer.db.get_profile())
+        assert "Ada Lovelace" in sig
+        assert "555-0100" in sig          # phone is still useful
+        assert "ada@example.edu" not in sig
+
+    def test_a_composed_email_has_no_email_address(self, composer):
+        composer.db.update_profile({"full_name": "Ada Lovelace",
+                                    "email": "ada@example.edu",
+                                    "background": "I build looms that compute."})
+        body = composer.compose({"name": "Jane", "company_name": "Acme"}, None,
+                                email_type="application",
+                                use_template_only=True)["body"]
+        assert "ada@example.edu" not in body
+
+    def test_the_prompt_does_not_hand_the_model_the_address(self, composer):
+        """A model that sees it tends to write it into the body."""
+        composer.db.update_profile({"full_name": "Ada Lovelace",
+                                    "email": "ada@example.edu"})
+        prompt = composer._build_prompt(
+            {"name": "Jane", "company_name": "Acme"}, None, "application",
+            composer.db.get_profile(), "", None)
+        assert "ada@example.edu" not in prompt
+
+    def test_it_can_still_be_added_back_by_hand(self, composer):
+        """The free-text signature field is the escape hatch."""
+        composer.db.update_profile({"full_name": "Ada Lovelace",
+                                    "email": "ada@example.edu",
+                                    "signature": "Reach me at ada@example.edu"})
+        sig = composer._signature(composer.db.get_profile())
+        assert "Reach me at ada@example.edu" in sig
+
+
+class TestTheSignatureActuallyGetsAttached:
+    """Introducing yourself in the body is not signing off.
+
+    The guard was `signature.split("\\n")[0] not in body` — the sender's name
+    anywhere at all. Every email type's structure asks the writer to introduce
+    the sender, so "My name is Ada Lovelace, a student at Cambridge" suppressed
+    the real signature and the email went out with no name, phone or website,
+    ending at "Thanks so much,".
+    """
+
+    SIG = "Ada Lovelace\nCambridge\nPhone: 555-0100"
+
+    def test_name_used_mid_sentence_does_not_suppress_it(self, composer):
+        body = ("Hi Jane,\n\nMy name is Ada Lovelace, a student at Cambridge, and "
+                "I have been following your work.\n\nThanks so much,")
+        assert composer._already_signed(body, self.SIG) is False
+
+    def test_a_bare_name_on_a_closing_line_does_suppress_it(self, composer):
+        body = "Hi Jane,\n\nShort note about your work.\n\nThanks so much,\nAda Lovelace"
+        assert composer._already_signed(body, self.SIG) is True
+
+    def test_a_name_far_above_the_close_does_not_count(self, composer):
+        body = ("Hi Jane,\n\nAda Lovelace\n\nthen four\n\nmore paragraphs\n\n"
+                "of text here\n\nThanks so much,")
+        assert composer._already_signed(body, self.SIG) is False
+
+    def test_an_empty_signature_is_never_considered_signed(self, composer):
+        assert composer._already_signed("Hi Jane,\n\nBody.", "") is False
+
+    def test_an_ai_body_that_introduces_the_sender_keeps_the_signature(self, composer,
+                                                                       monkeypatch):
+        composer.db.update_profile({"full_name": "Ada Lovelace", "school": "Cambridge",
+                                    "phone": "555-0100",
+                                    "website": "https://ada.example"})
+        monkeypatch.setattr("email_composer.get_cloud_llm_provider", lambda: "test")
+        monkeypatch.setattr(
+            "email_composer.llm_complete",
+            lambda prompt, system=None, max_tokens=0: (
+                "Subject: A question about Acme\nBody:\n"
+                "Hi Jane,\n\nMy name is Ada Lovelace and I study at Cambridge. "
+                "I would love fifteen minutes of your time to hear how you think "
+                "about analytical engines.\n\nThanks so much,"))
+        body = composer.compose({"name": "Jane", "company_name": "Acme"}, None,
+                                email_type="application")["body"]
+        assert body.rstrip().endswith("https://ada.example")
+        assert "Phone: 555-0100" in body
+        assert body.count("Phone: 555-0100") == 1
+
+    def test_an_ai_body_that_signs_off_is_not_doubled(self, composer, monkeypatch):
+        composer.db.update_profile({"full_name": "Ada Lovelace", "school": "Cambridge",
+                                    "phone": "555-0100"})
+        monkeypatch.setattr("email_composer.get_cloud_llm_provider", lambda: "test")
+        monkeypatch.setattr(
+            "email_composer.llm_complete",
+            lambda prompt, system=None, max_tokens=0: (
+                "Subject: A question about Acme\nBody:\n"
+                "Hi Jane,\n\nA short and perfectly reasonable note about your work "
+                "and why it interests me.\n\nThanks so much,\nAda Lovelace"))
+        body = composer.compose({"name": "Jane", "company_name": "Acme"}, None,
+                                email_type="application")["body"]
+        assert body.count("Ada Lovelace") == 1
 
 
 class TestSubjectPreambleRejection:
