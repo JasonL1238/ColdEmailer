@@ -24,6 +24,7 @@ from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
                 repair_contact_reply_status, repair_delivered_email_status,
                 repair_mismatched_company_sites,
                 repair_offdomain_contact_warnings,
+                repair_speculative_company_summaries,
                 repair_unverified_legacy_replies)
 from discovery import DiscoveryService
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
@@ -140,6 +141,7 @@ repair_delivered_email_status(db)
 repair_unverified_legacy_replies(db)
 repair_contact_reply_status(db)
 repair_mismatched_company_sites(db)
+repair_speculative_company_summaries(db)
 repair_offdomain_contact_warnings(db)
 resumes.migrate_legacy_resumes(_PROJECT_ROOT)
 _seed_profile_once()

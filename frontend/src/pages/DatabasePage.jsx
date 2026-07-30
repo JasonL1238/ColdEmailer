@@ -499,6 +499,21 @@ function CompanyDrawer({ company, onClose, onChanged, onDeleted, onCompose }) {
         </div>
       )}
 
+      {/* The model's guess at why this matched the search. Deliberately kept
+          out of the research block and out of emails — it is not evidence. */}
+      {company.discovery_note && (
+        <div className="card card-pad" style={{ background: 'var(--surface-hover)' }}>
+          <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>
+            Why the search matched
+          </div>
+          <div className="small" style={{ lineHeight: 1.55 }}>{company.discovery_note}</div>
+          <div className="tiny" style={{ marginTop: 6, color: 'var(--text-3)' }}>
+            Unverified — from the AI that suggested this company, not from their
+            site. Never quoted in your emails.
+          </div>
+        </div>
+      )}
+
       <div>
         <div className="row-between mb-16" style={{ marginBottom: 8 }}>
           <div style={{ fontWeight: 650, fontSize: 13.5 }}>

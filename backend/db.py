@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS companies (
     recent_news TEXT,
     why_care    TEXT,
     location    TEXT,
+    discovery_note TEXT,
     source      TEXT DEFAULT 'manual',
     job_id      TEXT,
     scraped_at  TEXT,
@@ -139,6 +140,10 @@ CREATE INDEX IF NOT EXISTS idx_events_created ON events (created_at);
 _ADDED_COLUMNS = {
     "emails": {"send_attempted_at": "TEXT", "send_attempt_error": "TEXT",
                "response_verified_at": "TEXT"},
+    # Why the search matched this company, per the model that suggested it.
+    # Kept apart from `summary` on purpose: summary is scraped evidence and is
+    # quoted into emails, this is an unverified guess and must not be.
+    "companies": {"discovery_note": "TEXT"},
 }
 
 
@@ -326,6 +331,7 @@ class Database:
             "recent_news": kwargs.get("recent_news"),
             "why_care": kwargs.get("why_care"),
             "location": kwargs.get("location"),
+            "discovery_note": kwargs.get("discovery_note"),
             "source": kwargs.get("source", "manual"),
             "job_id": kwargs.get("job_id"),
             "scraped_at": kwargs.get("scraped_at"),
@@ -1073,6 +1079,33 @@ def repair_unverified_legacy_replies(db: "Database") -> int:
     db.set_setting("unverified_replies_reported", unverified)
     print(f"[startup] {detail}")
     return unverified
+
+
+def repair_speculative_company_summaries(db: "Database") -> int:
+    """Move unscraped "summaries" out of the field emails quote from.
+
+    When scraping failed, discovery used to store the model's one-line guess at
+    why the company matched the search into `summary` — the same field the
+    composer quotes as researched fact. The guess is indistinguishable from
+    evidence once it is in there, so an email could tell a real person what
+    their company does on the strength of nothing. Idempotent.
+    """
+    rows = db.query(
+        "SELECT id, name, summary FROM companies "
+        "WHERE summary IS NOT NULL AND summary <> '' "
+        "AND discovery_note IS NULL "
+        "AND scrape_status IN ('scrape_failed', 'no_website', 'wrong_site')"
+    )
+    for row in rows:
+        db.update_company(row["id"], {
+            "summary": None,
+            "discovery_note": row["summary"],
+        })
+    if rows:
+        db.log_event("system", None, "repair",
+                     f"Moved {len(rows)} unscraped company description(s) out of research")
+        print(f"[startup] moved {len(rows)} speculative company summary/-ies to notes")
+    return len(rows)
 
 
 def repair_contact_reply_status(db: "Database") -> int:
