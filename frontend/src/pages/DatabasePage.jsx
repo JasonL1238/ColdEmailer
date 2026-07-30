@@ -8,7 +8,7 @@ import {
 import { companiesAPI, contactsAPI, errMessage } from '../api'
 import {
   Button, Chip, Drawer, EmptyState, Modal, Segmented, Spinner,
-  initials, timeAgo, CONTACT_STATUS_META, EMAIL_TYPE_META,
+  initials, timeAgo, contactStatusMeta, EMAIL_TYPE_META,
 } from '../ui'
 import { useApp } from '../App'
 import ComposeModal from './ComposeModal'
@@ -319,7 +319,17 @@ function CompaniesTable({ companies, onOpen, onDiscover, anyData }) {
                 <td><Chip tone={st.tone}>{st.label}</Chip></td>
                 <td>{c.contact_count}</td>
                 <td>{c.sent_count}</td>
-                <td>{c.reply_count > 0 ? <Chip tone="green">{c.reply_count}</Chip> : <span className="muted">0</span>}</td>
+                <td>
+                  {c.reply_count > 0
+                    ? <Chip tone="green">{c.reply_count}</Chip>
+                    : c.unverified_reply_count > 0
+                      // Flagged by the older reply check, never confirmed — an
+                      // amber "?" instead of a green count that isn't backed up.
+                      ? <Chip tone="amber" title="Flagged by an older reply check and not yet verified against Gmail">
+                        {c.unverified_reply_count}?
+                      </Chip>
+                      : <span className="muted">0</span>}
+                </td>
                 <td className="td-dim">{timeAgo(c.created_at)}</td>
               </tr>
             )
@@ -359,7 +369,7 @@ function ContactsTable({ contacts, selected, onToggle, onToggleAll, allSelected,
         </thead>
         <tbody>
           {contacts.map((c) => {
-            const st = CONTACT_STATUS_META[c.status] || CONTACT_STATUS_META.new
+            const st = contactStatusMeta(c)
             return (
               <tr key={c.id} className={selected.has(c.id) ? 'selected' : ''}>
                 <td>
@@ -379,7 +389,7 @@ function ContactsTable({ contacts, selected, onToggle, onToggleAll, allSelected,
                 </td>
                 <td className="td-dim">{c.company_name || '—'}</td>
                 <td className="td-dim">{c.role || '—'}</td>
-                <td><Chip tone={st.tone}>{st.label}</Chip></td>
+                <td><Chip tone={st.tone} title={st.title}>{st.label}</Chip></td>
                 <td>{c.email_count || 0}</td>
                 <td className="td-dim">{timeAgo(c.created_at)}</td>
                 <td>
@@ -430,7 +440,20 @@ function CompanyDrawer({ company, onClose, onChanged, onDeleted, onCompose }) {
   const del = async () => {
     if (!window.confirm(`Delete ${company.name} and all its contacts + emails?`)) return
     try { await companiesAPI.delete(company.id); toast.success('Company deleted'); onDeleted() }
-    catch (e) { toast.error(errMessage(e)) }
+    catch (e) {
+      // 409 = the cascade would erase delivered emails (and the reply history
+      // that stops those people being emailed twice). Name the count and make
+      // the user confirm, the way the contact delete does.
+      if (e?.response?.status === 409 && window.confirm(`${errMessage(e)}\n\nDelete anyway?`)) {
+        try {
+          await companiesAPI.delete(company.id, true)
+          toast.success('Company and its email history deleted')
+          onDeleted()
+        } catch (e2) { toast.error(errMessage(e2)) }
+      } else if (e?.response?.status !== 409) {
+        toast.error(errMessage(e))
+      }
+    }
   }
 
   const st = SCRAPE_STATUS[company.scrape_status] || SCRAPE_STATUS.pending
@@ -492,7 +515,7 @@ function CompanyDrawer({ company, onClose, onChanged, onDeleted, onCompose }) {
         ) : (
           <div className="stack" style={{ gap: 8 }}>
             {company.contacts.map((c) => {
-              const cst = CONTACT_STATUS_META[c.status] || CONTACT_STATUS_META.new
+              const cst = contactStatusMeta(c)
               return (
                 <div key={c.id} className="card card-pad row-between" style={{ padding: '10px 14px' }}>
                   <div>
@@ -506,7 +529,7 @@ function CompanyDrawer({ company, onClose, onChanged, onDeleted, onCompose }) {
                     )}
                   </div>
                   <div className="row">
-                    <Chip tone={cst.tone}>{cst.label}</Chip>
+                    <Chip tone={cst.tone} title={cst.title}>{cst.label}</Chip>
                     <button className="icon-btn" title="Generate email" onClick={() => onCompose([c.id])}>
                       <Sparkles size={14} />
                     </button>
@@ -535,7 +558,10 @@ function CompanyDrawer({ company, onClose, onChanged, onDeleted, onCompose }) {
                     <Chip tone={tm.tone}>{tm.label}</Chip>
                   </div>
                   <div className="tiny mt-8" style={{ marginTop: 4 }}>
-                    to {e.contact_email} · {e.status}{e.has_response ? ' · replied ✓' : ''} · {timeAgo(e.created_at)}
+                    to {e.contact_email} · {e.status}
+                    {e.has_response
+                      ? (e.response_verified_at ? ' · replied ✓' : ' · replied (unverified)')
+                      : ''} · {timeAgo(e.created_at)}
                   </div>
                 </div>
               )

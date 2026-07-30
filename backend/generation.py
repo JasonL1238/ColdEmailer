@@ -14,6 +14,10 @@ from enrichment import EnrichmentService, scrape_status_for
 from rate_limiter import RateLimiter
 
 
+class GenerationBusy(RuntimeError):
+    """A generation worker is still alive, so a second run cannot start."""
+
+
 class GenerationService:
     def __init__(self, db: Database, composer: EmailComposer,
                  enrichment: EnrichmentService, rate_limiter: RateLimiter):
@@ -21,6 +25,15 @@ class GenerationService:
         self.composer = composer
         self.enrichment = enrichment
         self.rate_limiter = rate_limiter
+        # Held for the lifetime of the worker thread, not just while the job row
+        # says "running". Cancelling flips the row immediately while the thread
+        # is still inside compose(), so a job-status check alone lets the next
+        # run start alongside it — and both then draft the same first-contact
+        # email, because neither has inserted a row for the other to see.
+        self._busy = threading.Lock()
+
+    def is_busy(self) -> bool:
+        return self._busy.locked()
 
     def start(self, contact_ids: List[str], email_type: str = DEFAULT_TYPE,
               resume_id: Optional[str] = None,
@@ -36,9 +49,18 @@ class GenerationService:
             "use_template_only": use_template_only,
             "allow_recontact": allow_recontact,
         }
-        job = self.db.create_job("generation", payload)
-        threading.Thread(target=self._run_safe, args=(job["id"], payload),
-                         daemon=True).start()
+        if not self._busy.acquire(blocking=False):
+            raise GenerationBusy(
+                "The last generation run is still finishing up — give it a few "
+                "seconds and try again.")
+        try:
+            job = self.db.create_job("generation", payload)
+            threading.Thread(target=self._run_safe, args=(job["id"], payload),
+                             daemon=True).start()
+        except Exception:
+            # The worker owns the release, and it never started.
+            self._busy.release()
+            raise
         return job
 
     def cancel(self, job_id: str) -> bool:
@@ -90,6 +112,9 @@ class GenerationService:
         except Exception as e:
             print(f"[generation] job {job_id} crashed: {e}")
             self.db.finish_job(job_id, status="failed", error=str(e))
+        finally:
+            if self._busy.locked():
+                self._busy.release()
 
     def _ensure_company_researched(self, company_id: Optional[str],
                                    allow_research: bool = True) -> Optional[Dict]:
@@ -194,6 +219,19 @@ class GenerationService:
                 # template here would ignore the instructions entirely.
                 skipped.append(self._skip_entry(contact_id, str(e)))
                 continue
+            # compose() takes seconds, so a Cancel click almost always lands
+            # inside it. Discarding the composed text here is what stops a
+            # cancelled run inserting one more draft (and charging quota for it).
+            if self._cancelled(job_id):
+                break
+            # Re-checked in the same breath as the insert: the guard above ran
+            # before compose(), long enough ago for a concurrent run to have
+            # drafted this person in the meantime.
+            if not payload.get("allow_recontact") and self._already_contacted(contact_id):
+                skipped.append(self._skip_entry(
+                    contact_id,
+                    "already emailed — use Draft follow-up instead of a new first email"))
+                continue
             self.rate_limiter.record_email_generation()
             email = self.db.create_email(
                 contact_id=contact["id"],
@@ -215,14 +253,17 @@ class GenerationService:
             self.db.update_job(job_id, progress_current=i + 1)
 
         was_cancelled = self._cancelled(job_id)
-        # Progress reflects what was actually accounted for: each contact is
-        # either drafted or listed in `skipped`. It only reads 100% when
-        # nothing was dropped, so the bar can never overstate the run.
-        accounted = min(len(generated_ids) + len(skipped), total)
-        self.db.update_job(job_id, progress_current=accounted)
+        # Progress counts drafts written, nothing else. Counting skips as
+        # progress filled the bar to 100% and labelled skipped contacts "done",
+        # so a run that drafted nothing at all still reported "3/3 done" under
+        # the title "Drafts ready". Skips are reported on their own, by name.
+        self.db.update_job(job_id, progress_current=min(len(generated_ids), total),
+                           stage=f"{len(generated_ids)} drafted"
+                                 + (f", {len(skipped)} skipped" if skipped else ""))
         self.db.finish_job(
             job_id,
             status="cancelled" if was_cancelled else "done",
             result={"generated": len(generated_ids), "total": total,
+                    "skipped_count": len(skipped),
                     "email_ids": generated_ids, "skipped": skipped},
         )

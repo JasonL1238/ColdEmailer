@@ -88,11 +88,21 @@ CREATE TABLE IF NOT EXISTS emails (
     gmail_thread_id     TEXT,
     has_response        INTEGER DEFAULT 0,
     response_at         TEXT,
+    -- When the *current* reply checker confirmed this reply. NULL means the
+    -- flag has never been verified by it (legacy rows imported from the old
+    -- checker, which counted bounces, auto-replies and our own messages), so
+    -- nothing may present such a reply — or its date — as established fact.
+    response_verified_at TEXT,
     original_email_id   TEXT,
     is_follow_up        INTEGER DEFAULT 0,
     used_template_fallback INTEGER DEFAULT 0,
     fallback_reason     TEXT,
-    custom_instructions TEXT
+    custom_instructions TEXT,
+    -- Set when a message was handed to Gmail but the answer never came back
+    -- (read timeout, reset, 5xx). Gmail may well have queued it, so the row is
+    -- NOT a safe retry until delivery is confirmed one way or the other.
+    send_attempted_at   TEXT,
+    send_attempt_error  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_emails_contact ON emails (contact_id);
 CREATE INDEX IF NOT EXISTS idx_emails_status ON emails (status);
@@ -123,12 +133,73 @@ CREATE INDEX IF NOT EXISTS idx_events_created ON events (created_at);
 """
 
 
-# A live (non-trashed) follow-up already drafted for this email. Surfaced on
-# every email row so the UI can stop offering "Draft follow-up" a second time.
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an
+# existing table alone, so they have to be added explicitly or every query
+# touching them fails against the user's real database.
+_ADDED_COLUMNS = {
+    "emails": {"send_attempted_at": "TEXT", "send_attempt_error": "TEXT",
+               "response_verified_at": "TEXT"},
+}
+
+
+# A live (non-trashed) follow-up already drafted for *this person*, not just for
+# this row. A contact with several sent first-contact emails used to be offered
+# (and given) one follow-up per email, so two near-identical "just following up"
+# notes reached the same human from one batch.
 _HAS_FOLLOW_UP_SQL = (
-    "EXISTS (SELECT 1 FROM emails f "
-    "WHERE f.original_email_id = e.id AND f.status <> 'trashed')"
+    "EXISTS (SELECT 1 FROM emails f JOIN emails o ON f.original_email_id = o.id "
+    "WHERE f.status <> 'trashed' AND (o.id = e.id OR "
+    "(e.contact_id IS NOT NULL AND o.contact_id = e.contact_id)))"
 )
+
+
+# True when *this person* has answered any of our emails — not just when this
+# particular row was answered. A follow-up written on the premise of silence is
+# an embarrassing thing to send someone who already wrote back, and the reply
+# can easily sit on a sibling email.
+#
+# Only replies the current checker has confirmed count. An unverified legacy
+# flag is not evidence of anything, and letting it stand in for a real reply
+# switched the follow-up pipeline off for most of the database.
+_CONTACT_HAS_REPLIED_SQL = (
+    "EXISTS (SELECT 1 FROM emails r "
+    "WHERE r.contact_id = e.contact_id AND r.has_response = 1 "
+    "AND r.response_verified_at IS NOT NULL)"
+)
+
+
+# A reply flag on this row (or on a sibling email to the same person) that the
+# current checker has never confirmed. Surfaced so the UI can say "unverified"
+# instead of printing a fabricated reply date as fact.
+_REPLY_UNVERIFIED_SQL = "(e.has_response = 1 AND e.response_verified_at IS NULL)"
+_CONTACT_REPLY_UNVERIFIED_SQL = (
+    "EXISTS (SELECT 1 FROM emails r "
+    "WHERE r.contact_id = e.contact_id AND r.has_response = 1 "
+    "AND r.response_verified_at IS NULL)"
+)
+
+
+# Wording that promises the recipient a file. The composer decides once, while
+# writing, whether a real PDF will go out ("My resume is attached for
+# convenience."); the send dialog can still switch the attachment off or swap
+# it, and nothing used to compare the two. Detected from the text rather than a
+# compose-time flag so the rows written before this existed are covered too.
+#
+# Lives here (and not in email_composer, which promises it) only because
+# email_composer imports db: this direction keeps the import graph acyclic.
+_ATTACHMENT_CLAIM_RE = re.compile(
+    # "my resume is attached", "the deck is attached below"
+    r"\b(?:resume|cv|portfolio|deck|attachment)\b[^.\n]{0,40}\b(?:is|are)\s+attached"
+    # "I've attached my resume", "attached my website and resume", "attached resume"
+    r"|\battach(?:ed|ing)\b[^.\n]{0,40}?\b(?:resume|cv|portfolio|deck)\b"
+    # "please find attached", "see the attached"
+    r"|\b(?:find|see)\s+(?:my\s+)?(?:attached|the\s+attached)\b",
+    re.I)
+
+
+def body_claims_attachment(body: Optional[str]) -> bool:
+    """True when this email body tells the recipient something is attached."""
+    return bool(_ATTACHMENT_CLAIM_RE.search(body or ""))
 
 
 def now_iso() -> str:
@@ -153,8 +224,17 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
+            self._add_missing_columns()
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn.commit()
+
+    def _add_missing_columns(self):
+        """Bring an existing database up to the current schema."""
+        for table, columns in _ADDED_COLUMNS.items():
+            have = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns.items():
+                if name not in have:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     # ---------- low-level helpers ----------
 
@@ -285,8 +365,14 @@ class Database:
                    (SELECT COUNT(*) FROM contacts ct WHERE ct.company_id = c.id) AS contact_count,
                    (SELECT COUNT(*) FROM emails e JOIN contacts ct ON e.contact_id = ct.id
                      WHERE ct.company_id = c.id AND e.status = 'sent') AS sent_count,
+                   -- Verified replies only: the green count is read as fact, and
+                   -- unverified legacy flags cannot back that up.
                    (SELECT COUNT(*) FROM emails e JOIN contacts ct ON e.contact_id = ct.id
-                     WHERE ct.company_id = c.id AND e.has_response = 1) AS reply_count
+                     WHERE ct.company_id = c.id AND e.has_response = 1
+                       AND e.response_verified_at IS NOT NULL) AS reply_count,
+                   (SELECT COUNT(*) FROM emails e JOIN contacts ct ON e.contact_id = ct.id
+                     WHERE ct.company_id = c.id AND e.has_response = 1
+                       AND e.response_verified_at IS NULL) AS unverified_reply_count
             FROM companies c
         """
         params: tuple = ()
@@ -349,7 +435,15 @@ class Database:
             SELECT ct.*, c.name AS company_name, c.url AS company_url,
                    (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id) AS email_count,
                    (SELECT MAX(e.sent_at) FROM emails e WHERE e.contact_id = ct.id
-                     AND e.status='sent') AS last_sent_at
+                     AND e.status='sent') AS last_sent_at,
+                   -- A 'Replied' chip resting only on unverified legacy flags is
+                   -- an assertion the app cannot back up, so let the UI say so.
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND e.has_response=1 AND e.response_verified_at IS NOT NULL)
+                     AS verified_reply_count,
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND e.has_response=1 AND e.response_verified_at IS NULL)
+                     AS unverified_reply_count
             FROM contacts ct LEFT JOIN companies c ON ct.company_id = c.id
         """
         clauses, params = [], []
@@ -427,6 +521,7 @@ class Database:
             "gmail_thread_id": kwargs.get("gmail_thread_id"),
             "has_response": 1 if kwargs.get("has_response") else 0,
             "response_at": kwargs.get("response_at"),
+            "response_verified_at": kwargs.get("response_verified_at"),
             "original_email_id": kwargs.get("original_email_id"),
             "is_follow_up": 1 if kwargs.get("is_follow_up") else 0,
             "used_template_fallback": 1 if kwargs.get("used_template_fallback") else 0,
@@ -436,24 +531,37 @@ class Database:
         self._insert("emails", data)
         return data
 
+    @staticmethod
+    def _annotate_email(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Add fields derived from the body, so the UI and the send guard agree
+        on whether this draft promises the recipient an attachment."""
+        if row is not None:
+            row["claims_attachment"] = 1 if body_claims_attachment(row.get("body")) else 0
+        return row
+
     def get_email(self, email_id: str) -> Optional[Dict[str, Any]]:
-        return self.query_one(
+        return self._annotate_email(self.query_one(
             f"""SELECT e.*, ct.name AS contact_name, ct.email AS contact_email,
                       ct.role AS contact_role, c.name AS company_name,
-                      {_HAS_FOLLOW_UP_SQL} AS has_follow_up
+                      {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
+                      {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
+                      {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
+                      {_CONTACT_REPLY_UNVERIFIED_SQL} AS contact_reply_unverified
                FROM emails e
                LEFT JOIN contacts ct ON e.contact_id = ct.id
                LEFT JOIN companies c ON ct.company_id = c.id
                WHERE e.id=?""",
             (email_id,),
-        )
+        ))
 
     def update_email(self, email_id: str, updates: Dict[str, Any]):
         allowed = {
             "subject", "body", "status", "sent_at", "gmail_message_id",
-            "gmail_thread_id", "has_response", "response_at", "email_type",
+            "gmail_thread_id", "has_response", "response_at",
+            "response_verified_at", "email_type",
             "resume_id", "used_template_fallback", "fallback_reason",
             "custom_instructions", "is_follow_up", "original_email_id",
+            "send_attempted_at", "send_attempt_error",
         }
         updates = {k: v for k, v in updates.items() if k in allowed}
         for bool_key in ("has_response", "is_follow_up", "used_template_fallback"):
@@ -469,7 +577,10 @@ class Database:
         sql = f"""
             SELECT e.*, ct.name AS contact_name, ct.email AS contact_email,
                    ct.role AS contact_role, c.name AS company_name,
-                   {_HAS_FOLLOW_UP_SQL} AS has_follow_up
+                   {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
+                   {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
+                   {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
+                   {_CONTACT_REPLY_UNVERIFIED_SQL} AS contact_reply_unverified
             FROM emails e
             LEFT JOIN contacts ct ON e.contact_id = ct.id
             LEFT JOIN companies c ON ct.company_id = c.id
@@ -479,7 +590,7 @@ class Database:
             sql += " WHERE e.status=?"
             params = (status,)
         sql += " ORDER BY e.created_at DESC"
-        return self.query(sql, params)
+        return [self._annotate_email(row) for row in self.query(sql, params)]
 
     def get_follow_up_candidates(self, days: int = 7) -> List[Dict[str, Any]]:
         """One candidate per contact who has never replied to anything.
@@ -489,6 +600,11 @@ class Database:
         quiet", and a contact mailed three times would be offered three
         separate follow-ups. The MAX(e.sent_at) aggregate makes SQLite pick
         the most recent unanswered email for each contact.
+
+        "Replied" means a reply the current checker confirmed. An unverified
+        legacy flag is not evidence, and treating it as one silently removed
+        most of the pipeline from this list — the banner said "2 contacts went
+        quiet" while a hundred genuinely unanswered ones were suppressed.
 
         Every test that decides whether a *contact* is due has to run on the
         whole group, not on individual rows. A row-level `sent_at < cutoff`
@@ -518,6 +634,7 @@ class Database:
                  AND NOT EXISTS (
                      SELECT 1 FROM emails r
                      WHERE r.contact_id = e.contact_id AND r.has_response = 1
+                       AND r.response_verified_at IS NOT NULL
                  )
                GROUP BY COALESCE(e.contact_id, e.id)
                HAVING _latest_sent_at < ?
@@ -779,21 +896,37 @@ def repair_mismatched_company_sites(db: "Database") -> int:
     UI and would be quoted back to a real person, so clear the invented
     research and mark the row for re-research. Contacts and email history are
     left untouched. Idempotent.
+
+    Two things this deliberately does NOT do:
+
+    * It never treats `summary` as identity evidence. The summary is LLM output
+      produced from a prompt that opens "Company name: {name}", so the model
+      writes the name back out almost every time — the fabricated profiles this
+      repair exists to quarantine were the ones that check kept letting through.
+      Live enrichment verifies against the *scraped page text*, which is not
+      persisted, so a domain-mismatched row simply has no trustworthy proof
+      here. Re-research restores anything wrongly caught.
+    * It does not limit itself to already-scraped rows. A row whose scrape never
+      produced a summary sits at 'pending' while still holding the junk
+      url/domain the search picked, and that domain then becomes the yardstick
+      for "is this contact address off domain" warnings. `domain` is only ever
+      written by enrichment (never by the user), so every row carrying one is
+      fair game.
     """
-    from enrichment import domain_matches_name, page_mentions_company
+    from enrichment import domain_matches_name, registered_domain
 
     rows = db.query(
-        "SELECT id, name, domain, summary, scrape_status FROM companies "
-        "WHERE domain IS NOT NULL AND scrape_status IN ('scraped', 'wrong_site')"
+        "SELECT id, name, domain, scrape_status FROM companies "
+        "WHERE domain IS NOT NULL AND domain <> ''"
     )
     repaired = 0
     for row in rows:
+        # Legacy rows stored a full netloc, so compare on the registered domain
+        # ("tower.betterview.com" is still BetterView's site).
+        domain = registered_domain(row["domain"]) or row["domain"]
         # Rows already flagged wrong_site still need their bogus url/domain
         # cleared — an earlier version of this repair left them behind.
-        already_flagged = row["scrape_status"] == "wrong_site"
-        if not already_flagged and domain_matches_name(row["name"], row["domain"]):
-            continue
-        if not already_flagged and page_mentions_company(row["name"], row["summary"] or ""):
+        if row["scrape_status"] != "wrong_site" and domain_matches_name(row["name"], domain):
             continue
         db.update_company(row["id"], {
             "scrape_status": "wrong_site",
@@ -812,6 +945,16 @@ def repair_mismatched_company_sites(db: "Database") -> int:
     return repaired
 
 
+def _is_offdomain_warning(note: Optional[str]) -> bool:
+    """True for a note this repair wrote (and only for one of those).
+
+    Discovery's own live warning reads "Found on the site but not on ...", and
+    anything the user typed is theirs — neither may be cleared.
+    """
+    note = (note or "").strip()
+    return note.startswith("Not on ") and "Verify this address really reaches" in note
+
+
 def repair_offdomain_contact_warnings(db: "Database") -> int:
     """Flag existing contacts whose address isn't on their company's domain.
 
@@ -819,45 +962,137 @@ def repair_offdomain_contact_warnings(db: "Database") -> int:
     that belong to a different company entirely (hello@ultravox.ai filed under
     Fixie.ai). New ones carry a warning note; backfill the old ones so the same
     caution shows before the user sends. Never overwrites an existing note.
+
+    The warning is only as good as the domain it cites, so it is withheld when
+    the domain cannot carry that weight, and any earlier note this repair wrote
+    under those conditions is cleared:
+
+    * If the company's stored domain does not itself look like the company's
+      (Figure AI -> ezeedomains.com), it is not a yardstick — citing it inverts
+      the advice and tells the user to distrust brett.adcock@figure.ai.
+    * Someone who already replied, or who has been mailed, has proved the
+      address reaches them. "Verify before sending" is noise there.
     """
-    from enrichment import registered_domain
+    from enrichment import domain_matches_name, registered_domain
 
     rows = db.query(
-        """SELECT ct.id, ct.email, c.domain, c.name AS company_name
-           FROM contacts ct JOIN companies c ON ct.company_id = c.id
-           WHERE ct.email <> '' AND c.domain IS NOT NULL
-             AND c.scrape_status <> 'wrong_site'
-             AND (ct.notes IS NULL OR ct.notes = '')"""
+        """SELECT ct.id, ct.email, ct.status, ct.notes,
+                  c.domain, c.name AS company_name, c.scrape_status,
+                  (SELECT COUNT(*) FROM emails e
+                    WHERE e.contact_id = ct.id AND e.status = 'sent') AS sent_count
+           FROM contacts ct LEFT JOIN companies c ON ct.company_id = c.id
+           WHERE ct.email <> ''"""
     )
-    flagged = 0
+    flagged = cleared = 0
     for row in rows:
-        email_domain = registered_domain(row["email"].split("@")[-1])
-        if email_domain == row["domain"]:
-            continue
-        db.update_contact(row["id"], {
-            "notes": (f"Not on {row['domain']}. Verify this address really "
-                      f"reaches {row['company_name']} before sending.")})
-        flagged += 1
+        domain = registered_domain(row["domain"] or "") or (row["domain"] or "")
+        engaged = row["status"] == "replied" or bool(row["sent_count"])
+        trustworthy = (bool(domain) and row["scrape_status"] != "wrong_site"
+                       and domain_matches_name(row["company_name"] or "", domain))
+        # Both sides through registered_domain: a stored netloc with a subdomain
+        # ("tower.betterview.com") could never equal "betterview.com".
+        on_domain = registered_domain(row["email"].split("@")[-1]) == domain
+        warranted = trustworthy and not on_domain and not engaged
+
+        if warranted and not (row["notes"] or "").strip():
+            db.update_contact(row["id"], {
+                "notes": (f"Not on {domain}. Verify this address really "
+                          f"reaches {row['company_name']} before sending.")})
+            flagged += 1
+        elif not warranted and _is_offdomain_warning(row["notes"]):
+            db.update_contact(row["id"], {"notes": None})
+            cleared += 1
     if flagged:
         db.log_event("system", None, "repair",
                      f"Flagged {flagged} contact(s) whose address is off the company domain")
         print(f"[startup] flagged {flagged} off-domain contact(s)")
+    if cleared:
+        db.log_event("system", None, "repair",
+                     f"Cleared {cleared} off-domain warning(s) that cited an "
+                     f"unverified domain or a contact who already replied")
+        print(f"[startup] cleared {cleared} misleading off-domain warning(s)")
     return flagged
+
+
+def _batch_stamped_reply_ids(db: "Database") -> List[str]:
+    """Reply rows whose response_at is really the moment a checker *ran*.
+
+    The legacy checker wrote `datetime.now()` for every hit, so a polling loop
+    over 113 threads left 113 "reply times" seconds apart inside one window.
+    A genuine Gmail internalDate does not cluster like that. Any response_at
+    shared to the minute by three or more rows is treated as a batch stamp.
+    """
+    buckets = db.query(
+        """SELECT substr(response_at, 1, 16) AS minute, COUNT(*) AS n
+           FROM emails
+           WHERE has_response = 1 AND response_at IS NOT NULL AND response_at <> ''
+           GROUP BY minute HAVING n >= 3"""
+    )
+    if not buckets:
+        return []
+    minutes = [b["minute"] for b in buckets]
+    marks = ", ".join(["?"] * len(minutes))
+    rows = db.query(
+        f"""SELECT id FROM emails
+            WHERE has_response = 1 AND substr(response_at, 1, 16) IN ({marks})""",
+        tuple(minutes),
+    )
+    return [r["id"] for r in rows]
+
+
+def repair_unverified_legacy_replies(db: "Database") -> int:
+    """Record that pre-existing reply flags have never been verified.
+
+    Every reply the *current* checker confirms carries a response_verified_at,
+    so rows without one are exactly the flags inherited from the legacy checker
+    — which counted bounces, auto-replies and our own messages in the thread.
+    Nothing may print those as fact, and they must not gate the follow-up
+    pipeline; that is enforced by the response_verified_at column itself.
+
+    This repair only *reports* the situation (once) so the count is visible in
+    the activity feed, and points at the fix. It deliberately makes no Gmail
+    calls: re-verification is the user's "Re-verify replies" action, which can
+    tell "no reply" apart from "the check failed".
+    """
+    unverified = db.query_one(
+        "SELECT COUNT(*) AS n FROM emails "
+        "WHERE has_response = 1 AND response_verified_at IS NULL")["n"]
+    if not unverified:
+        return 0
+    batch_stamped = len(_batch_stamped_reply_ids(db))
+    seen = db.get_setting("unverified_replies_reported")
+    if seen == unverified:
+        return unverified
+    detail = (f"{unverified} reply flag(s) predate the current reply checker and "
+              f"are shown as unverified")
+    if batch_stamped:
+        detail += (f" — {batch_stamped} carry a batch timestamp (the moment the old "
+                   f"checker ran, not a real reply time)")
+    detail += ". Use \"Re-verify replies\" to re-check them against Gmail."
+    db.log_event("system", None, "repair", detail)
+    db.set_setting("unverified_replies_reported", unverified)
+    print(f"[startup] {detail}")
+    return unverified
 
 
 def repair_contact_reply_status(db: "Database") -> int:
     """Give contacts who replied the 'replied' status.
 
     contacts.status was only ever advanced when a reply was discovered live by
-    check-replies, so replies that arrived before that code existed (or were
-    imported from the legacy store) left the person showing as merely 'Sent'.
-    The Database page then hides the single most useful fact about them.
-    Idempotent, and it never downgrades a contact.
+    check-replies, so replies that arrived before that code existed left the
+    person showing as merely 'Sent'. The Database page then hides the single
+    most useful fact about them. Idempotent, and it never downgrades a contact.
+
+    Only *verified* replies promote a contact. This repair used to spread the
+    legacy false positives from emails onto 114 contact chips, which is the
+    opposite of helpful — an unverified flag is surfaced as "unverified"
+    instead (see list_contacts).
     """
     rows = db.query(
         """SELECT DISTINCT ct.id FROM contacts ct
            JOIN emails e ON e.contact_id = ct.id
-           WHERE e.has_response = 1 AND ct.status <> 'replied'"""
+           WHERE e.has_response = 1 AND e.response_verified_at IS NOT NULL
+             AND ct.status <> 'replied'"""
     )
     for row in rows:
         db.update_contact(row["id"], {"status": "replied"})

@@ -4,15 +4,18 @@ import base64
 import email as email_lib
 import os
 import tempfile
+import threading
+import time
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 
 from db import Database
 from email_composer import EmailComposer
-from email_sender import EmailSender, _sanitize_header
+from email_sender import EmailSender, _refused_by_gmail, _sanitize_header
 from enrichment import EnrichmentService
-from generation import GenerationService
+from generation import GenerationBusy, GenerationService
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
 
@@ -184,6 +187,154 @@ class TestMimeCorrectness:
         pytest.fail("no attachment found")
 
 
+class _Resp:
+    def __init__(self, status):
+        self.status = status
+
+
+def _sender_that_raises(exc):
+    sender = EmailSender(credentials_path="/nonexistent", token_path="/nonexistent")
+    service = MagicMock()
+    service.users.return_value.messages.return_value.send.return_value.execute.side_effect = exc
+    sender.service = service
+    return sender
+
+
+class TestIndeterminateSendResult:
+    """Losing the response to an accepted POST is ordinary — a batch sleeps 3s
+    per message and runs for minutes. "We don't know" must not be reported as
+    "it didn't go out", because only the second one is a safe retry."""
+
+    def _send(self, sender):
+        return sender.send_email({"id": "e1", "contact_email": "ok@example.com",
+                                  "subject": "Hello",
+                                  "body": "A body long enough to be realistic."}, "me")
+
+    def test_a_lost_response_is_flagged_as_unknown(self):
+        result = self._send(_sender_that_raises(TimeoutError("timed out reading response")))
+        assert result["success"] is False
+        assert result["delivery_unknown"] is True
+
+    def test_a_server_error_is_flagged_as_unknown(self):
+        exc = Exception("backend error")
+        exc.resp = _Resp(500)
+        assert self._send(_sender_that_raises(exc))["delivery_unknown"] is True
+
+    @pytest.mark.parametrize("status", [408, 429])
+    def test_come_back_later_does_not_rule_out_delivery(self, status):
+        exc = Exception("slow down")
+        exc.resp = _Resp(status)
+        assert self._send(_sender_that_raises(exc))["delivery_unknown"] is True
+
+    @pytest.mark.parametrize("status", [400, 403, 404])
+    def test_a_gmail_refusal_is_a_verdict_and_stays_retryable(self, status):
+        exc = Exception("refused")
+        exc.resp = _Resp(status)
+        assert self._send(_sender_that_raises(exc))["delivery_unknown"] is False
+
+    def test_a_bad_recipient_never_reaches_gmail_at_all(self):
+        sender, _ = _sender_with_capture()
+        result = sender.send_email({"id": "e", "contact_email": "not an address",
+                                    "subject": "Hi", "body": "Hello there."}, "me")
+        assert result["success"] is False
+        assert not result.get("delivery_unknown")
+
+    def test_helper_ignores_a_missing_status(self):
+        assert _refused_by_gmail(Exception("no status here")) is False
+
+    @staticmethod
+    def _sender_with_sent_folder(messages, metadata):
+        """messages = what list() returns; metadata = {id: (subject, epoch_ms)}."""
+        sender = EmailSender(credentials_path="/x", token_path="/x")
+        service = MagicMock()
+        service.users.return_value.messages.return_value.list.return_value.execute.return_value = {
+            "messages": messages}
+
+        def _get(userId, id, format, metadataHeaders):
+            subject, internal = metadata[id]
+            result = MagicMock()
+            result.execute.return_value = {
+                "internalDate": str(internal),
+                "payload": {"headers": [{"name": "Subject", "value": subject}]},
+            }
+            return result
+
+        service.users.return_value.messages.return_value.get.side_effect = _get
+        sender.service = service
+        return sender, service
+
+    def test_find_delivered_message_reports_a_message_in_the_sent_folder(self):
+        sender, _ = self._sender_with_sent_folder(
+            [{"id": "m1", "threadId": "t1"}], {"m1": ("Hello", 1_700_000_000_000)})
+        assert sender.find_delivered_message("ok@example.com", "Hello") == {
+            "gmail_message_id": "m1", "gmail_thread_id": "t1"}
+
+    def test_the_lookup_is_bounded_by_the_attempt_and_checks_the_real_send_time(self):
+        """Template subjects are deterministic, so an *older* copy of the same
+        subject to the same person matches the same search. Accepting it marked
+        a row delivered (with today's timestamp and the old message's ids) for an
+        email that never went out."""
+        attempt = "2026-07-29T16:40:00"
+        attempt_epoch = int(datetime.fromisoformat(attempt).timestamp())
+        older_ms = (attempt_epoch - 3600) * 1000
+        sender, service = self._sender_with_sent_folder(
+            [{"id": "old", "threadId": "told"}],
+            {"old": ("Internship inquiry at Acme", older_ms)})
+
+        assert sender.find_delivered_message(
+            "ok@example.com", "Internship inquiry at Acme", sent_after=attempt) is None
+        # ...and the search itself was bounded, rather than relying on the recheck
+        q = service.users.return_value.messages.return_value.list.call_args.kwargs["q"]
+        assert f"after:{attempt_epoch - 60}" in q
+
+    def test_a_phrase_match_on_a_longer_subject_is_not_accepted(self):
+        """Gmail's subject: operator is a phrase match, not an equality test."""
+        sender, _ = self._sender_with_sent_folder(
+            [{"id": "m1", "threadId": "t1"}],
+            {"m1": ("Internship inquiry at Acme Robotics", 1_700_000_000_000)})
+        assert sender.find_delivered_message(
+            "ok@example.com", "Internship inquiry at Acme") is None
+
+    def test_the_first_identifiable_candidate_wins(self):
+        """maxResults=5, so a stale first hit must not hide the real one."""
+        attempt = "2026-07-29T16:40:00"
+        attempt_epoch = int(datetime.fromisoformat(attempt).timestamp())
+        sender, _ = self._sender_with_sent_folder(
+            [{"id": "old", "threadId": "told"}, {"id": "new", "threadId": "tnew"}],
+            {"old": ("Hello", (attempt_epoch - 7200) * 1000),
+             "new": ("Hello", (attempt_epoch + 5) * 1000)})
+        assert sender.find_delivered_message(
+            "ok@example.com", "Hello", sent_after=attempt) == {
+                "gmail_message_id": "new", "gmail_thread_id": "tnew"}
+
+    def test_an_unidentifiable_candidate_is_not_treated_as_proof(self):
+        sender = EmailSender(credentials_path="/x", token_path="/x")
+        service = MagicMock()
+        service.users.return_value.messages.return_value.list.return_value.execute.return_value = {
+            "messages": [{"id": "m1", "threadId": "t1"}]}
+        service.users.return_value.messages.return_value.get.return_value.execute.side_effect = \
+            Exception("network down")
+        sender.service = service
+        assert sender.find_delivered_message("ok@example.com", "Hello") is None
+
+    def test_find_delivered_message_returns_none_when_nothing_landed(self):
+        sender = EmailSender(credentials_path="/x", token_path="/x")
+        service = MagicMock()
+        service.users.return_value.messages.return_value.list.return_value.execute.return_value = {}
+        sender.service = service
+        assert sender.find_delivered_message("ok@example.com", "Hello") is None
+
+    def test_find_delivered_message_degrades_quietly(self):
+        """A failed lookup means we still don't know — never "it didn't land"."""
+        sender = EmailSender(credentials_path="/x", token_path="/x")
+        service = MagicMock()
+        service.users.return_value.messages.return_value.list.return_value.execute.side_effect = \
+            Exception("network down")
+        sender.service = service
+        assert sender.find_delivered_message("ok@example.com", "Hello") is None
+        assert EmailSender("/x", "/x").find_delivered_message("ok@example.com", "Hi") is None
+
+
 class TestRecipientDeduplication:
     @pytest.fixture
     def service(self):
@@ -241,3 +392,101 @@ class TestRecipientDeduplication:
         contact = db.create_contact(email="a@b.com")
         db.create_email(contact_id=contact["id"], status="sent", is_follow_up=True)
         assert gen._already_contacted(contact["id"]) is False
+
+
+class TestCancelledGenerationRace:
+    """"Cancel generation" then retry used to leave two identical first-contact
+    drafts for one person, both armed by "Select all"."""
+
+    @pytest.fixture
+    def service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(os.path.join(tmp, "test.db"))
+            db.update_profile({"full_name": "Ada", "school": "Cambridge"})
+            gen = GenerationService(db, EmailComposer(db, ResumeService(db)),
+                                    EnrichmentService(), RateLimiter(db))
+            yield db, gen
+
+    def test_a_job_cancelled_during_compose_inserts_nothing_more(self, service):
+        db, gen = service
+        contact = db.create_contact(name="ZZTEST Race", email="zzrace@example.invalid")
+        payload = {"contact_ids": [contact["id"]], "email_type": "application",
+                   "use_template_only": True}
+        job = db.create_job("generation", payload)
+
+        # Stand in for the seconds a real compose() takes: the Cancel click
+        # lands while the worker is inside it.
+        real_compose = gen.composer.compose
+
+        def compose_then_cancel(*args, **kwargs):
+            composed = real_compose(*args, **kwargs)
+            db.update_job(job["id"], status="cancelled")
+            return composed
+
+        gen.composer.compose = compose_then_cancel
+        gen._run(job["id"], payload)
+
+        assert db.list_emails() == []
+        # and the abandoned draft did not permanently spend generation quota
+        assert RateLimiter(db).generated_today() == 0
+
+    def test_a_draft_that_appeared_during_compose_is_not_duplicated(self, service):
+        """The de-dup guard runs before compose(); a concurrent run can insert
+        in between, so it has to run again next to the insert."""
+        db, gen = service
+        contact = db.create_contact(name="ZZTEST Twin", email="zztwin@example.invalid")
+        payload = {"contact_ids": [contact["id"]], "email_type": "application",
+                   "use_template_only": True}
+        job = db.create_job("generation", payload)
+
+        real_compose = gen.composer.compose
+
+        def compose_then_other_job_inserts(*args, **kwargs):
+            composed = real_compose(*args, **kwargs)
+            db.create_email(contact_id=contact["id"], status="draft",
+                            subject="Internship inquiry", body="from the other run")
+            return composed
+
+        gen.composer.compose = compose_then_other_job_inserts
+        gen._run(job["id"], payload)
+
+        assert len(db.list_emails()) == 1
+        result = db.get_job(job["id"])["result"]
+        assert "already emailed" in result
+
+    def test_a_cancelled_but_still_running_worker_blocks_the_next_run(self, service):
+        """cancel() flips the job row immediately while the thread is still
+        composing, so the route's "any job still running?" check sees nothing."""
+        db, gen = service
+        contact = db.create_contact(name="ZZTEST Busy", email="zzbusy@example.invalid")
+
+        released = threading.Event()
+        gen.composer.compose = lambda *a, **k: (released.wait(2) and None) or {
+            "subject": "Internship inquiry", "body": "hello",
+            "used_template_fallback": True, "fallback_reason": "user_requested"}
+
+        gen.start([contact["id"]], use_template_only=True)
+        job = db.list_jobs("generation", limit=1)[0]
+        assert gen.cancel(job["id"]) is True
+        # The row now says 'cancelled' — but the worker is alive, so a second
+        # run must not be allowed to start alongside it.
+        assert [j for j in db.list_jobs("generation", limit=5)
+                if j["status"] == "running"] == []
+        assert gen.is_busy() is True
+        with pytest.raises(GenerationBusy):
+            gen.start([contact["id"]], use_template_only=True)
+
+        released.set()
+        for _ in range(40):
+            if not gen.is_busy():
+                break
+            time.sleep(0.05)
+        assert gen.is_busy() is False
+        # and the run that was allowed to start again drafts exactly once
+        gen.composer.compose = EmailComposer(db, ResumeService(db)).compose
+        gen.start([contact["id"]], use_template_only=True)
+        for _ in range(40):
+            if not gen.is_busy():
+                break
+            time.sleep(0.05)
+        assert len(db.list_emails()) == 1

@@ -127,13 +127,48 @@ class TestRepairMismatchedCompanySites:
         assert repair_mismatched_company_sites(db) == 0
         assert db.get_company(c["id"])["summary"] is not None
 
-    def test_keeps_a_company_whose_summary_names_it(self, db):
-        """Rebrands and acquisitions legitimately sit on another domain."""
-        c = db.create_company("Fixie.ai", domain="ultravox.ai",
-                              summary="Fixie.ai builds voice agents.",
+    def test_a_summary_naming_the_company_is_not_identity_proof(self, db):
+        """The summary is LLM output written from a prompt that opens "Company
+        name: {name}", so the model puts the name in its first sentence almost
+        every time. Trusting it let through exactly the fabricated profiles this
+        repair exists to quarantine — Cogwear's read "Cogwear is a music
+        streaming service" while pointing at open.spotify.com. Re-research
+        restores anything wrongly caught; a fabricated profile in a real cold
+        email cannot be taken back.
+        """
+        c = db.create_company("Cogwear", domain="open.spotify.com",
+                              url="https://open.spotify.com/",
+                              summary="Cogwear is a music streaming service and "
+                                      "platform that provides trending songs.",
+                              industry="Entertainment/Music",
+                              product="Music Streaming Service",
+                              scrape_status="scraped")
+        assert repair_mismatched_company_sites(db) == 1
+        row = db.get_company(c["id"])
+        assert row["scrape_status"] == "wrong_site"
+        assert row["summary"] is None and row["product"] is None
+        assert row["domain"] is None and row["url"] is None
+
+    def test_clears_junk_domains_on_rows_that_never_finished_scraping(self, db):
+        """A scrape that produced no summary leaves the row at 'pending' while
+        still holding the junk domain the search picked (Figure AI ->
+        ezeedomains.com) — and that domain then becomes the authority for
+        "verify this address" warnings."""
+        c = db.create_company("Figure AI", domain="ezeedomains.com",
+                              url="https://ezeedomains.com/", scrape_status="pending")
+        assert repair_mismatched_company_sites(db) == 1
+        row = db.get_company(c["id"])
+        assert row["domain"] is None and row["url"] is None
+
+    def test_keeps_a_legacy_subdomain_that_belongs_to_the_company(self, db):
+        """Older rows stored a full netloc, so the comparison has to run on the
+        registered domain or tower.betterview.com reads as a wrong site."""
+        c = db.create_company("BetterView", domain="tower.betterview.com",
+                              url="https://tower.betterview.com/",
+                              summary="BetterView maps property risk.",
                               scrape_status="scraped")
         assert repair_mismatched_company_sites(db) == 0
-        assert db.get_company(c["id"])["summary"] is not None
+        assert db.get_company(c["id"])["domain"] == "tower.betterview.com"
 
     def test_is_idempotent(self, db):
         db.create_company("Cogwear", domain="spotify.com",
@@ -187,6 +222,72 @@ class TestRepairMismatchedCompanySites:
         repair_mismatched_company_sites(db)
         row = db.get_company(company["id"])
         assert row["domain"] is None and row["url"] is None
+
+    def test_an_unverified_company_domain_never_becomes_the_yardstick(self, db):
+        """The warning cites the company's domain as authority. When that domain
+        is some other company's, the advice inverts: it tells the user to
+        distrust brett.adcock@figure.ai on the authority of ezeedomains.com."""
+        company = db.create_company("Figure AI", domain="ezeedomains.com",
+                                    scrape_status="pending")
+        contact = db.create_contact(company_id=company["id"],
+                                    email="brett.adcock@figure.ai")
+        assert repair_offdomain_contact_warnings(db) == 0
+        assert not db.get_contact(contact["id"])["notes"]
+
+    def test_a_contact_who_already_replied_is_not_asked_to_verify(self, db):
+        """"Verify this address really reaches them" is noise for someone who
+        has already written back — they are proof the address works."""
+        company = db.create_company("Fixie.ai", domain="fixie.ai")
+        contact = db.create_contact(company_id=company["id"],
+                                    email="hello@ultravox.ai", status="replied")
+        assert repair_offdomain_contact_warnings(db) == 0
+        assert not db.get_contact(contact["id"])["notes"]
+
+    def test_a_contact_already_emailed_is_not_asked_to_verify(self, db):
+        company = db.create_company("Fixie.ai", domain="fixie.ai")
+        contact = db.create_contact(company_id=company["id"], email="hello@ultravox.ai")
+        db.create_email(contact_id=contact["id"], status="sent")
+        assert repair_offdomain_contact_warnings(db) == 0
+        assert not db.get_contact(contact["id"])["notes"]
+
+    def test_a_legacy_netloc_domain_does_not_flag_the_right_address(self, db):
+        """registered_domain on one side only meant tower.betterview.com could
+        never equal betterview.com, so the company's own address got flagged."""
+        company = db.create_company("BetterView", domain="tower.betterview.com",
+                                    scrape_status="scraped")
+        contact = db.create_contact(company_id=company["id"],
+                                    email="dtobias@betterview.com")
+        assert repair_offdomain_contact_warnings(db) == 0
+        assert not db.get_contact(contact["id"])["notes"]
+
+    def test_clears_a_note_it_wrote_that_cites_a_junk_domain(self, db):
+        """The inverted notes were already backfilled onto real contacts, so the
+        repair has to take them back, not just stop adding new ones."""
+        company = db.create_company("Cogwear", domain="open.spotify.com",
+                                    summary="Cogwear is a music streaming service.",
+                                    scrape_status="scraped")
+        contact = db.create_contact(
+            company_id=company["id"], email="david@cogweartech.com",
+            status="replied",
+            notes="Not on open.spotify.com. Verify this address really reaches "
+                  "Cogwear before sending.")
+        repair_mismatched_company_sites(db)
+        repair_offdomain_contact_warnings(db)
+        assert not db.get_contact(contact["id"])["notes"]
+
+    def test_clearing_never_touches_a_note_someone_else_wrote(self, db):
+        company = db.create_company("Cogwear", domain="open.spotify.com",
+                                    scrape_status="pending")
+        typed = db.create_contact(company_id=company["id"], email="david@cogweartech.com",
+                                  notes="Met at a conference")
+        discovered = db.create_contact(
+            company_id=company["id"], email="press@cogweartech.com",
+            notes="Found on the site but not on cogwear.com. Verify this reaches "
+                  "the right company before sending.")
+        repair_mismatched_company_sites(db)
+        repair_offdomain_contact_warnings(db)
+        assert db.get_contact(typed["id"])["notes"] == "Met at a conference"
+        assert "Found on the site" in db.get_contact(discovered["id"])["notes"]
 
     def test_leaves_contacts_and_email_history_intact(self, db):
         c = db.create_company("Cogwear", domain="spotify.com",

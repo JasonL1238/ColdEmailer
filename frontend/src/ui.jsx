@@ -15,8 +15,8 @@ export function Button({ variant = 'secondary', size, icon: Icon, children, clas
   )
 }
 
-export function Chip({ tone = 'gray', children }) {
-  return <span className={`chip chip-${tone}`}>{children}</span>
+export function Chip({ tone = 'gray', title, children }) {
+  return <span className={`chip chip-${tone}`} title={title}>{children}</span>
 }
 
 export function Spinner({ lg }) {
@@ -197,6 +197,22 @@ export const CONTACT_STATUS_META = {
   sent: { label: 'Sent', tone: 'sky' },
   replied: { label: 'Replied', tone: 'green' },
   archived: { label: 'Archived', tone: 'gray' },
+}
+
+// A green "Replied" chip resting only on flags from the older reply check (which
+// also counted bounces, auto-replies and our own messages) states something the
+// app cannot back up. Show it as unverified until a real check confirms it.
+export function contactStatusMeta(contact) {
+  if (contact?.status === 'replied' && !contact.verified_reply_count
+      && contact.unverified_reply_count > 0) {
+    return {
+      label: 'Replied?', tone: 'amber',
+      title: 'Flagged by an older reply check that also counted bounces, '
+        + 'auto-replies and your own messages — not verified against Gmail yet. '
+        + 'Use "Re-verify replies" on the Emails page.',
+    }
+  }
+  return CONTACT_STATUS_META[contact?.status] || CONTACT_STATUS_META.new
 }
 
 export function initials(name) {

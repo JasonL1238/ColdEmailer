@@ -40,8 +40,13 @@ export default function ComposeModal({ contactIds, onClose, onDone }) {
     if (j.status === 'done') {
       setPhase('done')
       const r = j.result || {}
+      const made = r.generated ?? 0
       const skipped = (r.skipped || []).length
-      toast.success(`${r.generated ?? 0} ${(r.generated ?? 0) === 1 ? 'email' : 'emails'} drafted${skipped ? ` · ${skipped} skipped` : ''}`)
+      const line = `${made} ${made === 1 ? 'email' : 'emails'} drafted${skipped ? ` · ${skipped} skipped` : ''}`
+      // A run that wrote nothing is not a success — saying so with a green
+      // check is how "0 emails drafted" got read as "done".
+      if (made > 0) toast.success(line)
+      else toast(line, { icon: '⚠️' })
       onDone?.()
     } else if (j.status === 'failed') {
       setPhase('setup')
@@ -89,6 +94,11 @@ export default function ComposeModal({ contactIds, onClose, onDone }) {
   }
 
   const n = contactIds.length
+  // What the finished run actually produced. A completed job is not the same
+  // thing as drafts existing: every contact can be skipped.
+  const drafted = job?.result?.generated ?? 0
+  const skippedList = job?.result?.skipped || []
+  const nothingDrafted = phase === 'done' && drafted === 0
   const showsResume = emailType !== 'sales'
   // The plain template can't follow instructions — it would emit a generic
   // application email instead, so custom always needs AI.
@@ -98,7 +108,7 @@ export default function ComposeModal({ contactIds, onClose, onDone }) {
     <Modal
       large
       title={
-        phase === 'done' ? 'Drafts ready'
+        phase === 'done' ? (nothingDrafted ? 'Nothing drafted' : 'Drafts ready')
           : phase === 'running' ? 'Writing emails…'
             : `Generate ${n} ${n === 1 ? 'email' : 'emails'}`
       }
@@ -120,12 +130,18 @@ export default function ComposeModal({ contactIds, onClose, onDone }) {
             </Button>
           </>
         ) : phase === 'done' ? (
-          <>
-            <Button variant="ghost" onClick={onClose}>Close</Button>
-            <Button variant="primary" onClick={() => { onClose(); navigate('emails') }}>
-              Review drafts
-            </Button>
-          </>
+          // Nothing was written, so there is nothing to review — sending the
+          // user to Drafts would land them on an unrelated older draft.
+          nothingDrafted ? (
+            <Button variant="primary" onClick={onClose}>Close</Button>
+          ) : (
+            <>
+              <Button variant="ghost" onClick={onClose}>Close</Button>
+              <Button variant="primary" onClick={() => { onClose(); navigate('emails') }}>
+                Review drafts
+              </Button>
+            </>
+          )
         ) : (
           <Button variant="danger" onClick={() => { cancel(); onClose() }}>Cancel generation</Button>
         )
@@ -223,10 +239,13 @@ export default function ComposeModal({ contactIds, onClose, onDone }) {
           <ProgressBar current={job.progress_current} total={job.progress_total}
             indeterminate={phase === 'running' && !job.progress_current} />
           <div className="small muted">
-            {job.progress_current}/{job.progress_total} done
-            {phase === 'running' && ' — each email is researched and written individually, this takes a few seconds per contact'}
+            {/* "N/N done" counted skipped contacts as work done. Say how many
+                drafts exist, and keep skips as their own number. */}
+            {phase === 'done'
+              ? `${drafted} of ${job.progress_total} drafted${skippedList.length ? ` · ${skippedList.length} skipped` : ''}`
+              : `${job.progress_current}/${job.progress_total} drafted — each email is researched and written individually, this takes a few seconds per contact`}
           </div>
-          {phase === 'done' && (job.result?.skipped?.length ?? 0) > 0 && (
+          {phase === 'done' && skippedList.length > 0 && (
             <div className="card card-pad" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
               <div className="small" style={{ fontWeight: 650, marginBottom: 4 }}>Skipped</div>
               {job.result.skipped.map((s, i) => (

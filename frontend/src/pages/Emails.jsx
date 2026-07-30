@@ -17,6 +17,16 @@ import { useApp } from '../App'
 // Send button on an email the recipient already has.
 export const isDelivered = (e) => !!(e.gmail_message_id || e.sent_at)
 
+// A message that reached Gmail without a confirmation coming back. Gmail may
+// have queued it, so this is not a safe retry — never present it as one.
+export const isUnconfirmed = (e) => !!e.send_attempted_at && !isDelivered(e)
+
+// A reply flag the current checker has confirmed vs. one inherited from the old
+// checker (which counted bounces, auto-replies and our own messages). Only the
+// first may be stated as fact — including its date.
+export const hasVerifiedReply = (e) => !!e.has_response && !e.reply_unverified
+export const hasUnverifiedReply = (e) => !!(e.reply_unverified || e.contact_reply_unverified)
+
 export default function Emails() {
   const { navigate, settings } = useApp()
   const [emails, setEmails] = useState(null)
@@ -146,12 +156,14 @@ export default function Emails() {
     finally { setBusy(false) }
   }
 
-  const checkReplies = async () => {
+  const checkReplies = async (recheck = false) => {
     setBusy(true)
     try {
-      const { data } = await emailsAPI.checkReplies()
+      const { data } = await emailsAPI.checkReplies(recheck)
       const notes = []
-      if (data.cleared) notes.push(`${data.cleared} earlier "reply" was a bounce or auto-reply`)
+      if (data.cleared) notes.push(`${data.cleared} earlier "reply" was a bounce, an auto-reply, or your own message`)
+      if (data.confirmed) notes.push(`${data.confirmed} earlier "reply" confirmed as real`)
+      if (data.unverified_remaining) notes.push(`${data.unverified_remaining} still unverified`)
       if (data.failed_checks) notes.push(`${data.failed_checks} couldn't be checked — try again shortly`)
       const suffix = notes.length ? ` (${notes.join('; ')})` : ''
       toast.success(data.new_replies > 0
@@ -162,6 +174,8 @@ export default function Emails() {
     } catch (e) { toast.error(errMessage(e)) }
     finally { setBusy(false) }
   }
+
+  const unverifiedCount = (emails || []).filter((e) => e.reply_unverified).length
 
   if (emails === null) {
     return <div className="page"><div className="skeleton" style={{ height: 400, marginTop: 40 }} /></div>
@@ -175,7 +189,15 @@ export default function Emails() {
           <div className="page-desc">Review AI drafts, approve, send, and track replies</div>
         </div>
         <div className="page-actions">
-          <Button icon={MessageSquare} onClick={checkReplies} disabled={busy}>Check replies</Button>
+          <Button icon={MessageSquare} onClick={() => checkReplies(false)} disabled={busy}>
+            Check replies
+          </Button>
+          {unverifiedCount > 0 && (
+            <Button icon={RefreshCw} onClick={() => checkReplies(true)} disabled={busy}
+              title="Re-check every reply flag against Gmail, including the ones marked before the current checker existed">
+              Re-verify replies
+            </Button>
+          )}
           {tab === 'drafts' && selected.size > 0 && (
             <Button variant="primary" icon={Send} onClick={() => setSendModal([...selected])}>
               Send {selected.size} selected
@@ -183,6 +205,24 @@ export default function Emails() {
           )}
         </div>
       </div>
+
+      {unverifiedCount > 0 && (
+        <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+          <div className="row">
+            <AlertTriangle size={16} style={{ color: 'var(--amber)' }} />
+            <span className="small">
+              <b>{unverifiedCount} {unverifiedCount === 1 ? 'email is' : 'emails are'} marked
+              as replied by an older reply check</b> that also counted bounces, auto-replies
+              and your own messages in the thread. Those flags — and their dates — are shown
+              as unverified until re-checked against Gmail, and they are left out of the
+              follow-ups-due list (you can still draft a follow-up from any sent email).
+            </span>
+          </div>
+          <Button size="sm" icon={RefreshCw} onClick={() => checkReplies(true)} disabled={busy}>
+            Re-verify replies
+          </Button>
+        </div>
+      )}
 
       {followUps.length > 0 && tab !== 'trashed' && (
         <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
@@ -262,7 +302,12 @@ export default function Emails() {
                       <Chip tone={tm.tone}>{tm.label}</Chip>
                       {e.status === 'approved' && !isDelivered(e) &&
                         <Chip tone="green"><Check size={10} /> approved</Chip>}
-                      {e.has_response ? <Chip tone="green"><MessageSquare size={10} /> replied</Chip> : null}
+                      {hasVerifiedReply(e) || e.contact_has_replied
+                        ? <Chip tone="green"><MessageSquare size={10} /> replied</Chip>
+                        : hasUnverifiedReply(e)
+                          ? <Chip tone="amber"><MessageSquare size={10} /> reply unverified</Chip>
+                          : null}
+                      {isUnconfirmed(e) && <Chip tone="amber">delivery unconfirmed</Chip>}
                       {!!e.used_template_fallback && <Chip tone="amber">template</Chip>}
                       <span className="tiny">{timeAgo(e.sent_at || e.created_at)}</span>
                     </div>
@@ -397,17 +442,34 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
           )}
           {delivered && email.status !== 'trashed' && (
             <>
-              {email.has_response ? (
+              {hasVerifiedReply(email) ? (
                 <Chip tone="green"><MessageSquare size={11} /> replied {timeAgo(email.response_at)}</Chip>
-              ) : email.has_follow_up ? (
-                // Clicking again just creates a duplicate follow-up to the
-                // same person, so say one exists instead of offering another.
-                <Chip tone="sky"><CornerUpLeft size={11} /> follow-up drafted</Chip>
+              ) : email.contact_has_replied ? (
+                // The reply landed on another email to this person. A follow-up
+                // is written on the premise of silence, so offering one here
+                // would send "still very interested?" to someone who answered.
+                <Chip tone="green"><MessageSquare size={11} /> this person already replied</Chip>
               ) : (
-                <Button size="sm" icon={CornerUpLeft} onClick={onFollowUp} disabled={busy}
-                  variant={followUpDue ? 'primary' : 'secondary'}>
-                  {followUpDue ? 'Follow up (due)' : 'Draft follow-up'}
-                </Button>
+                <>
+                  {/* An unverified flag is not a reply date, and it must not
+                      switch the follow-up pipeline off either — say what is
+                      actually known and leave the decision with the user. */}
+                  {hasUnverifiedReply(email) && (
+                    <Chip tone="amber" title="Flagged by an older reply check that also counted bounces, auto-replies and your own messages. Hit Re-verify replies to confirm.">
+                      <MessageSquare size={11} /> reply unverified
+                    </Chip>
+                  )}
+                  {email.has_follow_up ? (
+                    // Clicking again just creates a duplicate follow-up to the
+                    // same person, so say one exists instead of offering another.
+                    <Chip tone="sky"><CornerUpLeft size={11} /> follow-up drafted</Chip>
+                  ) : (
+                    <Button size="sm" icon={CornerUpLeft} onClick={onFollowUp} disabled={busy}
+                      variant={followUpDue ? 'primary' : 'secondary'}>
+                      {followUpDue ? 'Follow up (due)' : 'Draft follow-up'}
+                    </Button>
+                  )}
+                </>
               )}
             </>
           )}
@@ -423,6 +485,16 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
           {/* The template ignores instructions entirely — say so rather than
               letting the user assume they were applied. */}
           {email.custom_instructions ? ' Your extra instructions were not applied.' : ''}
+        </div>
+      )}
+
+      {delivered && !!email.reply_unverified && (
+        <div className="row small" style={{ color: 'var(--amber)', gap: 6 }}>
+          <AlertTriangle size={13} />
+          An older reply check marked this replied
+          {email.response_at ? ` (stamped ${timeAgo(email.response_at)})` : ''} — that check
+          also counted bounces, auto-replies and your own messages, so neither the reply nor
+          the date is confirmed. Use “Re-verify replies” above.
         </div>
       )}
 
@@ -450,10 +522,27 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
 /* ---------- send modal ---------- */
 
 function SendModal({ emailIds, emails, onClose, onSent }) {
-  const [resumeList, setResumeList] = useState([])
+  const [resumeList, setResumeList] = useState(null)   // null = still loading
   const [attach, setAttach] = useState(true)
   const [resumeId, setResumeId] = useState('')   // '' = per-email/default
   const [phase, setPhase] = useState('confirm')  // confirm | sending | done
+  const [confirmResend, setConfirmResend] = useState(false)
+  const [confirmAttachment, setConfirmAttachment] = useState(false)
+  const unconfirmed = emails.filter(isUnconfirmed)
+
+  // The body's "my resume is attached" was decided once, when the draft was
+  // written, around one specific PDF. Unticking "Attach resume" or picking
+  // "Attach X to all" can contradict it, so compare the two before sending.
+  const resumes = resumeList || []
+  const defaultResumeId = resumes.find((r) => r.is_default)?.id || ''
+  const labelFor = (id) => resumes.find((r) => r.id === id)?.label
+  const boundResumeId = (e) => e.resume_id || defaultResumeId
+  const attachedResumeId = (e) => (attach ? (resumeId || boundResumeId(e)) : '')
+  // Only once the resume list is in: mid-load every id looks unresolvable.
+  const claimConflicts = resumeList === null ? [] : emails.filter(
+    (e) => e.claims_attachment
+      && (!attachedResumeId(e) || attachedResumeId(e) !== boundResumeId(e)))
+  const needsAttachmentAck = claimConflicts.length > 0 && !confirmAttachment
   const { job, track } = useJobPolling((j) => {
     if (j.status === 'done' || j.status === 'cancelled') {
       setPhase('done')
@@ -484,7 +573,8 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
   }
 
   useEffect(() => {
-    resumesAPI.list().then(({ data }) => setResumeList(data)).catch(() => {})
+    resumesAPI.list().then(({ data }) => setResumeList(data || []))
+      .catch(() => setResumeList([]))
   }, [])
 
   const send = async () => {
@@ -494,6 +584,8 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
         email_ids: emailIds,
         attach_resume: attach,
         resume_id: resumeId || null,
+        confirm_resend: confirmResend,
+        confirm_attachment_change: confirmAttachment,
       })
       track(data)
     } catch (e) {
@@ -518,7 +610,11 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
       footer={phase === 'confirm' ? (
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" icon={Send} onClick={send}>
+          <Button variant="primary" icon={Send} onClick={send}
+            disabled={needsAttachmentAck}
+            title={needsAttachmentAck
+              ? 'These drafts promise an attachment these options would change'
+              : undefined}>
             Send now
           </Button>
         </>
@@ -537,10 +633,70 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
             {emails.map((e) => (
               <div key={e.id} className="row-between" style={{ padding: '8px 14px', borderBottom: '1px solid var(--border)' }}>
                 <span className="small" style={{ fontWeight: 600 }}>{e.contact_name || e.contact_email}</span>
-                <span className="tiny mono">{e.contact_email}</span>
+                <span className="tiny mono">
+                  {e.contact_email}
+                  {/* Which PDF this draft was written around — without it a
+                      swap or a strip is invisible to the user. */}
+                  {e.claims_attachment && (
+                    <span className="muted">
+                      {' · '}
+                      {attachedResumeId(e)
+                        ? `attaching ${labelFor(attachedResumeId(e)) || 'resume'}`
+                        : 'no attachment'}
+                    </span>
+                  )}
+                </span>
               </div>
             ))}
           </div>
+          {claimConflicts.length > 0 && (
+            <div className="card card-pad stack" style={{ gap: 6, background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+              <div className="row small" style={{ gap: 6, fontWeight: 650 }}>
+                <AlertTriangle size={13} style={{ color: 'var(--amber)' }} />
+                {claimConflicts.length === 1 ? 'One of these emails says' : `${claimConflicts.length} of these emails say`}
+                {' '}a resume is attached
+              </div>
+              <div className="small">
+                {attach
+                  ? 'These send options would attach a different PDF than the email was written around:'
+                  : 'With "Attach resume" off, the recipient gets an email promising an attachment that is not there:'}
+              </div>
+              {claimConflicts.map((e) => (
+                <div key={e.id} className="tiny mono">
+                  {e.contact_email}
+                  {' — written around '}{labelFor(boundResumeId(e)) || 'your default resume'}
+                  {', sending '}{labelFor(attachedResumeId(e)) || 'nothing'}
+                </div>
+              ))}
+              <label className="row small" style={{ gap: 8, cursor: 'pointer' }}>
+                <input type="checkbox" className="checkbox" checked={confirmAttachment}
+                  onChange={(e) => setConfirmAttachment(e.target.checked)} />
+                Send anyway — I know the email text won&apos;t match the attachment
+              </label>
+            </div>
+          )}
+          {unconfirmed.length > 0 && (
+            <div className="card card-pad stack" style={{ gap: 6, background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+              <div className="row small" style={{ gap: 6, fontWeight: 650 }}>
+                <AlertTriangle size={13} style={{ color: 'var(--amber)' }} />
+                {unconfirmed.length === 1 ? 'One of these was' : `${unconfirmed.length} of these were`} already handed to Gmail
+              </div>
+              <div className="small">
+                We never got a confirmation back, so we cannot tell whether Gmail
+                delivered {unconfirmed.length === 1 ? 'it' : 'them'}. We'll check your Sent
+                folder first, but if the message isn't there yet, sending again could put a
+                second copy in {unconfirmed.length === 1 ? 'a real inbox' : 'real inboxes'}:
+              </div>
+              {unconfirmed.map((e) => (
+                <div key={e.id} className="tiny mono">{e.contact_email}</div>
+              ))}
+              <label className="row small" style={{ gap: 8, cursor: 'pointer' }}>
+                <input type="checkbox" className="checkbox" checked={confirmResend}
+                  onChange={(e) => setConfirmResend(e.target.checked)} />
+                I checked Gmail — send {unconfirmed.length === 1 ? 'it' : 'them'} anyway
+              </label>
+            </div>
+          )}
           <label className="row small" style={{ gap: 8, cursor: 'pointer' }}>
             <input type="checkbox" className="checkbox" checked={attach} onChange={(e) => setAttach(e.target.checked)} />
             <Paperclip size={13} /> Attach resume
@@ -548,7 +704,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
           {attach && (
             <select className="select" value={resumeId} onChange={(e) => setResumeId(e.target.value)}>
               <option value="">Use each email's resume (or your default)</option>
-              {resumeList.map((r) => (
+              {resumes.map((r) => (
                 <option key={r.id} value={r.id}>Attach {r.label} to all</option>
               ))}
             </select>
@@ -566,26 +722,50 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
           {phase === 'done' && (() => {
             const failures = (job.result?.results || []).filter((r) => !r.success)
             const sentCount = job.result?.sent ?? 0
+            // "We don't know" and "Gmail refused" are different verdicts, and
+            // only the second one makes a retry safe. Skipped rows (already
+            // sent, not sendable) are neither.
+            const unknownOut = failures.filter((r) => r.delivery_unknown)
+            const skipped = failures.filter((r) => !r.delivery_unknown && r.retryable === false)
+            const refused = failures.filter((r) => !r.delivery_unknown && r.retryable !== false)
+            const line = (r, i) => {
+              const email = emails.find((e) => e.id === r.email_id)
+              return (
+                <div key={i} className="small" style={{ marginTop: 3 }}>
+                  • <b>{email?.contact_email || email?.contact_name || 'Unknown recipient'}</b>
+                  {' — '}{r.error}
+                </div>
+              )
+            }
             return (
               <>
                 <div className="small">
                   <b>{sentCount}</b> sent
                   {failures.length > 0 && <> · <b style={{ color: 'var(--red)' }}>{failures.length} failed</b></>}
                 </div>
-                {failures.length > 0 && (
+                {unknownOut.length > 0 && (
+                  <div className="card card-pad" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+                    <div className="small" style={{ fontWeight: 650, marginBottom: 6 }}>
+                      We could not confirm whether these were delivered — check your
+                      Gmail Sent folder before retrying:
+                    </div>
+                    {unknownOut.map(line)}
+                  </div>
+                )}
+                {refused.length > 0 && (
                   <div className="card card-pad" style={{ background: 'var(--red-soft)', borderColor: '#f5c6c6' }}>
                     <div className="small" style={{ fontWeight: 650, marginBottom: 6 }}>
                       These did not go out — they stay in Drafts so you can retry:
                     </div>
-                    {failures.map((r, i) => {
-                      const email = emails.find((e) => e.id === r.email_id)
-                      return (
-                        <div key={i} className="small" style={{ marginTop: 3 }}>
-                          • <b>{email?.contact_email || email?.contact_name || 'Unknown recipient'}</b>
-                          {' — '}{r.error}
-                        </div>
-                      )
-                    })}
+                    {refused.map(line)}
+                  </div>
+                )}
+                {skipped.length > 0 && (
+                  <div className="card card-pad">
+                    <div className="small" style={{ fontWeight: 650, marginBottom: 6 }}>
+                      Skipped — nothing was sent for these:
+                    </div>
+                    {skipped.map(line)}
                   </div>
                 )}
               </>

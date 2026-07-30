@@ -70,12 +70,28 @@ def test_list_companies_reports_contact_and_reply_counts(db):
     company = db.create_company("Acme")
     c1 = db.create_contact(company_id=company["id"], email="a@acme.com")
     db.create_contact(company_id=company["id"], email="b@acme.com")
-    db.create_email(contact_id=c1["id"], status="sent", has_response=True)
+    db.create_email(contact_id=c1["id"], status="sent", has_response=True,
+                    response_verified_at="2026-03-13T09:00:00")
 
     row = next(r for r in db.list_companies() if r["id"] == company["id"])
     assert row["contact_count"] == 2
     assert row["sent_count"] == 1
     assert row["reply_count"] == 1
+    assert row["unverified_reply_count"] == 0
+
+
+def test_list_companies_keeps_unverified_replies_out_of_the_reply_count(db):
+    """The green count is read as fact. A flag the current checker never
+    confirmed (every legacy row) cannot back that up, so it is reported on its
+    own instead of inflating the number."""
+    company = db.create_company("Legacy Co")
+    contact = db.create_contact(company_id=company["id"], email="a@legacy.com")
+    db.create_email(contact_id=contact["id"], status="sent", has_response=True,
+                    response_at="2026-03-12T16:26:00")   # batch-stamped legacy flag
+
+    row = next(r for r in db.list_companies() if r["id"] == company["id"])
+    assert row["reply_count"] == 0
+    assert row["unverified_reply_count"] == 1
 
 
 def test_resume_default_is_exclusive(db):
@@ -115,9 +131,26 @@ def test_follow_up_candidates_skip_contacts_who_replied_to_any_email(db):
     old = "2020-01-01T00:00:00"
     db.create_email(contact_id=contact["id"], status="sent", sent_at=old)
     db.create_email(contact_id=contact["id"], status="sent", sent_at="2020-02-01T00:00:00",
-                    has_response=True, response_at="2020-02-02T00:00:00")
+                    has_response=True, response_at="2020-02-02T00:00:00",
+                    response_verified_at="2020-02-02T00:05:00")
 
     assert db.get_follow_up_candidates() == []
+
+
+def test_an_unverified_reply_flag_does_not_suppress_a_follow_up(db):
+    """The legacy checker counted bounces, auto-replies and our own messages, so
+    its flags are not evidence of a reply. Letting them stand in for one removed
+    ~105 genuinely unanswered contacts from this list, i.e. switched the app's
+    core recurring action off for most of the database."""
+    contact = db.create_contact(email="quiet@b.com")
+    stale = db.create_email(contact_id=contact["id"], status="sent",
+                            sent_at="2020-01-01T00:00:00")
+    # Same person, flagged by the old checker with a batch timestamp
+    db.create_email(contact_id=contact["id"], status="sent",
+                    sent_at="2020-01-02T00:00:00", has_response=True,
+                    response_at="2026-03-12T16:26:00")
+
+    assert [e["id"] for e in db.get_follow_up_candidates()] == [stale["id"]]
 
 
 def test_follow_up_candidates_are_one_per_contact(db):

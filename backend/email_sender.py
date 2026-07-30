@@ -30,6 +30,26 @@ _QP_UTF8 = Charset('utf-8')
 _QP_UTF8.body_encoding = QP
 
 
+def _refused_by_gmail(exc: Exception) -> bool:
+    """True only when Gmail definitely rejected the message.
+
+    A 4xx is a verdict: the request was understood and turned down, so nothing
+    was queued and the draft is safe to retry. Anything else — a read timeout, a
+    connection reset, a 5xx — happened at a point where Gmail may already have
+    accepted and queued the message, and retrying would deliver a second copy.
+    408/429 are "come back later", which does not rule out the first attempt
+    having landed.
+    """
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return False
+    return 400 <= status < 500 and status not in (408, 429)
+
+
 def _sanitize_header(value: str) -> str:
     """Collapse CR/LF out of a header value.
 
@@ -264,10 +284,23 @@ class EmailSender:
             send_body = {'raw': raw_message}
             if email.get('reply_to_thread_id'):
                 send_body['threadId'] = email['reply_to_thread_id']
-            send_message = self.service.users().messages().send(
-                userId='me', body=send_body
-            ).execute()
-            
+            # Only the call itself can leave delivery in doubt: everything above
+            # happens before Gmail sees anything, so a failure there is
+            # unambiguously "not sent".
+            try:
+                send_message = self.service.users().messages().send(
+                    userId='me', body=send_body
+                ).execute()
+            except Exception as e:
+                return {
+                    'success': False,
+                    'error': str(e),
+                    # "We don't know" is not the same as "Gmail said no", and
+                    # only the first one makes a retry dangerous.
+                    'delivery_unknown': not _refused_by_gmail(e),
+                    'email_id': email['id']
+                }
+
             return {
                 'success': True,
                 'message_id': send_message.get('id'),
@@ -282,6 +315,77 @@ class EmailSender:
                 'error': str(e),
                 'email_id': email['id']
             }
+
+    def find_delivered_message(self, to_email: str, subject: str,
+                               sent_after: Optional[str] = None) -> Optional[Dict]:
+        """Look for the message *this attempt* left in the Sent folder.
+
+        Reconciles an attempt whose response was lost: if Gmail did accept it,
+        the message is sitting in the Sent folder and the row can be marked
+        delivered instead of sent a second time. Degrades quietly — a failed
+        lookup just means we still don't know.
+
+        Identity matters, because the answer marks a row delivered and blocks it
+        from ever being sent again. Template subjects are deterministic
+        ("Internship inquiry at {company}", "Re: {original subject}"), so an
+        older copy to the same person matches the same search — and Gmail's
+        `subject:` is a phrase match, not an equality test. So: bound the search
+        to the attempt with `sent_after` (the row's send_attempted_at), re-check
+        every candidate's internalDate against it, and require the Subject header
+        to match exactly. Anything we cannot positively identify is treated as
+        "not found", which leads to the honest "check Gmail before retrying"
+        prompt rather than a fabricated delivery record.
+        """
+        to_addr = str(to_email or '').strip()
+        subject = _sanitize_header(subject)
+        if not self.service or not _RECIPIENT_RE.fullmatch(to_addr) or not subject:
+            return None
+        # A minute of slack absorbs clock skew between us and Gmail.
+        floor_epoch = None
+        if sent_after:
+            try:
+                from datetime import datetime as _dt
+                floor_epoch = int(_dt.fromisoformat(str(sent_after)).timestamp()) - 60
+            except (TypeError, ValueError):
+                floor_epoch = None
+        query = f'in:sent to:{to_addr} subject:"{subject}"'
+        if floor_epoch is not None:
+            query += f' after:{floor_epoch}'
+        try:
+            listing = self.service.users().messages().list(
+                userId='me', maxResults=5, q=query,
+            ).execute()
+            messages = listing.get('messages') or []
+            for candidate in messages:
+                if self._is_this_message(candidate.get('id'), subject, floor_epoch):
+                    return {'gmail_message_id': candidate.get('id'),
+                            'gmail_thread_id': candidate.get('threadId')}
+            return None
+        except Exception as e:
+            print(f"[send] could not check the Sent folder for {to_addr}: {e}")
+            return None
+
+    def _is_this_message(self, message_id: Optional[str], subject: str,
+                         floor_epoch: Optional[int]) -> bool:
+        """Confirm a Sent-folder hit really is the message we just tried to send."""
+        if not message_id:
+            return False
+        try:
+            msg = self.service.users().messages().get(
+                userId='me', id=message_id, format='metadata',
+                metadataHeaders=['Subject'],
+            ).execute()
+            headers = {h.get('name', '').lower(): h.get('value', '')
+                       for h in (msg.get('payload', {}) or {}).get('headers', [])}
+            if _sanitize_header(headers.get('subject')) != subject:
+                return False
+            internal = int(msg.get('internalDate', 0)) // 1000
+        except Exception as e:
+            # Cannot establish identity => not proof. Better to ask the user to
+            # check Gmail than to record a delivery that may never have happened.
+            print(f"[send] could not identify sent message {message_id}: {e}")
+            return False
+        return floor_epoch is None or internal >= floor_epoch
 
     def send_batch(self, emails: List[Dict], from_email: str,
                    resume_paths: Optional[List[Optional[str]]] = None) -> List[Dict]:

@@ -120,11 +120,11 @@ All optional, set in `.env`:
 ## Tests
 
 ```bash
-cd tests && ../backend/venv/bin/python -m pytest     # 276 backend tests
+cd tests && ../backend/venv/bin/python -m pytest     # 355 backend tests
 ```
 
 ```bash
-cd frontend && npm test                              # 25 frontend tests
+cd frontend && npm test                              # 48 frontend tests
 ```
 
 The backend suite runs against a throwaway database (`tests/conftest.py` sets `COLD_DB_PATH`), so it never touches your real data or Gmail credentials.

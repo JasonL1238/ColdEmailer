@@ -144,6 +144,12 @@ class SendRequest(BaseModel):
     attach_resume: bool = True
     resume_id: Optional[str] = None  # override; default = email's own resume or default resume
     from_email: Optional[str] = None
+    # Opt-in to retrying a row whose earlier attempt reached Gmail without a
+    # confirmation. Off by default: the recipient may already have that message.
+    confirm_resend: bool = False
+    # Opt-in to sending a draft whose body promises an attachment these options
+    # would remove or swap. Off by default: the email would contradict itself.
+    confirm_attachment_change: bool = False
 
     @field_validator("from_email")
     @classmethod

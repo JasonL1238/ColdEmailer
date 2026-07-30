@@ -3,6 +3,7 @@ import toast from 'react-hot-toast'
 import {
   Building2, Users, Send, MessageSquare, ChevronRight, Compass,
   Sparkles, RefreshCw, Clock, CheckCircle2, XCircle, Search, FileUp, Zap,
+  AlertTriangle,
 } from 'lucide-react'
 import { dashboardAPI, emailsAPI, errMessage } from '../api'
 import { Button, Chip, EmptyState, Spinner, timeAgo, EMAIL_TYPE_META } from '../ui'
@@ -27,7 +28,7 @@ function eventText(ev) {
     started: 'Discovery started', finished: 'Discovery finished',
     send_failed: 'Send failed', uploaded: 'Resume uploaded',
     imported: 'Contacts imported', enriched: 'Company researched',
-    migration: 'Data imported', deleted: 'Resume removed',
+    migration: 'Data imported', deleted: 'Resume removed', repair: 'Data check',
   }
   return labels[ev.event] || ev.event
 }
@@ -52,12 +53,14 @@ export default function Dashboard() {
     return () => clearInterval(t)
   }, [load])
 
-  const checkReplies = async () => {
+  const checkReplies = async (recheck = false) => {
     setChecking(true)
     try {
-      const { data } = await emailsAPI.checkReplies()
+      const { data } = await emailsAPI.checkReplies(recheck)
       const notes = []
-      if (data.cleared) notes.push(`${data.cleared} earlier "reply" was a bounce or auto-reply`)
+      if (data.cleared) notes.push(`${data.cleared} earlier "reply" was a bounce, an auto-reply, or your own message`)
+      if (data.confirmed) notes.push(`${data.confirmed} earlier "reply" confirmed as real`)
+      if (data.unverified_remaining) notes.push(`${data.unverified_remaining} still unverified`)
       if (data.failed_checks) notes.push(`${data.failed_checks} couldn't be checked — try again shortly`)
       const suffix = notes.length ? ` (${notes.join('; ')})` : ''
       toast.success(
@@ -98,7 +101,7 @@ export default function Dashboard() {
           <div className="page-desc">Your outreach pipeline at a glance</div>
         </div>
         <div className="page-actions">
-          <Button icon={RefreshCw} onClick={checkReplies} disabled={checking}>
+          <Button icon={RefreshCw} onClick={() => checkReplies(false)} disabled={checking}>
             {checking ? 'Checking…' : 'Check for replies'}
           </Button>
           <Button variant="primary" icon={Compass} onClick={() => navigate('discover')}>
@@ -133,8 +136,32 @@ export default function Dashboard() {
             <StatCard icon={Send} label="Sent" value={counts.sent}
               sub={`${usage.emails_sent_today} today`} onClick={() => navigate('emails')} />
             <StatCard icon={MessageSquare} label="Reply rate" value={`${counts.reply_rate}%`}
-              sub={`${counts.replied} replies`} accent />
+              sub={counts.replied_unverified > 0
+                ? `${counts.replied} verified · ${counts.replied_unverified} unverified`
+                : `${counts.replied} replies`}
+              accent={counts.replied > 0} />
           </div>
+
+          {/* unverified legacy reply flags */}
+          {counts.replied_unverified > 0 && (
+            <div className="card card-pad mt-16 row-between" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+              <div className="row">
+                <AlertTriangle size={17} style={{ color: 'var(--amber)' }} />
+                <div>
+                  <b>{counts.replied_unverified} earlier {counts.replied_unverified === 1 ? 'reply is' : 'replies are'} unverified.</b>{' '}
+                  <span className="muted">
+                    They were flagged by an older check that also counted bounces,
+                    auto-replies and your own messages, so they are left out of the
+                    reply rate — and out of the follow-ups-due count — until
+                    re-checked against Gmail.
+                  </span>
+                </div>
+              </div>
+              <Button size="sm" icon={RefreshCw} onClick={() => checkReplies(true)} disabled={checking}>
+                {checking ? 'Checking…' : 'Re-verify replies'}
+              </Button>
+            </div>
+          )}
 
           {/* follow-ups banner */}
           {follow_ups_due > 0 && (
@@ -188,7 +215,9 @@ export default function Dashboard() {
                       const meta = EMAIL_TYPE_META[t.email_type] || { label: t.email_type, tone: 'gray' }
                       return (
                         <Chip key={t.email_type} tone={meta.tone}>
-                          {meta.label}: {t.sent}/{t.total} sent{t.replied > 0 ? ` · ${t.replied} replied` : ''}
+                          {meta.label}: {t.sent}/{t.total} sent
+                          {t.replied > 0 ? ` · ${t.replied} replied` : ''}
+                          {t.replied_unverified > 0 ? ` · ${t.replied_unverified} unverified` : ''}
                         </Chip>
                       )
                     })}

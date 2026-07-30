@@ -20,16 +20,17 @@ _root_env = os.path.join(_PROJECT_ROOT, ".env")
 if os.path.isfile(_root_env):
     load_dotenv(_root_env)
 
-from db import (Database, migrate_legacy_data, now_iso,
+from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
                 repair_contact_reply_status, repair_delivered_email_status,
                 repair_mismatched_company_sites,
-                repair_offdomain_contact_warnings)
+                repair_offdomain_contact_warnings,
+                repair_unverified_legacy_replies)
 from discovery import DiscoveryService
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
                             TemplateUnavailable)
 from email_sender import EmailSender
 from enrichment import EnrichmentService, scrape_status_for
-from generation import GenerationService
+from generation import GenerationBusy, GenerationService
 from models import (
     EMAIL_ADDRESS_RE, BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
     ContactCreate, ContactUpdate, DiscoveryRequest, EmailUpdate,
@@ -136,6 +137,7 @@ def _reap_orphaned_jobs():
 
 migrate_legacy_data(db, _PROJECT_ROOT, _BACKEND_DIR)
 repair_delivered_email_status(db)
+repair_unverified_legacy_replies(db)
 repair_contact_reply_status(db)
 repair_mismatched_company_sites(db)
 repair_offdomain_contact_warnings(db)
@@ -348,9 +350,33 @@ async def update_company(company_id: str, payload: CompanyUpdate):
 
 
 @app.delete("/api/companies/{company_id}")
-async def delete_company(company_id: str):
-    if not db.delete_company(company_id):
+async def delete_company(company_id: str, force: bool = Query(False)):
+    """Deleting cascades companies -> contacts -> emails, delivered ones
+    included. Every other delete path refuses to erase sent mail, so this one
+    has to as well: that record is what stops the same person being emailed
+    twice, and losing it also refunds today's send cap."""
+    company = db.get_company(company_id)
+    if not company:
         raise HTTPException(404, "Company not found")
+    if not force:
+        counts = db.query_one(
+            """SELECT
+                 SUM(CASE WHEN e.status='sent' OR (e.gmail_message_id IS NOT NULL
+                          AND e.gmail_message_id <> '') THEN 1 ELSE 0 END) AS sent,
+                 SUM(CASE WHEN e.has_response=1 THEN 1 ELSE 0 END) AS replies
+               FROM emails e JOIN contacts ct ON e.contact_id = ct.id
+               WHERE ct.company_id=?""", (company_id,)) or {}
+        sent = counts.get("sent") or 0
+        replies = counts.get("replies") or 0
+        if sent:
+            reply_note = (f" and {replies} repl{'y' if replies == 1 else 'ies'}"
+                          if replies else "")
+            raise HTTPException(
+                409, f"{company['name']} has {sent} sent email(s){reply_note}. "
+                     f"Deleting removes that record, which is what stops the same "
+                     f"person being emailed twice — archive the contacts instead, "
+                     f"or confirm to delete anyway.")
+    db.delete_company(company_id)
     return {"success": True}
 
 
@@ -580,14 +606,24 @@ async def delete_resume(resume_id: str, force: bool = Query(False)):
     is attached"). Deleting it silently substitutes a different file at send
     time, so the recipient gets a resume the email was never written for.
     """
-    if not resumes.get(resume_id):
+    row = resumes.get(resume_id)
+    if not row:
         raise HTTPException(404, "Resume not found")
     if not force:
-        row = db.query_one(
+        counted = db.query_one(
             "SELECT COUNT(*) AS n FROM emails "
             "WHERE resume_id = ? AND status IN ('draft', 'approved')",
             (resume_id,))
-        pending = row["n"] if row else 0
+        pending = counted["n"] if counted else 0
+        # Drafts saved before resume_id was recorded (and every send that used
+        # the default) carry no resume_id at all, so matching on the column
+        # alone missed exactly the drafts written around the default resume.
+        if row.get("is_default"):
+            pending += sum(
+                1 for e in db.query(
+                    "SELECT body FROM emails WHERE resume_id IS NULL "
+                    "AND status IN ('draft', 'approved')")
+                if body_claims_attachment(e["body"]))
         if pending:
             raise HTTPException(
                 409, f"{pending} unsent draft(s) were written around this resume. "
@@ -634,14 +670,20 @@ async def generate_emails(payload: GenerateRequest):
             raise HTTPException(400, 'Custom emails need AI — the plain template '
                                      'cannot follow your instructions. Uncheck '
                                      '"Skip AI", or set an AI provider in Settings.')
-    job = generation.start(
-        contact_ids=payload.contact_ids,
-        email_type=payload.email_type,
-        resume_id=payload.resume_id,
-        custom_instructions=payload.custom_instructions,
-        use_template_only=payload.use_template_only,
-        allow_recontact=payload.allow_recontact,
-    )
+    try:
+        job = generation.start(
+            contact_ids=payload.contact_ids,
+            email_type=payload.email_type,
+            resume_id=payload.resume_id,
+            custom_instructions=payload.custom_instructions,
+            use_template_only=payload.use_template_only,
+            allow_recontact=payload.allow_recontact,
+        )
+    except GenerationBusy as e:
+        # A cancelled job flips its row to 'cancelled' while the worker is still
+        # composing, so the check above cannot see it. Starting now would race
+        # that thread into two identical drafts for the same contact.
+        raise HTTPException(409, str(e))
     return _parse_job(db.get_job(job["id"]))
 
 
@@ -680,6 +722,19 @@ def _already_delivered(email: Optional[dict]) -> bool:
         return False
     return bool(str(email.get("gmail_message_id") or "").strip()
                 or str(email.get("sent_at") or "").strip())
+
+
+def _send_attempt_pending(email: Optional[dict]) -> bool:
+    """True when this row was handed to Gmail and we never heard the verdict.
+
+    A lost response (read timeout, reset, 5xx) is indistinguishable from a
+    message Gmail accepted and queued, so the row is not a safe retry: the
+    recipient may already have it. Sending again needs either proof from the
+    Sent folder or the user saying so explicitly.
+    """
+    if not email or _already_delivered(email):
+        return False
+    return bool(str(email.get("send_attempted_at") or "").strip())
 
 
 @app.patch("/api/emails/{email_id}")
@@ -807,12 +862,36 @@ async def generate_follow_up(email_id: str):
         raise HTTPException(404, "Original sent email not found")
     # Nothing dedupes downstream: two clicks used to mean two near-identical
     # follow-ups in Drafts, both caught by "Select all", both delivered.
+    #
+    # The question is per *person*, not per row — the same way the reply guard
+    # below and get_follow_up_candidates ask it. Someone with several sent
+    # first-contact emails was otherwise offered (and given) one follow-up per
+    # email, i.e. two "just following up on my note" messages to one human.
     existing = db.query_one(
-        "SELECT id FROM emails WHERE original_email_id=? AND status <> 'trashed' "
-        "ORDER BY created_at DESC LIMIT 1", (email_id,))
+        "SELECT f.id FROM emails f JOIN emails o ON f.original_email_id = o.id "
+        "WHERE f.status <> 'trashed' AND (o.id = ? OR (? IS NOT NULL "
+        "AND o.contact_id = ?)) ORDER BY f.created_at DESC LIMIT 1",
+        (email_id, original.get("contact_id"), original.get("contact_id")))
     if existing:
-        raise HTTPException(409, "A follow-up to this email has already been "
+        raise HTTPException(409, "A follow-up to this person has already been "
                                  "drafted — find it in Drafts.")
+    # A follow-up is written on the premise of silence ("no reply yet"). The
+    # reply can easily sit on a sibling email, so ask about the *person*, the
+    # way get_follow_up_candidates does — the row-level has_response flag says
+    # nothing about whether they have already written back.
+    #
+    # Only a reply the current checker verified may block this. An unverified
+    # legacy flag (the old checker counted bounces, auto-replies and our own
+    # messages) is not evidence, and letting it 409 switched follow-ups off for
+    # most of the database.
+    if original.get("contact_id") and db.query_one(
+            "SELECT 1 FROM emails WHERE contact_id=? AND has_response=1 "
+            "AND response_verified_at IS NOT NULL LIMIT 1",
+            (original["contact_id"],)):
+        raise HTTPException(
+            409, "This person already replied (on one of your emails to them), so "
+                 "a \"no reply yet\" follow-up would be wrong. Reply in Gmail "
+                 "instead.")
     can, err = rate_limiter.can_generate_email()
     if not can:
         raise HTTPException(429, err)
@@ -862,11 +941,62 @@ def _resume_allowed_for(email: dict) -> bool:
     return spec.get("resume_weight") != "none"
 
 
+def _resolved_attachment_id(email: dict, attach: bool,
+                            resume_override: Optional[str]) -> Optional[str]:
+    """Which resume will actually be stapled to this email, or None.
+
+    Single source of truth for the send path: the batch attaches what this
+    returns, and the request handler compares it against what the body promises.
+    """
+    if not (attach and _resume_allowed_for(email)):
+        return None
+    for candidate in (resume_override, email.get("resume_id")):
+        if candidate and resumes.resolve_attachment_path(candidate):
+            return candidate
+    default = db.get_default_resume()
+    if default and resumes.resolve_attachment_path(default["id"]):
+        return default["id"]
+    return None
+
+
+def _attachment_claim_conflict(email: dict, attach: bool,
+                               resume_override: Optional[str]) -> Optional[str]:
+    """Why sending this row would contradict its own body, or None.
+
+    The body's "my resume is attached" is decided once, at compose time, around
+    one specific PDF. The send dialog can still untick "Attach resume" or staple
+    a different file to every draft, and nothing compared the two — so the
+    recipient got an email promising an attachment that isn't there, or a resume
+    the email was never written around. Deleting a resume is refused for exactly
+    this reason (409 on /api/resumes/{id}); sending must not hold a lower
+    standard.
+    """
+    if not email.get("claims_attachment"):
+        return None
+    default = db.get_default_resume() or {}
+    # A draft with no resume_id was written around the default at the time.
+    expected = email.get("resume_id") or default.get("id")
+    resolved = _resolved_attachment_id(email, attach, resume_override)
+    if not resolved:
+        return "the body says a resume is attached, but nothing would be attached"
+    if expected and resolved != expected:
+        return ("the body was written around a different resume than the one "
+                "that would be attached")
+    return None
+
+
 def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
-                    attach: bool, from_email: str):
+                    attach: bool, from_email: str, confirm_resend: bool = False):
     sent = failed = 0
     results = []
     cancelled = False
+    # Recipients this batch has already sent a first-contact email to. Two
+    # drafts for the same person (a cancelled generation racing its retry) are
+    # both picked up by "Select all", and nothing else dedupes at send time.
+    first_contact_recipients = set()
+    # Same rule for follow-ups: two follow-ups to one person are two copies of
+    # "I wanted to follow up on my note" three seconds apart.
+    follow_up_recipients = set()
     try:
         for i, email_id in enumerate(email_ids):
             job = db.get_job(job_id)
@@ -876,16 +1006,69 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
             email = db.get_email(email_id)
             if not email or email["status"] not in ("draft", "approved"):
                 results.append({"email_id": email_id, "success": False,
-                                "error": "not sendable"})
+                                "retryable": False, "error": "not sendable"})
                 continue
             if _already_delivered(email):
                 # Re-checked here and not only in the handler: a second send of
                 # this row would also overwrite gmail_message_id and orphan the
                 # thread that reply tracking follows.
                 results.append({"email_id": email_id, "success": False,
-                                "error": "already sent"})
+                                "retryable": False, "error": "already sent"})
                 failed += 1
                 continue
+            recipient = str(email.get("contact_email") or "").strip().lower()
+            if not email.get("is_follow_up") and recipient in first_contact_recipients:
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": False,
+                    "error": "a first-contact email to this recipient already went "
+                             "out in this batch"})
+                failed += 1
+                continue
+            if email.get("is_follow_up") and recipient in follow_up_recipients:
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": False,
+                    "error": "a follow-up to this recipient already went out in "
+                             "this batch"})
+                failed += 1
+                continue
+            if _send_attempt_pending(email):
+                # An earlier attempt reached Gmail with no answer back. Ask the
+                # Sent folder first — if it landed, record that instead of
+                # sending the recipient a second copy.
+                found = email_sender.find_delivered_message(
+                    email.get("contact_email"), email.get("subject"),
+                    sent_after=email.get("send_attempted_at"))
+                if found and db.query_one(
+                        "SELECT id FROM emails WHERE gmail_message_id=? AND id<>?",
+                        (found.get("gmail_message_id"), email_id)):
+                    # That message is already recorded against another row, so it
+                    # is an older copy of the same subject to the same person —
+                    # not proof that *this* attempt landed.
+                    found = None
+                if found:
+                    db.update_email(email_id, {
+                        "status": "sent", "sent_at": now_iso(),
+                        "gmail_message_id": found.get("gmail_message_id"),
+                        "gmail_thread_id": found.get("gmail_thread_id"),
+                        "send_attempted_at": None, "send_attempt_error": None,
+                    })
+                    db.log_event("email", email_id, "send_reconciled",
+                                 f"found in Gmail Sent → {email.get('contact_email')}")
+                    results.append({
+                        "email_id": email_id, "success": False, "retryable": False,
+                        "error": "already sent — the earlier attempt did land, and "
+                                 "it is now recorded as sent"})
+                    failed += 1
+                    continue
+                if not confirm_resend:
+                    results.append({
+                        "email_id": email_id, "success": False,
+                        "delivery_unknown": True,
+                        "error": "an earlier attempt reached Gmail but never "
+                                 "confirmed, and it is not in your Sent folder. "
+                                 "Check Gmail before retrying."})
+                    failed += 1
+                    continue
             can, err = rate_limiter.can_send_email()
             if not can:
                 # Nothing from here on is attempted. Record every remaining id
@@ -898,15 +1081,8 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                 break
             db.update_job(job_id, stage=f"Sending to {email.get('contact_email')}",
                           progress_current=i)
-            resume_path = None
-            attach_this = attach and _resume_allowed_for(email)
-            if attach_this:
-                resume_path = (resumes.resolve_attachment_path(resume_override)
-                               or resumes.resolve_attachment_path(email.get("resume_id")))
-                if not resume_path:
-                    default = db.get_default_resume()
-                    resume_path = resumes.resolve_attachment_path(
-                        default["id"]) if default else None
+            resume_path = resumes.resolve_attachment_path(
+                _resolved_attachment_id(email, attach, resume_override))
             # A follow-up belongs in the original conversation. The stored
             # gmail_message_id is an API id, not the RFC Message-ID header, so
             # read the real threading values back from Gmail (and backfill the
@@ -924,6 +1100,17 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
             if i > 0:
                 import time as _t
                 _t.sleep(email_sender.send_delay)
+            # Write the intent *before* the network call. Between "Gmail accepted
+            # the POST" and the update below the row is otherwise an ordinary
+            # clean draft, so anything that kills the process in that window
+            # (uvicorn --reload picking up a save, SIGINT, OOM, interpreter
+            # shutdown freezing this daemon thread) loses the fact that the
+            # recipient may already have the message — and the next batch sends a
+            # second copy with no Sent-folder check. Cleared again on a
+            # definitive verdict below.
+            db.update_email(email_id, {"send_attempted_at": now_iso(),
+                                       "send_attempt_error": "handed to Gmail — "
+                                                             "awaiting confirmation"})
             result = email_sender.send_email(email, from_email, resume_path)
             results.append(result)
             if result.get("success"):
@@ -933,14 +1120,37 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                     "status": "sent", "sent_at": now_iso(),
                     "gmail_message_id": result.get("gmail_message_id"),
                     "gmail_thread_id": result.get("gmail_thread_id"),
+                    "send_attempted_at": None, "send_attempt_error": None,
                 })
                 db.update_contact(email["contact_id"], {"status": "sent"})
                 db.log_event("email", email_id, "sent",
                              f"→ {email.get('contact_email')}")
+                if recipient:
+                    if email.get("is_follow_up"):
+                        follow_up_recipients.add(recipient)
+                    else:
+                        first_contact_recipients.add(recipient)
             else:
                 failed += 1
-                db.log_event("email", email_id, "send_failed",
-                             result.get("error") or "")
+                if result.get("delivery_unknown"):
+                    # Keep the row stamped (the write-ahead marker above already
+                    # did) with the real error, so nothing downstream — the
+                    # results screen, a later batch, the user — reads this as
+                    # "safely retryable".
+                    db.update_email(email_id, {
+                        "send_attempted_at": now_iso(),
+                        "send_attempt_error": result.get("error") or "",
+                    })
+                    db.log_event("email", email_id, "send_unconfirmed",
+                                 result.get("error") or "")
+                else:
+                    # A verdict from Gmail (or a refusal before it saw anything):
+                    # nothing was queued, so clear the write-ahead marker and let
+                    # this stay an ordinary retryable draft.
+                    db.update_email(email_id, {"send_attempted_at": None,
+                                               "send_attempt_error": None})
+                    db.log_event("email", email_id, "send_failed",
+                                 result.get("error") or "")
             db.update_job(job_id, progress_current=i + 1)
         # Progress reflects what was actually accounted for: every id in
         # `results` was either sent or reported as failed. It reads 100% only
@@ -951,6 +1161,14 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
     except Exception as e:
         db.finish_job(job_id, status="failed", error=str(e),
                       result={"sent": sent, "failed": failed, "results": results})
+    except BaseException as e:
+        # KeyboardInterrupt / SystemExit are not Exceptions, so they used to skip
+        # finish_job and leave the job row 'running' — which 409s every later
+        # send until the next restart reaps it.
+        db.finish_job(job_id, status="failed",
+                      error=str(e) or type(e).__name__,
+                      result={"sent": sent, "failed": failed, "results": results})
+        raise
     finally:
         _send_lock.release()
 
@@ -960,13 +1178,27 @@ def send_emails(payload: SendRequest):
     # Plain `def` on purpose: FastAPI runs it in the threadpool, so a blocking
     # OAuth browser flow in authenticate() cannot freeze the event loop.
     candidates = [db.get_email(eid) or {} for eid in payload.email_ids]
-    sendable = [e["id"] for e in candidates
-                if e.get("status") in ("draft", "approved")
-                and not _already_delivered(e)]
+    sendable_rows = [e for e in candidates
+                     if e.get("status") in ("draft", "approved")
+                     and not _already_delivered(e)]
+    sendable = [e["id"] for e in sendable_rows]
     if not sendable:
         raise HTTPException(400, "None of the selected emails can be sent "
                                  "(only drafts and approved emails that have not "
                                  "already gone out are sendable)")
+    # Never let the send options quietly falsify the text the user reviewed.
+    if not payload.confirm_attachment_change:
+        conflicts = [(e, why) for e in sendable_rows
+                     if (why := _attachment_claim_conflict(
+                         e, payload.attach_resume, payload.resume_id))]
+        if conflicts:
+            listed = ", ".join(
+                f"{e.get('contact_email') or e.get('contact_name') or e['id']} "
+                f"({why})" for e, why in conflicts[:5])
+            raise HTTPException(
+                400, f"{len(conflicts)} of these emails promise an attachment that "
+                     f"these send options would change: {listed}. Rewrite the "
+                     f"draft, fix the attachment, or confirm the change.")
     can, err = rate_limiter.can_send_email()
     if not can:
         raise HTTPException(429, err)
@@ -989,7 +1221,8 @@ def send_emails(payload: SendRequest):
         from_email = (payload.from_email or "").strip() or (db.get_profile().get("email") or "me")
         threading.Thread(
             target=_send_batch_job,
-            args=(job["id"], sendable, payload.resume_id, payload.attach_resume, from_email),
+            args=(job["id"], sendable, payload.resume_id, payload.attach_resume,
+                  from_email, bool(payload.confirm_resend)),
             daemon=True,
         ).start()
     except Exception:
@@ -1017,13 +1250,19 @@ def cancel_send(job_id: str):
 
 @app.post("/api/emails/check-replies")
 def check_replies(recheck: bool = Query(False)):
-    """Check sent emails for genuine replies. With recheck=true, previously
-    marked replies are re-verified too (fixes legacy bounce/auto-reply
-    false positives). Plain `def` on purpose: the many sequential Gmail
-    calls (and any OAuth flow) run in the threadpool, not the event loop."""
+    """Check sent emails for genuine replies.
+
+    A default run covers everything not yet answered *and* every reply flag the
+    current checker has never verified — the legacy checker counted bounces,
+    auto-replies and our own messages, so those flags are precisely what needs
+    re-examining. recheck=true additionally re-verifies already-verified rows.
+
+    Plain `def` on purpose: the many sequential Gmail calls (and any OAuth flow)
+    run in the threadpool, not the event loop.
+    """
     where = "e.status='sent' AND e.gmail_message_id IS NOT NULL"
     if not recheck:
-        where += " AND e.has_response=0"
+        where += " AND (e.has_response=0 OR e.response_verified_at IS NULL)"
     sent_emails = db.query(
         f"""SELECT e.*, ct.name AS contact_name, ct.email AS contact_email
            FROM emails e LEFT JOIN contacts ct ON e.contact_id=ct.id
@@ -1032,14 +1271,14 @@ def check_replies(recheck: bool = Query(False)):
     )
     if not sent_emails:
         return {"success": True, "checked": 0, "new_replies": 0, "cleared": 0,
-                "failed_checks": 0}
+                "failed_checks": 0, "confirmed": 0, "unverified_remaining": 0}
     try:
         email_sender.authenticate()
     except Exception as e:
         raise HTTPException(401, f"Gmail authentication failed: {e}")
     checker = ResponseChecker(email_sender.service,
                               own_address=db.get_profile().get("email"))
-    new_replies = cleared = failed_checks = 0
+    new_replies = cleared = failed_checks = confirmed = 0
     for email in sent_emails:
         has_reply, when = checker.check_response(
             email["gmail_message_id"], email.get("gmail_thread_id"))
@@ -1048,29 +1287,44 @@ def check_replies(recheck: bool = Query(False)):
             # 'no reply' — never clear an existing reply record for it.
             failed_checks += 1
             continue
+        # Every definite verdict below stamps response_verified_at, which is what
+        # separates "this checker saw the reply" from an inherited legacy flag.
+        verified_at = now_iso()
         if has_reply and not email["has_response"]:
             new_replies += 1
             db.update_email(email["id"], {
                 "has_response": True,
                 "response_at": when.isoformat(timespec="seconds") if when else now_iso(),
+                "response_verified_at": verified_at,
             })
             if email.get("contact_id"):
                 db.update_contact(email["contact_id"], {"status": "replied"})
             db.log_event("email", email["id"], "replied",
                          email.get("contact_name") or email.get("contact_email") or "")
-        elif has_reply and email["has_response"] and when:
-            db.update_email(email["id"], {
-                "response_at": when.isoformat(timespec="seconds")})
+        elif has_reply and email["has_response"]:
+            if not email.get("response_verified_at"):
+                confirmed += 1
+            updates = {"response_verified_at": verified_at}
+            if when:
+                updates["response_at"] = when.isoformat(timespec="seconds")
+            db.update_email(email["id"], updates)
+            if email.get("contact_id"):
+                db.update_contact(email["contact_id"], {"status": "replied"})
         elif not has_reply and email["has_response"]:
             cleared += 1
-            db.update_email(email["id"], {"has_response": False, "response_at": None})
+            db.update_email(email["id"], {"has_response": False, "response_at": None,
+                                          "response_verified_at": None})
             if email.get("contact_id"):
                 contact = db.get_contact(email["contact_id"])
                 if contact and contact.get("status") == "replied":
                     db.update_contact(email["contact_id"], {"status": "sent"})
+    remaining = db.query_one(
+        "SELECT COUNT(*) AS n FROM emails "
+        "WHERE has_response=1 AND response_verified_at IS NULL")["n"]
     return {"success": True, "checked": len(sent_emails),
             "new_replies": new_replies, "cleared": cleared,
-            "failed_checks": failed_checks}
+            "failed_checks": failed_checks, "confirmed": confirmed,
+            "unverified_remaining": remaining}
 
 
 # ---------- dashboard / tracking ----------
@@ -1083,8 +1337,17 @@ async def dashboard():
         "drafts": db.query_one(
             "SELECT COUNT(*) AS n FROM emails WHERE status IN ('draft','approved')")["n"],
         "sent": db.query_one("SELECT COUNT(*) AS n FROM emails WHERE status='sent'")["n"],
+        # Only replies the current checker verified. The headline number is read
+        # as fact ("Reply rate 89.8%" in green), and the flags inherited from the
+        # legacy checker — which counted bounces, auto-replies and our own
+        # messages — cannot support that claim. They are reported separately so
+        # the user can re-verify them instead of being told a number.
         "replied": db.query_one(
-            "SELECT COUNT(*) AS n FROM emails WHERE has_response=1")["n"],
+            "SELECT COUNT(*) AS n FROM emails WHERE has_response=1 "
+            "AND response_verified_at IS NOT NULL")["n"],
+        "replied_unverified": db.query_one(
+            "SELECT COUNT(*) AS n FROM emails WHERE has_response=1 "
+            "AND response_verified_at IS NULL")["n"],
     }
     counts["reply_rate"] = round(counts["replied"] / counts["sent"] * 100, 1) if counts["sent"] else 0.0
 
@@ -1095,7 +1358,8 @@ async def dashboard():
            GROUP BY day ORDER BY day""", (since,))
     replies_by_day = db.query(
         """SELECT substr(response_at, 1, 10) AS day, COUNT(*) AS replies
-           FROM emails WHERE has_response=1 AND response_at >= ?
+           FROM emails WHERE has_response=1 AND response_verified_at IS NOT NULL
+             AND response_at >= ?
            GROUP BY day ORDER BY day""", (since,))
     timeline = {}
     for i in range(30):
@@ -1113,7 +1377,10 @@ async def dashboard():
         # in the denominator made "122/154 sent" look like a backlog.
         """SELECT email_type, COUNT(*) AS total,
                   SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
-                  SUM(CASE WHEN has_response=1 THEN 1 ELSE 0 END) AS replied
+                  SUM(CASE WHEN has_response=1 AND response_verified_at IS NOT NULL
+                           THEN 1 ELSE 0 END) AS replied,
+                  SUM(CASE WHEN has_response=1 AND response_verified_at IS NULL
+                           THEN 1 ELSE 0 END) AS replied_unverified
            FROM emails WHERE status <> 'trashed'
            GROUP BY email_type ORDER BY total DESC""")
 

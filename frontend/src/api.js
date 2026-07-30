@@ -34,7 +34,7 @@ export const companiesAPI = {
   create: (name, url) => api.post('/companies', { name, url: url || null }),
   update: (id, data) => api.put(`/companies/${id}`, data),
   enrich: (id) => api.post(`/companies/${id}/enrich`),
-  delete: (id) => api.delete(`/companies/${id}`),
+  delete: (id, force = false) => api.delete(`/companies/${id}`, { params: { force } }),
 }
 
 export const contactsAPI = {
