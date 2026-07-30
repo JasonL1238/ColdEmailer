@@ -3,9 +3,11 @@ import toast from 'react-hot-toast'
 import {
   Search, Sparkles, X, ChevronRight, Globe, Users, AlertCircle, History, Compass,
 } from 'lucide-react'
-import { discoveryAPI, errMessage } from '../api'
+import { companiesAPI, discoveryAPI, errMessage } from '../api'
 import { Button, Chip, EmptyState, ProgressBar, Spinner, initials, timeAgo } from '../ui'
 import { useApp } from '../App'
+import CompanyDrawer, { SCRAPE_STATUS } from '../components/CompanyDrawer'
+import ComposeModal from './ComposeModal'
 
 const SUGGESTIONS = [
   'AI infrastructure startups in San Francisco',
@@ -16,17 +18,6 @@ const SUGGESTIONS = [
   'Robotics companies in Boston',
 ]
 
-const STATUS_LABELS = {
-  scraped: { label: 'Contacts found', tone: 'green' },
-  no_emails_found: { label: 'No contacts found', tone: 'amber' },
-  no_website: { label: 'No website', tone: 'gray' },
-  wrong_site: { label: 'Wrong site found', tone: 'amber' },
-  scrape_failed: { label: 'Scrape failed', tone: 'red' },
-  already_in_database: { label: 'Already saved', tone: 'sky' },
-  pending: { label: 'Pending', tone: 'gray' },
-  scraping: { label: 'Scraping…', tone: 'accent' },
-}
-
 export default function Discover() {
   const { navigate } = useApp()
   const [query, setQuery] = useState('')
@@ -34,12 +25,23 @@ export default function Discover() {
   const [run, setRun] = useState(null)         // active/last-viewed run (full detail)
   const [history, setHistory] = useState([])
   const [starting, setStarting] = useState(false)
+  const [drawerCompany, setDrawerCompany] = useState(null)
+  const [composeIds, setComposeIds] = useState(null)
   const pollRef = useRef(null)
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) clearInterval(pollRef.current)
     pollRef.current = null
   }, [])
+
+  const openCompany = async (id) => {
+    try {
+      const { data } = await companiesAPI.get(id)
+      setDrawerCompany(data)
+    } catch (e) {
+      toast.error(errMessage(e, 'Could not load company'))
+    }
+  }
 
   /** Watch a run. announce=false when merely opening a past search, so an
    *  old completed run doesn't fire a "search complete" toast on click. */
@@ -224,18 +226,29 @@ export default function Discover() {
       {companies.length > 0 && (
         <>
           <div className="row-between mt-24 mb-16">
-            <div style={{ fontWeight: 700, fontSize: 15 }}>
-              {companies.length} {companies.length === 1 ? 'company' : 'companies'} found
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 15 }}>
+                {companies.length} {companies.length === 1 ? 'company' : 'companies'} found
+              </div>
+              <div className="tiny muted" style={{ marginTop: 2 }}>
+                Click a company to view research and contacts
+              </div>
             </div>
-            <Button variant="primary" onClick={() => navigate('database')}>
-              Open in Database <ChevronRight size={14} />
+            <Button variant="secondary" onClick={() => navigate('database')}>
+              Open full Database <ChevronRight size={14} />
             </Button>
           </div>
           <div className="company-grid">
             {companies.map((c) => {
-              const st = STATUS_LABELS[c.scrape_status] || STATUS_LABELS.pending
+              const st = SCRAPE_STATUS[c.scrape_status] || SCRAPE_STATUS.pending
               return (
-                <div key={c.id} className="card company-card" onClick={() => navigate('database')}>
+                <button
+                  key={c.id}
+                  type="button"
+                  className="card company-card"
+                  onClick={() => openCompany(c.id)}
+                  style={{ textAlign: 'left', cursor: 'pointer', width: '100%' }}
+                >
                   <div className="company-card-head">
                     <div className="company-favicon">{initials(c.name)}</div>
                     <div style={{ minWidth: 0 }}>
@@ -253,7 +266,7 @@ export default function Discover() {
                       <Users size={10} /> {c.contact_count} {c.contact_count === 1 ? 'contact' : 'contacts'}
                     </Chip>
                   </div>
-                </div>
+                </button>
               )
             })}
           </div>
@@ -301,6 +314,30 @@ export default function Discover() {
             })}
           </div>
         </div>
+      )}
+
+      {drawerCompany && (
+        <CompanyDrawer
+          company={drawerCompany}
+          onClose={() => setDrawerCompany(null)}
+          onChanged={async () => {
+            try { setDrawerCompany((await companiesAPI.get(drawerCompany.id)).data) }
+            catch { setDrawerCompany(null) }
+            if (run?.id) pollRun(run.id, { announce: false })
+          }}
+          onDeleted={() => {
+            setDrawerCompany(null)
+            if (run?.id) pollRun(run.id, { announce: false })
+          }}
+          onCompose={(ids) => setComposeIds(ids)}
+        />
+      )}
+      {composeIds && (
+        <ComposeModal
+          contactIds={composeIds}
+          onClose={() => setComposeIds(null)}
+          onDone={() => setComposeIds(null)}
+        />
       )}
     </div>
   )

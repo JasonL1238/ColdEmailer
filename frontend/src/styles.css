@@ -582,8 +582,9 @@ a:hover { text-decoration: underline; }
 
 /* company result cards */
 .company-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
-.company-card { padding: 16px 18px; transition: box-shadow 0.15s, transform 0.15s; cursor: pointer; }
+.company-card { padding: 16px 18px; transition: box-shadow 0.15s, transform 0.15s; cursor: pointer; border: none; background: var(--surface); font: inherit; color: inherit; }
 .company-card:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
+.company-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .company-card-head { display: flex; align-items: center; gap: 10px; }
 .company-favicon {
   width: 34px; height: 34px;
