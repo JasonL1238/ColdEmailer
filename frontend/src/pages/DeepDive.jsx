@@ -115,27 +115,58 @@ export default function DeepDive() {
     return stopPolling
   }, [loadHistory, stopPolling])
 
+  const running = run?.status === 'running'
+  const payload = (() => {
+    const p = run?.payload
+    if (!p) return {}
+    if (typeof p === 'string') {
+      try { return JSON.parse(p) } catch { return {} }
+    }
+    return p
+  })()
+  // History list items omit `company`; always read ids from parsed result too.
+  const result = (() => {
+    if (run?.status !== 'done') return null
+    const r = run?.result
+    if (!r) return null
+    if (typeof r === 'string') {
+      try { return JSON.parse(r) } catch { return null }
+    }
+    return r
+  })()
+  const company = run?.company
+  const companyId = result?.company_id || company?.id || payload?.company_id || null
+  const resolvedName = companyName.trim()
+    || result?.company_name
+    || company?.name
+    || payload?.company_name
+    || ''
+
   const start = async (continueMode = null) => {
-    const name = companyName.trim() || result?.company_name || ''
-    if (!continueMode && name.length < 2) {
+    // onClick={start} passes a click event — only real mode strings count.
+    const mode = typeof continueMode === 'string' ? continueMode : null
+    const name = resolvedName
+    if (!mode && name.length < 2) {
       toast.error('Enter a company name')
       return
     }
-    if (continueMode && !(result?.company_id || run?.company?.id)) {
+    // Continue can use company_id from the last run, or resolve by name on
+    // the backend when this company was deep-dived before.
+    if (mode && !companyId && name.length < 2) {
       toast.error('Run a full deep dive before continuing')
       return
     }
     setStarting(true)
     try {
-      const payload = {
+      const body = {
         company_name: name || undefined,
-        company_id: result?.company_id || run?.company?.id || undefined,
+        company_id: companyId || undefined,
         url: url.trim() || null,
         contact_criteria: criteria.trim(),
         min_contacts: 5,
       }
-      if (continueMode) payload.continue_mode = continueMode
-      const { data } = await deepResearchAPI.start(payload)
+      if (mode) body.continue_mode = mode
+      const { data } = await deepResearchAPI.start(body)
       setRun(data)
       if (name) setCompanyName(name)
       pollRun(data.id)
@@ -159,19 +190,55 @@ export default function DeepDive() {
     }
   }
 
-  const running = run?.status === 'running'
-  const result = run?.status === 'done' ? (run.result || {}) : null
-  const company = run?.company
   // Prefer the job snapshot so history does not show a later run's intel.
   const intel = result?.deep_intel || company?.deep_intel || {}
   const hasRunContactFilter = Array.isArray(result?.contact_ids)
   const runContactIds = new Set(result?.contact_ids || [])
+  const matchedIdSet = new Set(result?.matched_contact_ids || [])
+  const otherIdSet = new Set(result?.other_contact_ids || [])
   const runContacts = hasRunContactFilter
     ? (company?.contacts || []).filter((c) => runContactIds.has(c.id))
     : []
+  const matchedContacts = matchedIdSet.size
+    ? runContacts.filter((c) => matchedIdSet.has(c.id))
+    : runContacts.filter((c) => /criteria match/i.test(c.notes || ''))
+  const otherContacts = otherIdSet.size
+    ? runContacts.filter((c) => otherIdSet.has(c.id))
+    : runContacts.filter((c) => !matchedContacts.some((m) => m.id === c.id))
   const contactCountLabel = result
     ? (result.contacts_saved ?? runContacts.length)
     : runContacts.length
+  const canContinue = Boolean(companyId || resolvedName.length >= 2)
+
+  const renderContactRow = (c, { criteriaHit } = {}) => (
+    <div key={c.id} className="card card-pad row-between" style={{ padding: '10px 14px' }}>
+      <div style={{ minWidth: 0 }}>
+        <div className="row" style={{ gap: 8 }}>
+          <div style={{ fontWeight: 600, fontSize: 13 }}>{c.name || 'Unnamed'}</div>
+          {criteriaHit && <Chip tone="violet">Criteria</Chip>}
+        </div>
+        {c.role && <div className="tiny" style={{ marginTop: 2 }}>{c.role}</div>}
+        <div className="row" style={{ gap: 10, marginTop: 4, flexWrap: 'wrap' }}>
+          {c.email && <span className="tiny mono">{c.email}</span>}
+          {c.linkedin_url && (
+            <a href={c.linkedin_url} target="_blank" rel="noreferrer"
+              className="tiny row" style={{ gap: 4 }}>
+              LinkedIn <ExternalLink size={10} />
+            </a>
+          )}
+        </div>
+      </div>
+      {c.email && (
+        <button
+          className="icon-btn"
+          title="Generate email"
+          onClick={() => setComposeIds([c.id])}
+        >
+          <Sparkles size={14} />
+        </button>
+      )}
+    </div>
+  )
 
   return (
     <div className="page">
@@ -242,7 +309,12 @@ export default function DeepDive() {
             {running ? (
               <Button variant="ghost" icon={X} onClick={cancel}>Cancel</Button>
             ) : (
-              <Button variant="primary" icon={Microscope} onClick={start} disabled={starting}>
+              <Button
+                variant="primary"
+                icon={Microscope}
+                onClick={() => start()}
+                disabled={starting}
+              >
                 {starting ? 'Starting…' : 'Deep research'}
               </Button>
             )}
@@ -290,18 +362,30 @@ export default function DeepDive() {
               </div>
             </div>
             <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
-              {result.company_id && (
-                <Button size="sm" onClick={() => openCompany(result.company_id)}>
+              {companyId && (
+                <Button size="sm" onClick={() => openCompany(companyId)}>
                   Open company
                 </Button>
               )}
-              <Button size="sm" disabled={running || starting} onClick={() => start('contacts')}>
+              <Button
+                size="sm"
+                disabled={running || starting || !canContinue}
+                onClick={() => start('contacts')}
+              >
                 Continue contacts
               </Button>
-              <Button size="sm" disabled={running || starting} onClick={() => start('research')}>
+              <Button
+                size="sm"
+                disabled={running || starting || !canContinue}
+                onClick={() => start('research')}
+              >
                 Continue research
               </Button>
-              <Button size="sm" disabled={running || starting} onClick={() => start('both')}>
+              <Button
+                size="sm"
+                disabled={running || starting || !canContinue}
+                onClick={() => start('both')}
+              >
                 Continue both
               </Button>
               {runContacts.filter((c) => c.email).length > 0 && (
@@ -355,47 +439,39 @@ export default function DeepDive() {
                 </div>
               </div>
               <Chip tone={result.criteria_ratio_met ? 'green' : 'amber'}>
-                {result.criteria_matches}/{result.contacts_saved ?? 0} criteria
+                {result.criteria_matches ?? matchedContacts.length} match criteria
+                {' · '}
+                {otherContacts.length} other
               </Chip>
             </div>
             {runContacts.length === 0 ? (
               <div className="small muted">No contacts saved from this run.</div>
             ) : (
-              <div className="stack" style={{ gap: 8 }}>
-                {runContacts.map((c) => {
-                  const criteriaHit = /criteria match|warm match: criteria|northwestern|alumni|alum/i.test(
-                    `${c.notes || ''} ${c.affinity || ''} ${c.evidence || ''} ${c.role || ''}`,
-                  )
-                  return (
-                    <div key={c.id} className="card card-pad row-between" style={{ padding: '10px 14px' }}>
-                      <div style={{ minWidth: 0 }}>
-                        <div className="row" style={{ gap: 8 }}>
-                          <div style={{ fontWeight: 600, fontSize: 13 }}>{c.name || 'Unnamed'}</div>
-                          {criteriaHit && <Chip tone="violet">Criteria</Chip>}
-                        </div>
-                        {c.role && <div className="tiny" style={{ marginTop: 2 }}>{c.role}</div>}
-                        <div className="row" style={{ gap: 10, marginTop: 4, flexWrap: 'wrap' }}>
-                          {c.email && <span className="tiny mono">{c.email}</span>}
-                          {c.linkedin_url && (
-                            <a href={c.linkedin_url} target="_blank" rel="noreferrer"
-                              className="tiny row" style={{ gap: 4 }}>
-                              LinkedIn <ExternalLink size={10} />
-                            </a>
-                          )}
-                        </div>
-                      </div>
-                      {c.email && (
-                        <button
-                          className="icon-btn"
-                          title="Generate email"
-                          onClick={() => setComposeIds([c.id])}
-                        >
-                          <Sparkles size={14} />
-                        </button>
-                      )}
+              <div className="stack" style={{ gap: 16 }}>
+                <div>
+                  <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+                    Criteria matches ({matchedContacts.length})
+                  </div>
+                  {matchedContacts.length === 0 ? (
+                    <div className="small muted">No criteria matches yet — try Continue contacts.</div>
+                  ) : (
+                    <div className="stack" style={{ gap: 8 }}>
+                      {matchedContacts.map((c) => renderContactRow(c, { criteriaHit: true }))}
                     </div>
-                  )
-                })}
+                  )}
+                </div>
+                <div>
+                  <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+                    Other contacts ({otherContacts.length})
+                  </div>
+                  {otherContacts.length === 0 ? (
+                    <div className="small muted">No additional company contacts in this run.</div>
+                  ) : (
+                    <div className="stack" style={{ gap: 8 }}>
+                      {otherContacts.map((c) => renderContactRow(c))}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -432,7 +508,12 @@ export default function DeepDive() {
                   style={{ textAlign: 'left', cursor: 'pointer', border: 'none', font: 'inherit', color: 'inherit' }}
                   onClick={() => {
                     setRun(j)
-                    if (j.status === 'running' || (j.status === 'done' && res.company_id)) {
+                    const name = payload.company_name || res.company_name || ''
+                    if (name) setCompanyName(name)
+                    if (payload.contact_criteria) setCriteria(payload.contact_criteria)
+                    // Always hydrate — list rows omit the company object that
+                    // Continue needs for company_id.
+                    if (j.status === 'running' || j.status === 'done') {
                       pollRun(j.id, { announce: false })
                     }
                   }}

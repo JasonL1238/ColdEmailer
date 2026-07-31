@@ -358,7 +358,9 @@ class TestAlumniCriteria:
             criteria_terms=["VP Engineering", "Northwestern Alum"],
             alumni_only_floor=True,
         )
-        assert selected == []
+        # Role-only hits are kept as "other" contacts, never as alumni.
+        assert selected
+        assert all(not c.get("alumni_match") for c in selected)
 
 
 class TestEmployeeEstimateAndFloor:
@@ -529,8 +531,11 @@ class TestContactFloorSelection:
             criteria_terms=["Northwestern Alum"],
             alumni_only_floor=True,
         )
-        assert all(c.get("criteria_match") for c in selected)
-        assert not any(c.get("name") == "David Solomon" for c in selected)
+        alumni = [c for c in selected if c.get("alumni_match")]
+        others = [c for c in selected if not c.get("alumni_match")]
+        assert len(alumni) == 3
+        # Non-alumni company people are kept, but separated from matches.
+        assert any(c.get("name") == "David Solomon" for c in others)
 
     def test_channel_rejects_mx_failed_email(self):
         svc = DeepResearchService(db=None, enrichment=None)

@@ -42,8 +42,11 @@ except ImportError:  # pragma: no cover
 MIN_CONTACTS = 5
 CRITERIA_HIT_TARGET = 4  # of MIN_CONTACTS should match criteria when possible
 MAX_LINKEDIN_SEARCHES = 14
-MAX_ALUMNI_SEARCHES = 28
+MAX_ALUMNI_SEARCHES = 24
+MAX_GENERAL_ROSTER_SEARCHES = 10
 MAX_OUTREACH_LOOKUPS = 12
+MAX_MATCHED_PERSIST = 20
+MAX_OTHER_PERSIST = 12
 
 # Broader fallback roles used only to hit the contact floor when criteria
 # are role-shaped (never used to pad an alumni-only request).
@@ -1220,33 +1223,36 @@ class DeepResearchService:
             contacts_added, conflicts, saved_ids = self._persist_contacts(
                 company, selected, source="deep_research")
 
-        saved_key_set = set()
+        saved_by_key: Dict[str, str] = {}
         if saved_ids:
+            id_set = set(saved_ids)
             for row in self.db.list_contacts(company_id=company["id"]) or []:
-                if row.get("id") in set(saved_ids):
-                    saved_key_set.add(self._contact_key(row))
-        if not saved_ids:
-            criteria_hits = 0
-        else:
-            criteria_hits = sum(
-                1 for c in selected
-                if c.get("criteria_match") and self._contact_key(c) in saved_key_set
+                if row.get("id") in id_set:
+                    saved_by_key[self._contact_key(row)] = row["id"]
+
+        matched_ids: List[str] = []
+        other_ids: List[str] = []
+        for c in selected:
+            cid = saved_by_key.get(self._contact_key(c))
+            if not cid:
+                continue
+            is_match = (
+                bool(c.get("alumni_match")) if want_alum
+                else bool(c.get("criteria_match"))
             )
+            if is_match:
+                matched_ids.append(cid)
+            else:
+                other_ids.append(cid)
+
+        criteria_hits = len(matched_ids)
         with_channel = sum(1 for c in selected if any(self._channel_ok(c)))
         persisted_count = len(saved_ids)
-        alumni_hits = sum(
-            1 for c in selected
-            if c.get("alumni_match") and (
-                not saved_key_set or self._contact_key(c) in saved_key_set
-            )
-        ) if saved_ids else 0
-        # Alumni requests: floor means ≥min alumni matches saved, not just
-        # any five employees (and not role-only matches in mixed criteria).
+        # Alumni floor = matched alumni count (matched_ids), not total saved.
         if want_alum and require_floor:
-            floor_met = alumni_hits >= min_contacts
-            criteria_ratio_met = alumni_hits >= min(
+            floor_met = criteria_hits >= min_contacts
+            criteria_ratio_met = criteria_hits >= min(
                 CRITERIA_HIT_TARGET, min_contacts)
-            criteria_hits = alumni_hits
         else:
             floor_met = (not require_floor) or persisted_count >= min_contacts
             criteria_ratio_met = (
@@ -1274,6 +1280,8 @@ class DeepResearchService:
             "contacts_created": contacts_added,
             "contacts_selected": len(selected),
             "contact_ids": saved_ids,
+            "matched_contact_ids": matched_ids,
+            "other_contact_ids": other_ids,
             "criteria_matches": criteria_hits,
             "with_email_or_linkedin": with_channel,
             "employee_estimate": emp_estimate if identity_ok else None,
@@ -1333,32 +1341,51 @@ class DeepResearchService:
 
     def _hunt_queries_for_term(
             self, company_name: str, term: str) -> List[Tuple[str, str]]:
-        """Build (term, query) pairs for a criteria term, with alumni expansions."""
+        """Build ranked (term, query) pairs — high-yield shapes first."""
         pairs: List[Tuple[str, str]] = []
         if is_alumni_term(term):
             aliases = school_aliases_for_term(term)
+            strong: List[str] = []
+            mid: List[str] = []
+            weak: List[str] = []
             for alias in aliases:
                 if _ALUM_WORD_RE.fullmatch(alias.strip()):
                     continue
-                # Skip ultra-short weak stems in search — too noisy
-                # (\"Penn\", \"Ross\") unless they include University/School.
                 a_l = alias.lower()
-                if len(alias.split()) == 1 and not re.search(
-                        r"university|college|school|kellogg|wharton|booth|"
-                        r"mit|ucla|nyu|upenn",
+                if re.search(
+                        r"university|college|school of|school\b", a_l):
+                    strong.append(alias)
+                elif re.search(
+                        r"\b(?:kellogg|wharton|booth|haas|stern|fuqua|"
+                        r"sloan|mit|ucla|nyu|upenn)\b",
                         a_l):
-                    if len(alias) < 8:
-                        continue
+                    mid.append(alias)
+                elif len(alias.split()) == 1 and len(alias) < 8:
+                    continue  # scrap Penn/Ross/NU-style noise stems
+                else:
+                    weak.append(alias)
+            # Ranked: strong school phrases, B-school brands, then stems.
+            for alias in strong + mid + weak:
                 pairs.append((
                     term,
                     f'"{company_name}" "{alias}" site:linkedin.com/in'))
+            # Alias-first order catches different SERP pages.
+            for alias in (strong + mid)[:6]:
                 pairs.append((
                     term,
-                    f'site:linkedin.com/in "{company_name}" "{alias}"'))
-            pairs.append((term, f'"{company_name}" "{term}" site:linkedin.com/in'))
+                    f'"{alias}" "{company_name}" site:linkedin.com/in'))
+            # Education-line shape (LinkedIn snippet pattern).
+            for alias in strong[:3]:
+                pairs.append((
+                    term,
+                    f'"Education: {alias}" "{company_name}"'))
+            pairs.append((
+                term, f'"{company_name}" "{term}" site:linkedin.com/in'))
         else:
-            pairs.append((term, f'"{company_name}" "{term}" site:linkedin.com/in'))
-        # Dedup by query text
+            pairs.append((
+                term, f'"{company_name}" "{term}" site:linkedin.com/in'))
+            pairs.append((
+                term, f'"{term}" "{company_name}" site:linkedin.com/in'))
         seen = set()
         out: List[Tuple[str, str]] = []
         for t, q in pairs:
@@ -1386,15 +1413,19 @@ class DeepResearchService:
 
         def ingest(people: List[Dict], term: str):
             for person in people:
-                # Drop alumni candidates that do not actually mention the school.
+                matched = False
                 if is_alumni_term(term):
                     aliases = school_aliases_for_term(term)
-                    if not _school_mentioned(
+                    if _school_mentioned(
                             aliases,
                             person.get("role") or "",
                             person.get("evidence") or ""):
-                        continue
-                    person["alumni_match"] = True
+                        person["alumni_match"] = True
+                        matched = True
+                    # Non-alum company people from these SERPs stay as
+                    # general contacts — do not drop them.
+                else:
+                    matched = True
                 key = self._contact_key(person)
                 if key in merged:
                     existing = merged[key]
@@ -1403,13 +1434,15 @@ class DeepResearchService:
                             existing[field] = person[field]
                     if person.get("alumni_match"):
                         existing["alumni_match"] = True
-                    aff = list(existing.get("affinity") or [])
-                    tag = f"criteria:{term}"
-                    if tag not in aff:
-                        aff.append(tag)
-                    existing["affinity"] = aff
+                    if matched:
+                        aff = list(existing.get("affinity") or [])
+                        tag = f"criteria:{term}"
+                        if tag not in aff:
+                            aff.append(tag)
+                        existing["affinity"] = aff
                     continue
-                person.setdefault("affinity", []).append(f"criteria:{term}")
+                if matched:
+                    person.setdefault("affinity", []).append(f"criteria:{term}")
                 merged[key] = person
 
         for term in criteria_terms:
@@ -1422,35 +1455,59 @@ class DeepResearchService:
                     results = []
                 searches += 1
                 ingest(
-                    extract_people_from_snippets(
-                        results, company_name),
+                    extract_people_from_snippets(results, company_name),
                     term_i,
                 )
             if searches >= budget:
                 break
 
-            # First-party pages mentioning the school/role.
-            if domain and searches < budget:
-                aliases = school_aliases_for_term(term) if is_alumni_term(term) else [term]
-                seed = next(
-                    (a for a in aliases if "university" in a.lower()
-                     or "school" in a.lower() or len(a) >= 8),
-                    aliases[0] if aliases else term,
-                )
-                try:
-                    site_hits = ddg_text_search(
-                        f'site:{domain} "{seed}" (team OR leadership OR people OR alumni)',
-                        max_results=5,
-                    ) or []
-                except Exception:
-                    site_hits = []
-                searches += 1
-                for hit in site_hits:
+        # Always pull a general company roster so non-criteria contacts
+        # still show up (separated in the UI from matches).
+        merged = self._merge_contacts(
+            list(merged.values()) + self._hunt_general_roster(
+                company_name, domain, budget=MAX_GENERAL_ROSTER_SEARCHES,
+            )
+        )
+        return list(merged.values())
+
+    def _hunt_general_roster(
+            self,
+            company_name: str,
+            domain: Optional[str],
+            *,
+            budget: int = MAX_GENERAL_ROSTER_SEARCHES) -> List[Dict]:
+        """Find company people without criteria filtering (the \"other\" bucket)."""
+        from ddg_search import ddg_text_search
+
+        out: List[Dict] = []
+        seen = set()
+        queries = [
+            f'"{company_name}" ("Managing Director" OR Partner OR "Vice President") site:linkedin.com/in',
+            f'"{company_name}" (Associate OR Analyst OR "Software Engineer") site:linkedin.com/in',
+            f'"{company_name}" ("Head of" OR Director OR Manager) site:linkedin.com/in',
+        ]
+        if domain:
+            queries.append(
+                f'site:{domain} (team OR leadership OR "about us" OR people)')
+        for query in queries[:budget]:
+            try:
+                results = ddg_text_search(query, max_results=6) or []
+            except Exception:
+                results = []
+            for person in extract_people_from_snippets(results, company_name):
+                key = self._contact_key(person)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(person)
+            if domain and query.startswith("site:") and results:
+                for hit in results:
                     title = hit.get("title") or ""
                     body = hit.get("body") or ""
-                    blob = f"{title}. {body}"
-                    for m in _NAME_ROLE_RE.finditer(blob):
+                    for m in _NAME_ROLE_RE.finditer(f"{title}. {body}"):
                         pname = m.group(1).strip()
+                        if len(name_tokens(pname)) < 2:
+                            continue
                         person = {
                             "name": pname,
                             "role": m.group(2).strip()[:80],
@@ -1462,12 +1519,14 @@ class DeepResearchService:
                             "on_domain": True,
                             "seniority_rank": 14,
                             "name_from_email": False,
-                            "affinity": [f"criteria:{term}"],
+                            "affinity": [],
                         }
-                        if len(name_tokens(person["name"])) < 2:
+                        key = self._contact_key(person)
+                        if key in seen:
                             continue
-                        ingest([person], term)
-        return list(merged.values())
+                        seen.add(key)
+                        out.append(person)
+        return out
 
     def _ensure_contact_floor(
             self,
@@ -1662,23 +1721,24 @@ class DeepResearchService:
             c.get("seniority_rank", 20),
         ))
 
-        alumni = [c for c in selected if c.get("alumni_match")]
-        matches = [c for c in selected if c.get("criteria_match")]
-        others = [c for c in selected if not c.get("criteria_match")]
+        # Prefer alumni / criteria matches first, but always keep other
+        # company contacts in a separate trailing bucket (UI splits them).
         if alumni_only_floor:
-            # Persist alumni only — never pad the floor with role-only hits.
-            return alumni[: max(min_contacts + 5, 12)]
+            matches = [c for c in selected if c.get("alumni_match")]
+            others = [c for c in selected if not c.get("alumni_match")]
+        else:
+            matches = [c for c in selected if c.get("criteria_match")]
+            others = [c for c in selected if not c.get("criteria_match")]
 
-        keep = matches[:max(CRITERIA_HIT_TARGET, min_contacts)]
+        keep = matches[:MAX_MATCHED_PERSIST]
+        # Fill toward min_contacts with others only when we still need bodies
+        # for outreach — never reclassify them as criteria matches.
         if len(keep) < min_contacts:
-            keep.extend(others[: min_contacts - len(keep)])
-        if len(keep) < len(matches):
-            for c in matches:
-                if c not in keep:
-                    keep.append(c)
-                if len(keep) >= max(min_contacts, len(matches)):
-                    break
-        return keep[: max(min_contacts + 5, 12)]
+            need = min_contacts - len(keep)
+            keep.extend(others[:need])
+            others = others[need:]
+        keep.extend(others[:MAX_OTHER_PERSIST])
+        return keep
 
     @staticmethod
     def _channel_ok(contact: Dict) -> Tuple[bool, bool]:
