@@ -36,19 +36,31 @@ SUBPAGES = [
     "/leadership", "/people", "/careers", "/news", "/press", "/blog",
 ]
 
-MAX_PAGES_FETCHED = 8
-MAX_PAGE_ATTEMPTS = 16
-# Fast path: homepage + about/team enough for "what they do" + 1 person contact.
-FAST_MAX_PAGES = 3
-FAST_MAX_ATTEMPTS = 5
-FAST_DEADLINE_SEC = 55.0
-FAST_MIN_DELAY = 0.35
+MAX_PAGES_FETCHED = 14
+MAX_PAGE_ATTEMPTS = 28
+# Fast path still aims for a quick first contact, but crawls harder when needed.
+FAST_MAX_PAGES = 6
+FAST_MAX_ATTEMPTS = 12
+FAST_DEADLINE_SEC = 90.0
+FAST_MIN_DELAY = 0.05
+# Deep dive: interview-grade crawl across news/press/careers/policy pages.
+DEEP_MAX_PAGES = 28
+DEEP_MAX_ATTEMPTS = 56
+DEEP_SUBPAGES = [
+    "/about", "/about-us", "/company", "/team", "/leadership", "/people",
+    "/who-we-are", "/our-team", "/management", "/contact", "/contact-us",
+    "/careers", "/jobs", "/news", "/press", "/blog", "/insights",
+    "/culture", "/values", "/mission", "/policy", "/policies", "/esg",
+    "/sustainability", "/diversity", "/inclusion", "/investors",
+]
 
 _LINK_PRIORITY = {
     "leadership": 0, "team": 0, "people": 0, "founder": 0, "management": 0,
     "about": 1, "company": 1, "who-we-are": 1,
     "contact": 2, "careers": 2, "jobs": 2,
     "press": 3, "news": 3, "blog": 4, "insights": 4,
+    "culture": 3, "values": 3, "mission": 3, "policy": 3, "policies": 3,
+    "diversity": 3, "inclusion": 3, "esg": 4, "sustainability": 4,
 }
 _SKIP_PATH_WORDS = {
     "login", "signin", "sign-in", "signup", "sign-up", "privacy", "terms",
@@ -913,17 +925,27 @@ class EnrichmentService:
     def enrich(self, company_name: str, url: Optional[str] = None,
                preferred_school: Optional[str] = None,
                preferred_affiliations: Optional[str] = None,
-               mode: str = "fast",
+               mode: str = "full",
                deadline_sec: Optional[float] = None) -> Dict:
         """Enrich a company from its site.
 
-        mode='fast' (default): stop once we have identity + an about summary +
-        at least one verified person contact, within ~55s.
-        mode='full': deeper crawl (legacy 8-page research).
+        mode='full' (default): deeper crawl (more pages / attempts).
+        mode='fast': stop once we have identity + an about summary +
+        at least one verified person contact, within the fast deadline.
+        mode='deep': interview-grade crawl (news/press/careers/policy).
         """
-        fast = (mode or "fast").lower() != "full"
-        max_pages = FAST_MAX_PAGES if fast else MAX_PAGES_FETCHED
-        max_attempts = FAST_MAX_ATTEMPTS if fast else MAX_PAGE_ATTEMPTS
+        mode_l = (mode or "full").lower()
+        fast = mode_l == "fast"
+        deep = mode_l == "deep"
+        if deep:
+            max_pages = DEEP_MAX_PAGES
+            max_attempts = DEEP_MAX_ATTEMPTS
+        elif fast:
+            max_pages = FAST_MAX_PAGES
+            max_attempts = FAST_MAX_ATTEMPTS
+        else:
+            max_pages = MAX_PAGES_FETCHED
+            max_attempts = MAX_PAGE_ATTEMPTS
         budget = deadline_sec if deadline_sec is not None else (
             FAST_DEADLINE_SEC if fast else None)
         started = time.monotonic()
@@ -941,17 +963,16 @@ class EnrichmentService:
             "pages_scraped": 0,
             "research_sources": [],
             "research_quality": "low",
-            "enrich_mode": "fast" if fast else "full",
+            "enrich_mode": "deep" if deep else ("fast" if fast else "full"),
             "elapsed_sec": 0.0,
         }
         if not url:
             result["elapsed_sec"] = round(time.monotonic() - started, 2)
             return result
 
-        # Fast path uses a tighter same-domain delay so homepage+about+team
-        # can finish under a minute without ignoring robots/SSRF checks.
+        # Always run with the aggressive same-domain delay; SSRF checks stay on.
         delay_cm = None
-        if fast and hasattr(self.scraper, "delay_override"):
+        if hasattr(self.scraper, "delay_override"):
             delay_cm = self.scraper.delay_override(FAST_MIN_DELAY)
             delay_cm.__enter__()
 
@@ -1042,6 +1063,8 @@ class EnrichmentService:
                     company_name=company_name,
                     domain=result.get("domain"),
                     check_mx=True,
+                    max_linkedin_lookups=10 if deep else 3,
+                    max_email_lookups=10 if deep else 3,
                 )
             result["contacts"].sort(key=lambda c: (
                 0 if c.get("person_verified") else 1,
@@ -1111,10 +1134,19 @@ class EnrichmentService:
                 "/about", "/about-us", "/company", "/team", "/leadership",
                 "/people", "/contact", "/contact-us",
             ]
+            deep_extra = [p for p in DEEP_SUBPAGES if p not in preferred_fallbacks]
             other_fallbacks = [p for p in SUBPAGES if p not in preferred_fallbacks]
+            if deep:
+                path_pool = preferred_fallbacks + deep_extra + other_fallbacks
+            elif fast:
+                path_pool = preferred_fallbacks
+            else:
+                path_pool = preferred_fallbacks + other_fallbacks
+            # Preserve order, drop dupes
+            path_pool = list(dict.fromkeys(path_pool))
             fallback_pages = [
                 urljoin(url.rstrip("/") + "/", p.lstrip("/"))
-                for p in (preferred_fallbacks + (other_fallbacks if not fast else []))
+                for p in path_pool
             ]
             attempted = 0
             fallback_failures = 0
@@ -1191,6 +1223,7 @@ class EnrichmentService:
                                 page_records, queue):
                         _refresh_contacts_and_meta(
                             page_records, texts, run_llm=False, do_outreach=True)
+                        result["page_texts"] = texts[:24]
                         result["elapsed_sec"] = round(time.monotonic() - started, 2)
                         return result
 
@@ -1220,17 +1253,23 @@ class EnrichmentService:
                             texts.append(f"SOURCE: {page_url}\n{text[:5000]}")
 
             if page_records:
-                need_llm = not result.get("summary") or not _has_fast_success(
-                    page_records, [])
+                # Deep mode always asks the LLM when a provider exists — heuristic
+                # mid-crawl summaries must not skip interview-grade extraction.
+                need_llm = deep or (
+                    not result.get("summary") or not _has_fast_success(
+                        page_records, [])
+                )
                 # One outreach pass after the crawl fills LinkedIn/Hunter gaps.
                 _refresh_contacts_and_meta(
                     page_records, texts,
                     run_llm=need_llm and not timed_out(),
                     do_outreach=not timed_out(),
                 )
+                result["page_texts"] = texts[:24]
             else:
                 result["pages_attempted"] = attempted
                 result["identity_verified"] = False
+                result["page_texts"] = []
 
             result["elapsed_sec"] = round(time.monotonic() - started, 2)
             return result

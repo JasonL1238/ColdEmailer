@@ -12,7 +12,7 @@ from typing import Dict, List
 
 _lock = threading.Lock()
 _last_call = 0.0
-_MIN_INTERVAL = 2.0  # be polite; DDG rate-limits aggressively
+_MIN_INTERVAL = 0.75  # push harder; DDG still rate-limits if we go much lower
 
 
 def _throttle():

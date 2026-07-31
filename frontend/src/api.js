@@ -18,10 +18,17 @@ export const settingsAPI = {
 }
 
 export const discoveryAPI = {
-  start: (query, count) => api.post('/discovery', { query, count }),
+  start: (query, count, mode = 'full') => api.post('/discovery', { query, count, mode }),
   list: () => api.get('/discovery'),
   get: (id) => api.get(`/discovery/${id}`),
   cancel: (id) => api.post(`/discovery/${id}/cancel`),
+}
+
+export const deepResearchAPI = {
+  start: (payload) => api.post('/deep-research', payload),
+  list: () => api.get('/deep-research'),
+  get: (id) => api.get(`/deep-research/${id}`),
+  cancel: (id) => api.post(`/deep-research/${id}/cancel`),
 }
 
 export const jobsAPI = {
@@ -32,7 +39,7 @@ export const companiesAPI = {
   list: (search) => api.get('/companies', { params: search ? { search } : {} }),
   get: (id) => api.get(`/companies/${id}`),
   create: (name, url) => api.post('/companies', { name, url: url || null }),
-  enrich: (id) => api.post(`/companies/${id}/enrich`),
+  enrich: (id, mode = 'full') => api.post(`/companies/${id}/enrich`, { mode }),
   delete: (id, force = false) => api.delete(`/companies/${id}`, { params: { force } }),
 }
 

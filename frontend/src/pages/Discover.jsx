@@ -4,7 +4,7 @@ import {
   Search, Sparkles, X, ChevronRight, Globe, Users, AlertCircle, History, Compass,
 } from 'lucide-react'
 import { companiesAPI, discoveryAPI, errMessage } from '../api'
-import { Button, Chip, EmptyState, ProgressBar, Spinner, initials, timeAgo } from '../ui'
+import { Button, Chip, EmptyState, ProgressBar, Segmented, Spinner, initials, timeAgo } from '../ui'
 import { useApp } from '../App'
 import CompanyDrawer, { SCRAPE_STATUS } from '../components/CompanyDrawer'
 import ComposeModal from './ComposeModal'
@@ -22,6 +22,7 @@ export default function Discover() {
   const { navigate } = useApp()
   const [query, setQuery] = useState('')
   const [count, setCount] = useState(10)
+  const [mode, setMode] = useState('full')    // full (default) | fast
   const [run, setRun] = useState(null)         // active/last-viewed run (full detail)
   const [history, setHistory] = useState([])
   const [starting, setStarting] = useState(false)
@@ -113,7 +114,7 @@ export default function Discover() {
     setCount(n)
     setStarting(true)
     try {
-      const { data } = await discoveryAPI.start(searchQuery, n)
+      const { data } = await discoveryAPI.start(searchQuery, n, mode)
       setQuery(searchQuery)
       setRun(data)
       pollRun(data.id)
@@ -181,6 +182,16 @@ export default function Discover() {
             />
             <span>companies</span>
           </label>
+          <div className="discover-mode" title="Full crawls deeper; Fast stops once it finds a contact">
+            <Segmented
+              value={mode}
+              onChange={(v) => !isRunning && setMode(v)}
+              options={[
+                { value: 'full', label: 'Full' },
+                { value: 'fast', label: 'Fast' },
+              ]}
+            />
+          </div>
           {isRunning ? (
             <Button variant="danger" icon={X} onClick={cancel}>Cancel</Button>
           ) : (

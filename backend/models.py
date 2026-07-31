@@ -60,6 +60,36 @@ class ProfileUpdate(BaseModel):
 class DiscoveryRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=300)
     count: int = Field(10, ge=1, le=100)
+    mode: str = Field("full", pattern="^(fast|full)$")
+
+
+class EnrichRequest(BaseModel):
+    mode: str = Field("full", pattern="^(fast|full|deep)$")
+
+
+class DeepResearchRequest(BaseModel):
+    """Interview-grade research for one company + criteria-matched contacts."""
+    company_name: Optional[str] = Field(None, min_length=1, max_length=120)
+    company_id: Optional[str] = None
+    url: Optional[str] = None
+    contact_criteria: str = Field(
+        "",
+        max_length=500,
+        description="Roles, schools, or traits to prioritize (e.g. 'VP Engineering, Penn alumni')",
+    )
+    min_contacts: int = Field(5, ge=1, le=15)
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, v):
+        return validate_http_url(v)
+
+    @field_validator("company_name")
+    @classmethod
+    def _strip_name(cls, v):
+        if v is None:
+            return v
+        return v.strip() or None
 
 
 class CompanyCreate(BaseModel):

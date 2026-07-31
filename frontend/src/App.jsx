@@ -1,11 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useState } from 'react'
 import { Toaster } from 'react-hot-toast'
 import {
-  LayoutDashboard, Compass, Database, FileText, Mail, Settings as SettingsIcon, Send,
+  LayoutDashboard, Compass, Database, FileText, Mail, Microscope,
+  Settings as SettingsIcon, Send,
 } from 'lucide-react'
 import { settingsAPI } from './api'
 import Dashboard from './pages/Dashboard'
 import Discover from './pages/Discover'
+import DeepDive from './pages/DeepDive'
 import DatabasePage from './pages/DatabasePage'
 import Resumes from './pages/Resumes'
 import Emails from './pages/Emails'
@@ -17,6 +19,7 @@ export const useApp = () => useContext(AppContext)
 const PAGES = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, section: null },
   { id: 'discover', label: 'Discover', icon: Compass, section: 'Pipeline' },
+  { id: 'deep-dive', label: 'Deep Dive', icon: Microscope, section: 'Pipeline' },
   { id: 'database', label: 'Database', icon: Database, section: 'Pipeline' },
   { id: 'emails', label: 'Emails', icon: Mail, section: 'Pipeline' },
   { id: 'resumes', label: 'Resumes', icon: FileText, section: 'Assets' },
@@ -134,6 +137,7 @@ export default function App() {
         <main className="main">
           {page === 'dashboard' && <Dashboard />}
           {page === 'discover' && <Discover />}
+          {page === 'deep-dive' && <DeepDive />}
           {page === 'database' && <DatabasePage />}
           {page === 'emails' && <Emails />}
           {page === 'resumes' && <Resumes />}

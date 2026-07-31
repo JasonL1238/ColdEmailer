@@ -27,6 +27,7 @@ from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
                 repair_offdomain_contact_warnings,
                 repair_speculative_company_summaries,
                 repair_unverified_legacy_replies)
+from deep_research import DeepResearchService
 from discovery import DiscoveryService, discovery_scrape_status
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
                             TemplateUnavailable)
@@ -35,9 +36,9 @@ from enrichment import EnrichmentService
 from generation import GenerationBusy, GenerationService
 from models import (
     EMAIL_ADDRESS_RE, BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
-    ContactCreate, ContactUpdate, DiscoveryRequest, EmailUpdate,
-    GenerateRequest, ProfileUpdate, ResumeUpdate, SendRequest,
-    LinkedInDraftRequest, validate_linkedin_profile_url,
+    ContactCreate, ContactUpdate, DeepResearchRequest, DiscoveryRequest,
+    EmailUpdate, EnrichRequest, GenerateRequest, ProfileUpdate, ResumeUpdate,
+    SendRequest, LinkedInDraftRequest, validate_linkedin_profile_url,
 )
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
@@ -88,6 +89,7 @@ resumes = ResumeService(db)
 composer = EmailComposer(db, resumes)
 rate_limiter = RateLimiter(db)
 discovery = DiscoveryService(db, enrichment)
+deep_research = DeepResearchService(db, enrichment)
 generation = GenerationService(db, composer, enrichment, rate_limiter)
 email_sender = EmailSender(
     credentials_path=os.getenv("CREDENTIALS_JSON_PATH") or os.path.join(_PROJECT_ROOT, "credentials.json"),
@@ -209,7 +211,7 @@ async def start_discovery(payload: DiscoveryRequest):
     if running:
         raise HTTPException(409, "A discovery search is already running. "
                                  "Wait for it to finish or cancel it first.")
-    job = discovery.start(payload.query.strip(), payload.count)
+    job = discovery.start(payload.query.strip(), payload.count, mode=payload.mode)
     return _parse_job(db.get_job(job["id"]))
 
 
@@ -241,6 +243,65 @@ async def cancel_discovery(job_id: str):
         raise HTTPException(404, "Discovery run not found")
     if not discovery.cancel(job_id):
         raise HTTPException(409, "That search already finished")
+    return {"success": True}
+
+
+# ---------- deep research ----------
+
+@app.post("/api/deep-research")
+async def start_deep_research(payload: DeepResearchRequest):
+    if not payload.company_name and not payload.company_id:
+        raise HTTPException(400, "Provide company_name or company_id")
+    can, err = rate_limiter.can_research_company()
+    if not can:
+        raise HTTPException(429, err)
+    try:
+        job = deep_research.start(
+            company_name=payload.company_name,
+            company_id=payload.company_id,
+            url=payload.url,
+            contact_criteria=payload.contact_criteria or "",
+            min_contacts=payload.min_contacts,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    rate_limiter.record_company_research()
+    return _parse_job(db.get_job(job["id"]))
+
+
+@app.get("/api/deep-research")
+async def list_deep_research_jobs():
+    return [_parse_job(j) for j in deep_research.list_jobs(limit=20)]
+
+
+@app.get("/api/deep-research/{job_id}")
+async def get_deep_research_job(job_id: str):
+    job = deep_research.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Deep research run not found")
+    out = _parse_job(job)
+    company_id = None
+    if isinstance(out.get("result"), dict):
+        company_id = out["result"].get("company_id")
+    if not company_id and isinstance(out.get("payload"), dict):
+        company_id = out["payload"].get("company_id")
+    if company_id:
+        company = db.get_company(company_id)
+        if company:
+            company["contacts"] = db.list_contacts(company_id=company_id)
+            out["company"] = company
+    return out
+
+
+@app.post("/api/deep-research/{job_id}/cancel")
+async def cancel_deep_research(job_id: str):
+    job = deep_research.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Deep research run not found")
+    if not deep_research.cancel(job_id):
+        raise HTTPException(409, "That deep research already finished")
     return {"success": True}
 
 
@@ -276,7 +337,7 @@ async def get_company(company_id: str):
     return company
 
 
-def _enrich_company_async(company_id: str):
+def _enrich_company_async(company_id: str, mode: str = "full"):
     company = db.get_company(company_id)
     if not company:
         return
@@ -286,6 +347,7 @@ def _enrich_company_async(company_id: str):
             company["name"], company.get("url"),
             preferred_school=db.get_profile().get("school"),
             preferred_affiliations=db.get_profile().get("affiliations"),
+            mode=mode or "full",
         )
         research_fields = {
             "url", "domain", "summary", "industry", "product", "hook",
@@ -558,17 +620,19 @@ async def create_company(payload: CompanyCreate):
 
 
 @app.post("/api/companies/{company_id}/enrich")
-async def enrich_company(company_id: str):
+async def enrich_company(company_id: str, payload: Optional[EnrichRequest] = None):
     company = db.get_company(company_id)
     if not company:
         raise HTTPException(404, "Company not found")
     can, err = rate_limiter.can_research_company()
     if not can:
         raise HTTPException(429, err)
+    mode = (payload.mode if payload else "full")
     rate_limiter.record_company_research()
-    threading.Thread(target=_enrich_company_async, args=(company_id,),
-                     daemon=True).start()
-    return {"success": True, "message": "Research started"}
+    threading.Thread(
+        target=_enrich_company_async, args=(company_id, mode),
+        daemon=True).start()
+    return {"success": True, "message": "Research started", "mode": mode}
 
 
 @app.put("/api/companies/{company_id}")

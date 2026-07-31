@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, "data", "coldemailer.db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS companies (
     scrape_status TEXT DEFAULT 'pending',
     name_key    TEXT,
     scrape_warnings TEXT,
+    deep_intel  TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -125,7 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_emails_status ON emails (status);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id               TEXT PRIMARY KEY,
-    type             TEXT NOT NULL,           -- 'discovery' | 'generation' | 'enrich'
+    type             TEXT NOT NULL,           -- 'discovery' | 'generation' | 'enrich' | 'deep_research'
     status           TEXT DEFAULT 'running',  -- 'running' | 'done' | 'failed' | 'cancelled'
     payload          TEXT,                    -- JSON request
     stage            TEXT,                    -- human-readable current stage
@@ -166,6 +167,7 @@ _ADDED_COLUMNS = {
         "research_quality": "TEXT DEFAULT 'low'",
         "name_key": "TEXT",
         "scrape_warnings": "TEXT",
+        "deep_intel": "TEXT",
     },
     "contacts": {
         "linkedin_url": "TEXT",
@@ -711,6 +713,11 @@ class Database:
             "scraped_at": kwargs.get("scraped_at"),
             "scrape_status": kwargs.get("scrape_status", "pending"),
             "scrape_warnings": json.dumps(kwargs.get("scrape_warnings") or []),
+            "deep_intel": (
+                json.dumps(kwargs["deep_intel"])
+                if isinstance(kwargs.get("deep_intel"), (dict, list))
+                else kwargs.get("deep_intel")
+            ),
             "created_at": ts,
             "updated_at": ts,
         }
@@ -741,6 +748,15 @@ class Database:
                     out[key] = []
             elif raw is None:
                 out[key] = []
+        raw_intel = out.get("deep_intel")
+        if isinstance(raw_intel, str) and raw_intel.strip():
+            try:
+                parsed = json.loads(raw_intel)
+                out["deep_intel"] = parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                out["deep_intel"] = {}
+        elif raw_intel is None:
+            out["deep_intel"] = None
         return out
 
     def get_company(self, company_id: str) -> Optional[Dict[str, Any]]:
@@ -776,6 +792,11 @@ class Database:
         for key in ("research_sources", "scrape_warnings"):
             if key in updates and not isinstance(updates[key], str):
                 updates[key] = json.dumps(updates[key] or [])
+        if "deep_intel" in updates and not isinstance(updates["deep_intel"], str):
+            updates["deep_intel"] = (
+                json.dumps(updates["deep_intel"])
+                if updates["deep_intel"] is not None else None
+            )
         updates["updated_at"] = now_iso()
         self._update("companies", company_id, updates)
 
@@ -1167,11 +1188,25 @@ class Database:
             self._update("jobs", job_id, data)
 
     def finish_job(self, job_id: str, status: str = "done",
-                   result: Any = None, error: Optional[str] = None):
+                   result: Any = None, error: Optional[str] = None,
+                   *, only_if_running: bool = False) -> bool:
+        """Mark a job finished. When only_if_running, refuse to overwrite
+        cancelled/failed rows (compare-and-swap against status='running')."""
+        payload = result
+        if isinstance(payload, (dict, list)):
+            payload = json.dumps(payload)
+        if only_if_running:
+            cur = self.execute(
+                "UPDATE jobs SET status=?, result=?, error=?, finished_at=? "
+                "WHERE id=? AND status='running'",
+                (status, payload, error, now_iso(), job_id),
+            )
+            return cur.rowcount > 0
         self.update_job(
             job_id, status=status, result=result, error=error,
             finished_at=now_iso(),
         )
+        return True
 
     # ---------- events ----------
 

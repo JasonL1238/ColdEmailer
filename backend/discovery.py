@@ -182,11 +182,13 @@ class DiscoveryService:
 
     # ---------- public API ----------
 
-    def start(self, query: str, count: int = 10) -> Dict:
+    def start(self, query: str, count: int = 10, mode: str = "full") -> Dict:
         count = max(1, min(int(count or 10), MAX_COMPANIES_PER_RUN))
-        job = self.db.create_job("discovery", {"query": query, "count": count})
+        mode = "fast" if (mode or "full").lower() == "fast" else "full"
+        job = self.db.create_job(
+            "discovery", {"query": query, "count": count, "mode": mode})
         thread = threading.Thread(
-            target=self._run_safe, args=(job["id"], query, count), daemon=True
+            target=self._run_safe, args=(job["id"], query, count, mode), daemon=True
         )
         thread.start()
         return job
@@ -206,14 +208,14 @@ class DiscoveryService:
         job = self.db.get_job(job_id)
         return not job or job["status"] == "cancelled"
 
-    def _run_safe(self, job_id: str, query: str, count: int):
+    def _run_safe(self, job_id: str, query: str, count: int, mode: str = "full"):
         try:
-            self._run(job_id, query, count)
+            self._run(job_id, query, count, mode=mode)
         except Exception as e:
             print(f"[discovery] job {job_id} crashed: {e}")
             self.db.finish_job(job_id, status="failed", error=str(e))
 
-    def _run(self, job_id: str, query: str, count: int):
+    def _run(self, job_id: str, query: str, count: int, mode: str = "full"):
         self.db.update_job(job_id, stage="Finding companies", progress_total=count)
         self.db.log_event("discovery", job_id, "started", query)
 
@@ -254,6 +256,7 @@ class DiscoveryService:
                 name, cand.get("website"),
                 preferred_school=self.db.get_profile().get("school"),
                 preferred_affiliations=self.db.get_profile().get("affiliations"),
+                mode=mode,
             )
             status = discovery_scrape_status(enriched)
             trusted_site = status != "wrong_site"

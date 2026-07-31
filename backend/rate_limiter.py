@@ -22,7 +22,7 @@ class RateLimiter:
             'emails_per_day': int(os.getenv('MAX_EMAILS_PER_DAY', 50)),
             'generations_per_day': int(os.getenv('MAX_EMAIL_GENERATIONS_PER_DAY', 500)),
             'generations_per_minute': int(os.getenv('MAX_EMAIL_GENERATIONS_PER_MINUTE', 10)),
-            'researches_per_minute': int(os.getenv('MAX_COMPANY_RESEARCH_PER_MINUTE', 5)),
+            'researches_per_minute': int(os.getenv('MAX_COMPANY_RESEARCH_PER_MINUTE', 20)),
         }
 
     # ---------- persistent daily counts ----------

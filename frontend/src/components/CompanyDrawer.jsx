@@ -6,7 +6,7 @@ import {
 } from 'lucide-react'
 import { companiesAPI, errMessage } from '../api'
 import {
-  Button, Chip, Drawer, contactStatusMeta, EMAIL_TYPE_META, timeAgo,
+  Button, Chip, Drawer, Segmented, contactStatusMeta, EMAIL_TYPE_META, timeAgo,
 } from '../ui'
 
 export const SCRAPE_STATUS = {
@@ -23,6 +23,7 @@ export default function CompanyDrawer({
   company, onClose, onChanged, onDeleted, onCompose,
 }) {
   const [enriching, setEnriching] = useState(false)
+  const [mode, setMode] = useState('full') // full (default) | fast
   const refreshTimer = useRef(null)
 
   // Cancel the pending refresh if the drawer closes, or it would re-open the
@@ -32,10 +33,14 @@ export default function CompanyDrawer({
   const enrich = async () => {
     setEnriching(true)
     try {
-      await companiesAPI.enrich(company.id)
-      toast.success('Research started — this takes about 30 seconds')
+      await companiesAPI.enrich(company.id, mode)
+      toast.success(
+        mode === 'fast'
+          ? 'Research started — fast mode (~1 min)'
+          : 'Research started — full crawl (deeper, slower)',
+      )
       clearTimeout(refreshTimer.current)
-      refreshTimer.current = setTimeout(onChanged, 20000)
+      refreshTimer.current = setTimeout(onChanged, mode === 'fast' ? 20000 : 45000)
     } catch (e) { toast.error(errMessage(e)) }
     finally { setEnriching(false) }
   }
@@ -78,6 +83,14 @@ export default function CompanyDrawer({
       onClose={onClose}
       actions={
         <>
+          <Segmented
+            value={mode}
+            onChange={setMode}
+            options={[
+              { value: 'full', label: 'Full' },
+              { value: 'fast', label: 'Fast' },
+            ]}
+          />
           <Button size="sm" icon={RefreshCw} onClick={enrich} disabled={enriching}>
             {company.scrape_status === 'scraped' ? 'Re-research' : 'Research'}
           </Button>
@@ -104,6 +117,19 @@ export default function CompanyDrawer({
           </div>
         </div>
       )}
+      {(company.deep_intel?.error || company.deep_intel?.last_error) && (
+        <div className="card card-pad" style={{ borderColor: 'var(--amber)' }}>
+          <div className="row" style={{ gap: 6, marginBottom: 4 }}>
+            <AlertTriangle size={14} style={{ color: 'var(--amber)' }} />
+            <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              Deep dive issue
+            </div>
+          </div>
+          <div className="small">
+            {company.deep_intel.error || company.deep_intel.last_error}
+          </div>
+        </div>
+      )}
       {company.summary ? (
         <div className="stack" style={{ gap: 10 }}>
           <Info label="What they do" value={company.summary} />
@@ -114,6 +140,17 @@ export default function CompanyDrawer({
           {company.product && <Info label="Product" value={company.product} />}
           {company.hook && <Info label="Personalization hook" value={company.hook} />}
           {company.recent_news && <Info label="Recent news" value={company.recent_news} />}
+          {company.deep_intel && !company.deep_intel.error && (
+            <div className="stack" style={{ gap: 10 }}>
+              <DeepIntelList label="Key changes" items={company.deep_intel.key_changes} />
+              <DeepIntelList label="Improvements" items={company.deep_intel.improvements} />
+              <DeepIntelList label="Policy & culture" items={company.deep_intel.policy_highlights} />
+              <DeepIntelList label="Talking points" items={company.deep_intel.talking_points} />
+              {company.deep_intel.contact_criteria && (
+                <Info label="Contact criteria used" value={company.deep_intel.contact_criteria} />
+              )}
+            </div>
+          )}
           <div className="card card-pad" style={{ background: 'var(--surface-hover)' }}>
             <div className="row-between" style={{ gap: 8 }}>
               <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
@@ -265,6 +302,20 @@ function Info({ label, value }) {
         {label}
       </div>
       <div className="small" style={{ lineHeight: 1.55 }}>{value}</div>
+    </div>
+  )
+}
+
+function DeepIntelList({ label, items }) {
+  if (!Array.isArray(items) || items.length === 0) return null
+  return (
+    <div>
+      <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>
+        {label}
+      </div>
+      <ul className="deep-list" style={{ margin: 0 }}>
+        {items.map((item) => <li key={item}>{item}</li>)}
+      </ul>
     </div>
   )
 }
