@@ -258,6 +258,105 @@ class _FixtureScraper:
         return BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
 
 
+class TestPagePrefetch:
+    """Prefetching is a latency trick only — crawl order and results must not move."""
+
+    PAGES = {
+        "https://acme.com": """
+          <html><body><h1>Acme</h1>
+          <p>Acme builds reliable robotics systems for industrial teams
+          that need safer and more efficient warehouse operations.</p>
+          <a href="/company/our-people">Leadership</a>
+          <a href="/press/product-launch">News</a>
+          </body></html>
+        """,
+        "https://acme.com/company/our-people": """
+          <html><body><h1>Acme leadership</h1>
+          <p>Jane Doe — CEO of Acme.</p>
+          <a href="mailto:jane.doe@acme.com">Email Jane</a>
+          </body></html>
+        """,
+        "https://acme.com/press/product-launch": """
+          <html><body><h1>Acme launches Atlas</h1>
+          <p>Acme launched Atlas, a warehouse robotics platform, in March 2026.</p>
+          </body></html>
+        """,
+    }
+
+    def _crawl(self, monkeypatch, workers):
+        import enrichment
+
+        monkeypatch.setattr(enrichment, "PREFETCH_WORKERS", workers)
+        monkeypatch.setattr(enrichment, "llm_metadata", lambda *_a: None)
+        service = EnrichmentService()
+        fixture = _FixtureScraper(self.PAGES)
+        service.scraper = fixture
+        monkeypatch.setattr(service, "_school_research_pages",
+                            lambda *_a, **_k: [])
+        result = service.enrich("Acme", "https://acme.com", mode="full")
+        return result, fixture
+
+    def test_prefetching_does_not_change_the_crawl(self, monkeypatch):
+        serial, serial_scraper = self._crawl(monkeypatch, 1)
+        parallel, parallel_scraper = self._crawl(monkeypatch, 3)
+
+        assert serial["research_sources"] == parallel["research_sources"]
+        assert serial["pages_scraped"] == parallel["pages_scraped"]
+        assert ([c["email"] for c in serial["contacts"]]
+                == [c["email"] for c in parallel["contacts"]])
+        # Warming may fetch a page the loop never reaches, but never twice.
+        assert len(parallel_scraper.requested) == len(set(parallel_scraper.requested))
+        assert set(serial_scraper.requested) <= set(parallel_scraper.requested)
+
+    def test_get_falls_back_to_a_direct_fetch_on_a_miss(self):
+        from enrichment import _PagePrefetcher
+
+        fixture = _FixtureScraper(self.PAGES)
+        prefetch = _PagePrefetcher(fixture, workers=2)
+        try:
+            html = prefetch.get("https://acme.com")
+        finally:
+            prefetch.close()
+        assert html is not None and "Acme" in html
+        assert fixture.requested == ["https://acme.com"]
+
+    def test_warmed_page_is_not_fetched_again(self):
+        from enrichment import _PagePrefetcher
+
+        fixture = _FixtureScraper(self.PAGES)
+        prefetch = _PagePrefetcher(fixture, workers=2)
+        try:
+            prefetch.submit(["https://acme.com"])
+            html = prefetch.get("https://acme.com")
+        finally:
+            prefetch.close()
+        assert html is not None
+        assert fixture.requested == ["https://acme.com"]
+
+    def test_a_failing_page_is_reported_as_a_miss_not_an_exception(self):
+        from enrichment import _PagePrefetcher
+
+        class _Exploding:
+            def fetch_html(self, url):
+                raise RuntimeError("network on fire")
+
+        prefetch = _PagePrefetcher(_Exploding(), workers=2)
+        try:
+            prefetch.submit(["https://acme.com"])
+            assert prefetch.get("https://acme.com") is None
+        finally:
+            prefetch.close()
+
+    def test_close_is_safe_with_work_still_queued(self):
+        from enrichment import _PagePrefetcher
+
+        fixture = _FixtureScraper(self.PAGES)
+        prefetch = _PagePrefetcher(fixture, workers=2)
+        prefetch.submit(list(self.PAGES))
+        prefetch.close()
+        prefetch.close()  # idempotent
+
+
 class TestEndToEndCompanyCrawl:
     def test_crawls_discovered_pages_and_reports_auditable_coverage(self, monkeypatch):
         import enrichment

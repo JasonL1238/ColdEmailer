@@ -5,6 +5,7 @@ Company enrichment: scrape a company's site, extract structured metadata
 import html as html_lib
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
@@ -38,6 +39,12 @@ SUBPAGES = [
 
 MAX_PAGES_FETCHED = 14
 MAX_PAGE_ATTEMPTS = 28
+# Warm the next few queued pages while the current one is being parsed. The
+# crawl is latency-bound, not politeness-bound (same-domain delay is 50ms), so
+# this is close to free. Fast mode opts out: it early-exits often enough that
+# prefetching would mostly buy pages we throw away.
+PREFETCH_WORKERS = 3
+PREFETCH_DEPTH = 3
 # Fast path still aims for a quick first contact, but crawls harder when needed.
 FAST_MAX_PAGES = 6
 FAST_MAX_ATTEMPTS = 12
@@ -827,6 +834,53 @@ def scrape_status_for(enriched: dict) -> str:
     return "scrape_failed"
 
 
+class _PagePrefetcher:
+    """Warms upcoming crawl URLs on a small thread pool.
+
+    Purely a latency optimisation: the crawl loop still pops, processes and
+    discovers in exactly the order it always did — this only means the page it
+    asks for is usually already in hand. A URL that gets warmed but never
+    popped is wasted bandwidth, bounded by PREFETCH_DEPTH.
+    """
+
+    def __init__(self, scraper, workers: Optional[int] = None):
+        # Read the module global at call time so tests (and future config) can
+        # move it without the default arg having frozen the old value.
+        workers = max(1, PREFETCH_WORKERS if workers is None else workers)
+        self._scraper = scraper
+        self._pool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="reach-prefetch")
+        self._inflight: Dict[str, object] = {}
+        self._max_inflight = workers * 2
+
+    def submit(self, urls: List[str]) -> None:
+        for url in urls:
+            if len(self._inflight) >= self._max_inflight:
+                return
+            if url in self._inflight:
+                continue
+            try:
+                self._inflight[url] = self._pool.submit(
+                    self._scraper.fetch_html, url)
+            except RuntimeError:  # pool already shut down
+                return
+
+    def get(self, url: str) -> Optional[str]:
+        future = self._inflight.pop(url, None)
+        if future is None:
+            return self._scraper.fetch_html(url)
+        try:
+            return future.result()
+        except Exception:
+            return None
+
+    def close(self) -> None:
+        for future in self._inflight.values():
+            future.cancel()
+        self._inflight.clear()
+        self._pool.shutdown(wait=False)
+
+
 class EnrichmentService:
     """Scrape + extract for a single company. Stateless besides the scraper session."""
 
@@ -975,6 +1029,14 @@ class EnrichmentService:
         if hasattr(self.scraper, "delay_override"):
             delay_cm = self.scraper.delay_override(FAST_MIN_DELAY)
             delay_cm.__enter__()
+        # One Chromium for the whole crawl instead of one per JS-shell page.
+        browser_cm = None
+        if hasattr(self.scraper, "browser_session"):
+            browser_cm = self.scraper.browser_session()
+            browser_cm.__enter__()
+        # Fast mode early-exits too often for prefetching to pay off.
+        prefetch = (None if fast or PREFETCH_WORKERS < 2
+                    else _PagePrefetcher(self.scraper))
 
         def timed_out() -> bool:
             return budget is not None and (time.monotonic() - started) >= budget
@@ -1155,13 +1217,18 @@ class EnrichmentService:
                     and len(page_records) < max_pages and not timed_out():
                 page_url = queue.pop(0)
                 attempted += 1
+                # Warm the head of the queue for the *next* iterations. Done
+                # after the pop so the current page is never queued twice.
+                if prefetch is not None:
+                    prefetch.submit(queue[:PREFETCH_DEPTH])
                 was_fallback = page_url.rstrip("/") in {
                     f.rstrip("/") for f in fallback_pages
                 } and not any(
                     p["url"].rstrip("/") == page_url.rstrip("/")
                     for p in page_records
                 )
-                html = self.scraper.fetch_html(page_url)
+                html = (prefetch.get(page_url) if prefetch is not None
+                        else self.scraper.fetch_html(page_url))
                 if not html:
                     if was_fallback:
                         fallback_failures += 1
@@ -1274,6 +1341,10 @@ class EnrichmentService:
             result["elapsed_sec"] = round(time.monotonic() - started, 2)
             return result
         finally:
+            if prefetch is not None:
+                prefetch.close()
+            if browser_cm is not None:
+                browser_cm.__exit__(None, None, None)
             if delay_cm is not None:
                 delay_cm.__exit__(None, None, None)
 

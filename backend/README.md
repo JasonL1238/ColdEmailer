@@ -27,7 +27,7 @@ Normally you don't run this directly — `./start.sh` from the project root star
 | `email_sender.py` | Gmail API send with attachments and recipient safety checks |
 | `response_checker.py` | Thread inspection for genuine replies (ignores bounces/auto-replies) |
 | `llm_client.py` | Provider abstraction: Gemini, OpenAI, OpenRouter |
-| `web_scraper.py` | HTTP fetching with SSRF guards, robots.txt, per-domain rate limiting |
+| `web_scraper.py` | Layered fetch (JSON API → HTTPX → Playwright) with SSRF guards and per-domain rate limiting. Does not consult robots.txt |
 | `text_cleaner.py` | Strips nav/footer/boilerplate lines out of scraped page text |
 | `ddg_search.py` | DuckDuckGo search wrapper that degrades gracefully |
 | `rate_limiter.py` | Send/generation/research caps |

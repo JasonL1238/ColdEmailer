@@ -89,7 +89,8 @@ backend/   FastAPI
   resume_service.py    resume PDF upload/parse/versioning
   linkedin_outreach.py drafts LinkedIn messages (never logs in or sends)
   llm_client.py        provider abstraction (Gemini / OpenAI / OpenRouter)
-  web_scraper.py       HTTP fetching with SSRF guards, robots.txt, rate limits
+  web_scraper.py       layered fetch (JSON API → HTTPX → Playwright), SSRF
+                       guards, per-domain rate limits. No robots.txt.
   text_cleaner.py      strips nav/footer boilerplate from scraped text
   ddg_search.py        DuckDuckGo wrapper that degrades gracefully
   rate_limiter.py      send/generation/research caps

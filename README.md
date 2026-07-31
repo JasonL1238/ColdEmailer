@@ -125,7 +125,7 @@ All optional, set in `.env`:
 | `MAX_EMAILS_PER_DAY` | 50 | Send cap |
 | `MAX_EMAIL_GENERATIONS_PER_DAY` | 500 | Generation cap |
 | `MAX_EMAIL_GENERATIONS_PER_MINUTE` | 10 | Burst cap |
-| `MAX_COMPANY_RESEARCH_PER_MINUTE` | 5 | Scrape rate |
+| `MAX_COMPANY_RESEARCH_PER_MINUTE` | 20 (`.env.example` ships 5) | Scrape rate |
 | `EMAIL_SEND_DELAY_SECONDS` | 3 | Pause between sends |
 | `EMAIL_LLM_MODEL` | provider default | Override the model |
 | `CORS_ORIGINS` | localhost:5173,3000 | Allowed frontend origins |
@@ -145,7 +145,9 @@ The backend suite runs against a throwaway database (`tests/conftest.py` sets `C
 
 ## Notes on responsible use
 
-Reach respects `robots.txt` when scraping and rate-limits requests per domain. Cold email is regulated in most jurisdictions (CAN-SPAM, GDPR, CASL) — send to people plausibly interested in hearing from you, keep volumes sane, and honor opt-outs.
+Reach does **not** consult `robots.txt`. It fetches only public first-party pages a browser would load, rate-limits per domain, backs off when a server returns `Retry-After`, and caps how many pages it takes from any one site — but if you need robots compliance for your use case, it is not there today and you would have to add it.
+
+Cold email is regulated in most jurisdictions (CAN-SPAM, GDPR, CASL) — send to people plausibly interested in hearing from you, keep volumes sane, and honor opt-outs.
 
 To run the deterministic scraping benchmark:
 

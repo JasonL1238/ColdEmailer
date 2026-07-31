@@ -7,6 +7,10 @@ Order of operations (fastest → heaviest):
   3. Fall back to Playwright only when the page is clearly client-rendered or the
      HTTP body is an empty JS shell.
 
+A site that blocks HTTPX (403/429/503) or times out escalates to step 3 rather
+than being written off — those are exactly the pages a browser can still get.
+A clean 404 does not: there is nothing there to render.
+
 Scrapy is intentionally not used here: enrichment runs as a short in-process
 crawl inside FastAPI jobs, not as a standalone crawl project. HTTPX covers the
 same request/retry needs at this scale.
@@ -15,6 +19,7 @@ SSRF-safe (public http/https only). robots.txt is ignored.
 """
 from __future__ import annotations
 
+import contextlib
 import html as html_lib
 import json
 import random
@@ -22,6 +27,8 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -41,6 +48,13 @@ MAX_API_FETCHES = 8
 # eight identical info@ stubs fill the merge budget.
 MAX_API_BEFORE_BROWSER = 4
 MIN_USEFUL_TEXT = 120
+# Statuses that mean "the server refused this client", not "nothing here".
+# Worth a browser retry; a 404 is not.
+BLOCK_STATUSES = (403, 429, 503)
+# Honour Retry-After, but never stall a crawl job on a server's say-so.
+MAX_RETRY_AFTER_SLEEP = 5.0
+# Recycle a pooled browser periodically so a long crawl cannot grow unbounded.
+PLAYWRIGHT_PAGES_PER_BROWSER = 40
 
 _USER_AGENTS = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -351,6 +365,13 @@ class WebScraper:
         self.text_cleaner = TextCleaner()
         self.min_delay = 0.05
         self._delay_override = threading.local()
+        # Why the last HTTP fetch failed, per thread: a refusal is worth a
+        # browser retry, a 404 is not. Thread-local because enrichment fetches
+        # pages from a small worker pool.
+        self._http_state = threading.local()
+        # Pooled Chromium, per thread. Playwright's sync API is bound to the
+        # thread that started it, so this can never be shared across threads.
+        self._pw_state = threading.local()
         self._ua_lock = threading.Lock()
         self.last_request_time: Dict[str, float] = {}
         self._client = httpx.Client(
@@ -398,10 +419,84 @@ class WebScraper:
             return _Resp(599, url)
 
     def close(self):
+        self._close_browser()
         try:
             self._client.close()
         except Exception:
             pass
+
+    # --- pooled Chromium ---------------------------------------------------
+
+    @contextlib.contextmanager
+    def browser_session(self):
+        """Reuse one Chromium for the duration of a crawl.
+
+        Without this every JS-shell page pays a full browser launch (~1s).
+        Inside a session the browser is kept alive and only the page context is
+        recycled. Nested sessions are refcounted; the browser is torn down when
+        the outermost one exits.
+        """
+        state = self._pw_state
+        state.depth = getattr(state, "depth", 0) + 1
+        try:
+            yield self
+        finally:
+            state.depth = getattr(state, "depth", 1) - 1
+            if state.depth <= 0:
+                self._close_browser()
+
+    def _acquire_browser(self):
+        """Return a live Chromium for this thread, or None if unavailable."""
+        state = self._pw_state
+        browser = getattr(state, "browser", None)
+        if browser is not None:
+            if getattr(state, "pages", 0) < PLAYWRIGHT_PAGES_PER_BROWSER:
+                state.pages = getattr(state, "pages", 0) + 1
+                return browser
+            self._close_browser()  # recycle before it gets fat
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return None
+        try:
+            playwright = sync_playwright().start()
+        except Exception:
+            return None
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+            return None
+        state.playwright = playwright
+        state.browser = browser
+        state.pages = 1
+        return browser
+
+    def _release_browser(self):
+        """Drop the browser unless a browser_session is holding it open."""
+        if getattr(self._pw_state, "depth", 0) <= 0:
+            self._close_browser()
+
+    def _close_browser(self):
+        state = self._pw_state
+        browser = getattr(state, "browser", None)
+        playwright = getattr(state, "playwright", None)
+        state.browser = None
+        state.playwright = None
+        state.pages = 0
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
 
     @staticmethod
     def _browser_headers(user_agent: Optional[str] = None,
@@ -546,8 +641,35 @@ class WebScraper:
         except Exception:
             return None
 
+    @staticmethod
+    def _retry_after_seconds(response: _Fetched) -> float:
+        """Parse Retry-After (delta-seconds or HTTP-date). 0 when absent/bad."""
+        raw = (response.headers.get("Retry-After")
+               or response.headers.get("retry-after") or "").strip()
+        if not raw:
+            return 0.0
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+        try:
+            when = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+        if when is None:
+            return 0.0
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
     def _fetch_html_http(self, url: str) -> Tuple[Optional[str], str]:
-        """Return (html_or_none, final_public_url). final_url tracks redirects."""
+        """Return (html_or_none, final_public_url). final_url tracks redirects.
+
+        Also records on thread-local state whether a failure was a *refusal*
+        (403/429/503, timeout, transport error) rather than a genuine miss, so
+        fetch_html knows whether a browser attempt is worth the launch.
+        """
+        self._http_state.blocked = False
         if not is_safe_public_url(url):
             return None, url
         for attempt in range(FETCH_RETRIES):
@@ -562,10 +684,18 @@ class WebScraper:
                     headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
                 response = self._safe_get(url, timeout=8.0, headers=headers)
                 if response is None:
+                    # Timeout / connection error / redirect dead-end.
+                    self._http_state.blocked = True
                     continue
-                if response.status_code in (403, 429, 503):
+                if response.status_code in BLOCK_STATUSES:
+                    self._http_state.blocked = True
+                    wait = self._retry_after_seconds(response)
+                    if wait > 0:
+                        time.sleep(min(MAX_RETRY_AFTER_SLEEP, wait))
                     continue
                 if response.status_code >= 400:
+                    # A real 404/410 — nothing for a browser to render either.
+                    self._http_state.blocked = False
                     return None, response.final_url
                 ctype = (response.headers.get("Content-Type")
                          or response.headers.get("content-type") or "").lower()
@@ -577,6 +707,8 @@ class WebScraper:
                     except Exception:
                         return f"<pre>{html_lib.escape(text[:80000])}</pre>", final
                 if "html" not in ctype and "<html" not in text[:2000].lower():
+                    # Served fine, just not a document — rendering won't help.
+                    self._http_state.blocked = False
                     return None, final
                 return text, final
             except Exception:
@@ -592,12 +724,11 @@ class WebScraper:
         SSRF: abort only non-public destinations (CDN/scripts allowed). Final
         navigation URL must still be public. JSON bodies are read after settle.
         """
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
+        if not is_safe_public_url(url):
             return None, [], url
 
-        if not is_safe_public_url(url):
+        browser = self._acquire_browser()
+        if browser is None:
             return None, [], url
 
         api_chunks: List[str] = []
@@ -605,81 +736,83 @@ class WebScraper:
         final = url
         json_responses = []
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                try:
-                    context = browser.new_context(
-                        user_agent=random.choice(_USER_AGENTS),
-                        java_script_enabled=True,
-                    )
+            context = browser.new_context(
+                user_agent=random.choice(_USER_AGENTS),
+                java_script_enabled=True,
+            )
+            try:
+                page = context.new_page()
+
+                def _guard_route(route):
+                    # Deny private/metadata targets only — allow CDNs and
+                    # public apex↔www redirects so hydration can finish.
+                    if not is_safe_public_url(route.request.url):
+                        return route.abort()
+                    return route.continue_()
+
+                page.route("**/*", _guard_route)
+
+                def _on_response(response):
                     try:
-                        page = context.new_page()
+                        if len(json_responses) >= MAX_API_FETCHES:
+                            return
+                        ctype = (response.headers.get("content-type") or "").lower()
+                        req_url = response.url
+                        if "json" not in ctype and not req_url.lower().endswith(".json"):
+                            return
+                        if not is_safe_public_url(req_url):
+                            return
+                        json_responses.append(response)
+                    except Exception:
+                        return
 
-                        def _guard_route(route):
-                            # Deny private/metadata targets only — allow CDNs and
-                            # public apex↔www redirects so hydration can finish.
-                            if not is_safe_public_url(route.request.url):
-                                return route.abort()
-                            return route.continue_()
-
-                        page.route("**/*", _guard_route)
-
-                        def _on_response(response):
-                            try:
-                                if len(json_responses) >= MAX_API_FETCHES:
-                                    return
-                                ctype = (response.headers.get("content-type") or "").lower()
-                                req_url = response.url
-                                if "json" not in ctype and not req_url.lower().endswith(".json"):
-                                    return
-                                if not is_safe_public_url(req_url):
-                                    return
-                                json_responses.append(response)
-                            except Exception:
-                                return
-
-                        page.on("response", _on_response)
-                        page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                        final = page.url
-                        if not is_safe_public_url(final):
-                            return None, [], url
-                        try:
-                            page.wait_for_selector(
-                                "a[href^='mailto:'], [class*='team'], [class*='people'], "
-                                "main, article, h1",
-                                timeout=4000,
-                            )
-                        except Exception:
-                            pass
-                        html = page.content()
-                        # Bodies after settle — avoids response-handler deadlocks.
-                        for response in json_responses:
-                            if len(api_chunks) >= MAX_API_FETCHES:
-                                break
-                            try:
-                                req_url = response.url
-                                if not is_safe_public_url(req_url):
-                                    continue
-                                if not _same_origin(final, req_url):
-                                    continue
-                                body = response.text()
-                                if not body or len(body) > MAX_RESPONSE_BYTES:
-                                    continue
-                                if not body.lstrip().startswith(("{", "[")):
-                                    continue
-                                payload = json.loads(body)
-                                if not _json_payload_useful(payload):
-                                    continue
-                                api_chunks.append(
-                                    json_to_research_html(req_url, payload))
-                            except Exception:
-                                continue
-                    finally:
-                        context.close()
-                finally:
-                    browser.close()
+                page.on("response", _on_response)
+                page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                final = page.url
+                if not is_safe_public_url(final):
+                    return None, [], url
+                try:
+                    page.wait_for_selector(
+                        "a[href^='mailto:'], [class*='team'], [class*='people'], "
+                        "main, article, h1",
+                        timeout=4000,
+                    )
+                except Exception:
+                    pass
+                html = page.content()
+                # Bodies after settle — avoids response-handler deadlocks.
+                for response in json_responses:
+                    if len(api_chunks) >= MAX_API_FETCHES:
+                        break
+                    try:
+                        req_url = response.url
+                        if not is_safe_public_url(req_url):
+                            continue
+                        if not _same_origin(final, req_url):
+                            continue
+                        body = response.text()
+                        if not body or len(body) > MAX_RESPONSE_BYTES:
+                            continue
+                        if not body.lstrip().startswith(("{", "[")):
+                            continue
+                        payload = json.loads(body)
+                        if not _json_payload_useful(payload):
+                            continue
+                        api_chunks.append(
+                            json_to_research_html(req_url, payload))
+                    except Exception:
+                        continue
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
         except Exception:
+            # The browser may be wedged — drop it rather than reuse it.
+            self._close_browser()
             return None, api_chunks, url
+        finally:
+            self._release_browser()
         return html, api_chunks, final if is_safe_public_url(final) else url
 
     def fetch_html(self, url: str) -> Optional[str]:
@@ -688,6 +821,7 @@ class WebScraper:
             return None
 
         html, final_url = self._fetch_html_http(url)
+        http_blocked = bool(getattr(self._http_state, "blocked", False))
         page_url = final_url if is_safe_public_url(final_url) else url
         api_parts: List[str] = []
         useful_api = False
@@ -706,9 +840,15 @@ class WebScraper:
                     break
 
         text = self.extract_text(html) if html else None
-        # Playwright ONLY for confirmed JS shells with no people in API payload.
-        # Never launch Chromium just because HTTP returned 404/None.
-        needs_browser = bool(html) and _looks_like_js_shell(html, text) and not useful_api
+        # Two reasons to spend a browser launch:
+        #   1. HTTP worked but handed back a JS shell with no people in the API.
+        #   2. HTTP was refused outright (403/429/503/timeout) — the page may
+        #      well render for a real browser. A 404 never gets here, because
+        #      _fetch_html_http only marks genuine refusals as blocked.
+        needs_browser = (
+            (bool(html) and _looks_like_js_shell(html, text) and not useful_api)
+            or (not html and not api_parts and http_blocked)
+        )
 
         if needs_browser:
             pw_html, pw_api, pw_final = self._fetch_html_playwright(page_url)
