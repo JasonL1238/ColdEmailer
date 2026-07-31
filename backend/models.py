@@ -78,6 +78,9 @@ class DeepResearchRequest(BaseModel):
         description="Roles, schools, or traits to prioritize (e.g. 'VP Engineering, Penn alumni')",
     )
     min_contacts: int = Field(5, ge=1, le=15)
+    # Continue an existing dive: contacts | research | both. Omit for a full run.
+    continue_mode: Optional[str] = Field(
+        None, pattern="^(contacts|research|both)$")
 
     @field_validator("url")
     @classmethod

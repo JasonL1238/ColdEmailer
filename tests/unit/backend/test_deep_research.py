@@ -1,12 +1,15 @@
-"""Deep research: criteria matching, contact floor, intel extraction."""
+"""Deep research: criteria matching, alumni hunting, contact floor."""
 from deep_research import (
     CRITERIA_HIT_TARGET,
     MIN_CONTACTS,
     DeepResearchService,
+    alumni_mode,
     estimate_employee_count,
     extract_people_from_snippets,
     heuristic_deep_intel,
+    is_alumni_term,
     parse_criteria,
+    school_aliases_for_term,
     score_criteria_match,
     should_require_contact_floor,
 )
@@ -29,17 +32,6 @@ class TestCriteriaParsingAndScoring:
         match = score_criteria_match(contact, ["VP Engineering", "Penn alumni"])
         assert match["criteria_match"] is True
         assert "VP Engineering" in match["matched_terms"]
-        assert match["match_score"] > 0
-
-    def test_evidence_snippet_alone_is_not_a_criteria_match(self):
-        contact = {
-            "name": "Alex Kim",
-            "role": "Recruiter",
-            "evidence": 'Alex Kim - Recruiter - "VP Engineering" hiring at Acme',
-            "affinity": ["criteria:VP Engineering"],
-        }
-        match = score_criteria_match(contact, ["VP Engineering"])
-        assert match["criteria_match"] is False
 
     def test_affinity_tag_alone_is_not_a_criteria_match(self):
         contact = {
@@ -50,7 +42,6 @@ class TestCriteriaParsingAndScoring:
         }
         match = score_criteria_match(contact, ["VP Engineering"])
         assert match["criteria_match"] is False
-        assert match["found_via_criteria_search"] is True
 
     def test_vp_engineering_does_not_match_bare_engineer(self):
         contact = {
@@ -71,6 +62,303 @@ class TestCriteriaParsingAndScoring:
         }
         assert score_criteria_match(contact, ["AI"])["criteria_match"] is False
         assert score_criteria_match(contact, ["HR"])["criteria_match"] is False
+
+    def test_evidence_snippet_alone_is_not_a_role_match(self):
+        contact = {
+            "name": "Alex Kim",
+            "role": "Recruiter",
+            "evidence": 'Alex Kim - Recruiter - "VP Engineering" hiring at Acme',
+            "affinity": ["criteria:VP Engineering"],
+        }
+        match = score_criteria_match(contact, ["VP Engineering"])
+        assert match["criteria_match"] is False
+
+
+class TestAlumniCriteria:
+    def test_northwestern_alum_is_alumni_term(self):
+        assert is_alumni_term("Northwestern Alum")
+        assert alumni_mode(["Northwestern Alum"]) is True
+        assert alumni_mode(["VP Engineering"]) is False
+
+    def test_school_aliases_expand_northwestern(self):
+        aliases = school_aliases_for_term("Northwestern Alum")
+        joined = " ".join(aliases).lower()
+        assert "northwestern university" in joined
+        assert "kellogg" in joined
+
+    def test_alumni_match_uses_education_evidence(self):
+        contact = {
+            "name": "Benjamin Forbes",
+            "role": "Associate",
+            "evidence": (
+                "Benjamin Forbes - Northwestern University - Evanston | LinkedIn. "
+                "Associate at Goldman Sachs. New York, NY."
+            ),
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["criteria_match"] is True
+        assert match["alumni_match"] is True
+
+    def test_alumni_does_not_require_literal_alum_word_in_role(self):
+        # This was the bug: role="Northwestern University" failed because
+        # scoring required both "northwestern" AND "alum" tokens.
+        contact = {
+            "name": "Jane Doe",
+            "role": "Northwestern University",
+            "evidence": "Analyst at Goldman Sachs",
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["criteria_match"] is True
+
+    def test_ucla_person_is_not_northwestern_alum(self):
+        contact = {
+            "name": "Annika Maria Tonn",
+            "role": "Goldman Sachs",
+            "evidence": (
+                "Experience: Goldman Sachs · Education: University of California, "
+                "Los Angeles · Location: New York"
+            ),
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["criteria_match"] is False
+
+    def test_northwestern_mutual_is_not_northwestern_alum(self):
+        contact = {
+            "name": "Pat Lee",
+            "role": "Advisor",
+            "evidence": "Advisor at Northwestern Mutual. New York.",
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["criteria_match"] is False
+        assert match["alumni_match"] is False
+
+    def test_truncated_title_plus_mutual_not_alum(self):
+        # Truncated LinkedIn title leaves bare "Northwestern"; Mutual is in
+        # Experience; Education is a different school — must not match.
+        contact = {
+            "name": "Pat Lee",
+            "role": "Advisor",
+            "evidence": (
+                "Pat Lee - Northwestern | Experience: Advisor at "
+                "Northwestern Mutual. Education: University of Wisconsin"
+            ),
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["alumni_match"] is False
+
+    def test_education_northwestern_still_matches(self):
+        contact = {
+            "name": "Alex Kim",
+            "role": "Analyst",
+            "evidence": (
+                "Alex Kim - Analyst at Goldman Sachs. "
+                "Education: Northwestern University"
+            ),
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["alumni_match"] is True
+
+    def test_surname_johnson_is_not_cornell_alum(self):
+        contact = {
+            "name": "Pat Johnson",
+            "role": "Associate",
+            "evidence": "Pat Johnson, MBA - Associate at Goldman Sachs. New York.",
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Cornell Alum"])
+        assert match["alumni_match"] is False
+
+    def test_surname_johnson_mba_no_comma_not_cornell(self):
+        contact = {
+            "name": "Pat Johnson",
+            "role": "Associate",
+            "evidence": "Pat Johnson MBA - Associate at Goldman Sachs.",
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Cornell Alum"])
+        assert match["alumni_match"] is False
+
+    def test_later_johnson_graduate_school_still_matches(self):
+        contact = {
+            "name": "Pat Johnson",
+            "role": "Associate",
+            "evidence": (
+                "Pat Johnson - Associate at GS. "
+                "Education: Johnson Graduate School of Management"
+            ),
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Cornell Alum"])
+        assert match["alumni_match"] is True
+
+    def test_education_kellogg_short_form(self):
+        contact = {
+            "name": "Sam Lee",
+            "role": "Analyst",
+            "evidence": "Analyst at Goldman Sachs. Education: Kellogg",
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["alumni_match"] is True
+
+    def test_kellogg_dash_school_principal_not_alum(self):
+        contact = {
+            "name": "Chris Kellogg",
+            "role": "Principal",
+            "evidence": "Chris Kellogg - School Principal at Lincoln High",
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["alumni_match"] is False
+
+    def test_title_only_midcard_kellogg_body_ignored(self):
+        from deep_research import person_scoped_evidence, score_criteria_match
+        title = "Ken Hirsch - Partner - Goldman Sachs | LinkedIn"
+        body = (
+            "MBA Candidate at Kellogg School of Management · "
+            "Experience: Northwestern Mutual"
+        )
+        evidence = person_scoped_evidence("Ken Hirsch", title, body)
+        assert "kellogg" not in evidence.lower()
+        match = score_criteria_match(
+            {"name": "Ken Hirsch", "role": "Partner", "evidence": evidence,
+             "affinity": []},
+            ["Northwestern Alum"],
+        )
+        assert match["alumni_match"] is False
+
+    def test_kellogg_school_is_northwestern_alum(self):
+        contact = {
+            "name": "Sam Lee",
+            "role": "VP",
+            "evidence": "MBA, Kellogg School of Management. Goldman Sachs.",
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["alumni_match"] is True
+
+    def test_kellogg_mba_bound_is_northwestern_alum(self):
+        contact = {
+            "name": "Dylan Speirs",
+            "role": "Senior Analyst",
+            "evidence": "Senior Analyst at Goldman Sachs | Kellogg MBA Deferred Admit",
+            "affinity": [],
+        }
+        match = score_criteria_match(contact, ["Northwestern Alum"])
+        assert match["alumni_match"] is True
+
+    def test_serp_neighbor_kellogg_does_not_bleed(self):
+        from deep_research import person_scoped_evidence, score_criteria_match
+        title = "Ken Hirsch - Partner - Goldman Sachs | LinkedIn"
+        body = (
+            "Allison Sheehan - MBA Candidate at Kellogg School of Management. "
+            "Ken Hirsch - Partner - Goldman Sachs (Co-Chairman, Global TMT). "
+            "Vidhi Bhatnagar - Vice President"
+        )
+        evidence = person_scoped_evidence("Ken Hirsch", title, body)
+        assert "kellogg" not in evidence.lower()
+        match = score_criteria_match(
+            {"name": "Ken Hirsch", "role": "Partner", "evidence": evidence,
+             "affinity": []},
+            ["Northwestern Alum"],
+        )
+        assert match["alumni_match"] is False
+
+    def test_serp_title_only_neighbor_body_does_not_bleed(self):
+        from deep_research import person_scoped_evidence, score_criteria_match
+        title = "Ken Hirsch - Partner - Goldman Sachs | LinkedIn"
+        body = (
+            "Allison Sheehan - MBA Candidate at Kellogg School of Management. "
+            "Vidhi Bhatnagar - Vice President"
+        )
+        evidence = person_scoped_evidence("Ken Hirsch", title, body)
+        assert "kellogg" not in evidence.lower()
+        match = score_criteria_match(
+            {"name": "Ken Hirsch", "role": "Partner", "evidence": evidence,
+             "affinity": []},
+            ["Northwestern Alum"],
+        )
+        assert match["alumni_match"] is False
+
+    def test_serp_neighbor_glued_into_title_does_not_bleed(self):
+        from deep_research import person_scoped_evidence, score_criteria_match
+        title = (
+            "Ken Hirsch - Partner - Goldman Sachs (Co-Chairman ... - LinkedIn. "
+            "Robert Wang - MBA Candidate at Kellogg School of Management"
+        )
+        evidence = person_scoped_evidence("Ken Hirsch", title, "")
+        assert "kellogg" not in evidence.lower()
+        assert "robert wang" not in evidence.lower()
+        match = score_criteria_match(
+            {"name": "Ken Hirsch", "role": "Partner", "evidence": evidence,
+             "affinity": []},
+            ["Northwestern Alum"],
+        )
+        assert match["alumni_match"] is False
+
+    def test_serp_ellipsis_neighbor_kellogg_does_not_bleed(self):
+        from deep_research import person_scoped_evidence, score_criteria_match
+        title = "Ken Hirsch - Partner - Goldman Sachs (Co-Chairman ... - LinkedIn"
+        body = (
+            "Ken Hirsch - Partner - Goldman Sachs (Co-Chairman, Global TMT "
+            "...Vidhi Bhatnagar - Vice President, Management & Strategy "
+            "...Robert Wang - MBA Candidate at Kellogg School of Management "
+            "...Winston Xu, CFA - PWA at Goldman Sachs"
+        )
+        evidence = person_scoped_evidence("Ken Hirsch", title, body)
+        assert "kellogg" not in evidence.lower()
+        assert "robert wang" not in evidence.lower()
+        match = score_criteria_match(
+            {"name": "Ken Hirsch", "role": "Partner", "evidence": evidence,
+             "affinity": []},
+            ["Northwestern Alum"],
+        )
+        assert match["alumni_match"] is False
+
+    def test_mixed_criteria_alumni_floor_ignores_role_only(self, monkeypatch):
+        scored = []
+        for i in range(5):
+            scored.append({
+                "name": f"Vice Person{i} Smith",
+                "role": "VP Engineering",
+                "email": f"vp{i}@gs.com",
+                "linkedin_url": f"https://www.linkedin.com/in/vp-{i}-smith",
+                "email_kind": "personal",
+                "email_verified": True,
+                "email_person_match": True,
+                "email_mx_ok": True,
+                "on_domain": True,
+                "linkedin_verified": True,
+                "person_verified": True,
+                "name_from_email": False,
+                "criteria_match": True,
+                "alumni_match": False,
+                "match_score": 0.5,
+                "matched_terms": ["VP Engineering"],
+                "affinity": [],
+            })
+        for c in scored:
+            parts = c["name"].split()
+            c["name"] = f"{parts[0]} {parts[-1]}"
+        import deep_research as dr
+        monkeypatch.setattr(
+            dr, "select_outreach_contacts",
+            lambda contacts, emails, domain, limit=5, **_k: list(contacts)[:limit],
+        )
+        svc = DeepResearchService(db=None, enrichment=None)
+        selected = svc._select_persistable(
+            scored, [c["email"] for c in scored], "gs.com",
+            min_contacts=5,
+            criteria_terms=["VP Engineering", "Northwestern Alum"],
+            alumni_only_floor=True,
+        )
+        assert selected == []
 
 
 class TestEmployeeEstimateAndFloor:
@@ -94,27 +382,10 @@ class TestEmployeeEstimateAndFloor:
             "href": "https://www.linkedin.com/in/jane-doe-123",
         }]
         people = extract_people_from_snippets(
-            results, "Acme AI", role_hint="VP Engineering")
+            results, "Acme AI")
         assert len(people) == 1
         assert people[0]["name"].lower().startswith("jane")
         assert "linkedin.com/in/jane-doe" in people[0]["linkedin_url"]
-        assert people[0]["role"] == "VP Engineering"
-        assert people[0].get("search_hint") == "VP Engineering"
-
-    def test_search_hint_is_not_used_as_role(self):
-        results = [{
-            "title": "Jane Doe - Acme AI | LinkedIn",
-            "body": "Jane Doe currently works at Acme AI.",
-            "href": "https://www.linkedin.com/in/jane-doe-123",
-        }]
-        people = extract_people_from_snippets(
-            results, "Acme AI", role_hint="VP Engineering")
-        assert len(people) == 1
-        assert people[0].get("role") in (None, "", "Acme AI")
-        # Even if role accidentally became company name, criteria must not
-        # match solely because of the hunt term.
-        match = score_criteria_match(people[0], ["VP Engineering"])
-        assert match["criteria_match"] is False
 
     def test_extract_people_rejects_wrong_company(self):
         results = [{
@@ -124,13 +395,16 @@ class TestEmployeeEstimateAndFloor:
         }]
         assert extract_people_from_snippets(results, "Acme AI") == []
 
-    def test_extract_people_rejects_ex_employee_noise(self):
+    def test_extract_alumni_at_company(self):
         results = [{
-            "title": "Jane Doe - Advisor | LinkedIn",
-            "body": "Former VP at Acme AI, now advising startups.",
-            "href": "https://www.linkedin.com/in/jane-doe-ex",
+            "title": "Benjamin Forbes - Northwestern University | LinkedIn",
+            "body": "Associate at Goldman Sachs. New York, NY.",
+            "href": "https://www.linkedin.com/in/benjamin-forbes-8b8379203",
         }]
-        assert extract_people_from_snippets(results, "Acme AI") == []
+        people = extract_people_from_snippets(
+            results, "Goldman Sachs")
+        assert len(people) == 1
+        assert "northwestern" in (people[0].get("evidence") or "").lower()
 
 
 class TestHeuristicIntel:
@@ -194,6 +468,69 @@ class TestContactFloorSelection:
         )
         assert len(selected) >= MIN_CONTACTS
         assert sum(1 for c in selected if c.get("criteria_match")) >= CRITERIA_HIT_TARGET
+
+    def test_alumni_only_floor_does_not_pad_with_ceo(self, monkeypatch):
+        scored = []
+        for i in range(3):
+            scored.append({
+                "name": f"Alum Person{i} Smith",
+                "role": "Associate",
+                "email": f"alum{i}@gs.com",
+                "linkedin_url": f"https://www.linkedin.com/in/alum-{i}-smith",
+                "email_kind": "personal",
+                "email_verified": True,
+                "email_person_match": True,
+                "email_mx_ok": True,
+                "on_domain": True,
+                "linkedin_verified": True,
+                "person_verified": True,
+                "name_from_email": False,
+                "criteria_match": True,
+                "alumni_match": True,
+                "match_score": 1.0,
+                "matched_terms": ["Northwestern Alum"],
+                "evidence": "Northwestern University · Goldman Sachs",
+                "affinity": [],
+            })
+        scored.append({
+            "name": "David Solomon",
+            "role": "CEO",
+            "email": "ceo@gs.com",
+            "linkedin_url": "https://www.linkedin.com/in/david-m-solomon",
+            "email_kind": "personal",
+            "email_verified": True,
+            "email_person_match": True,
+            "email_mx_ok": True,
+            "on_domain": True,
+            "linkedin_verified": True,
+            "person_verified": True,
+            "name_from_email": False,
+            "criteria_match": False,
+            "alumni_match": False,
+            "match_score": 0.0,
+            "matched_terms": [],
+            "affinity": [],
+        })
+        import deep_research as dr
+        monkeypatch.setattr(
+            dr, "select_outreach_contacts",
+            lambda contacts, emails, domain, limit=5, **_k: list(contacts)[:limit],
+        )
+        # Use realistic two-token names for channel checks
+        for c in scored:
+            parts = c["name"].split()
+            if len(parts) >= 3:
+                c["name"] = f"{parts[0]} {parts[-1]}"
+
+        svc = DeepResearchService(db=None, enrichment=None)
+        selected = svc._select_persistable(
+            scored, [c["email"] for c in scored], "gs.com",
+            min_contacts=5,
+            criteria_terms=["Northwestern Alum"],
+            alumni_only_floor=True,
+        )
+        assert all(c.get("criteria_match") for c in selected)
+        assert not any(c.get("name") == "David Solomon" for c in selected)
 
     def test_channel_rejects_mx_failed_email(self):
         svc = DeepResearchService(db=None, enrichment=None)

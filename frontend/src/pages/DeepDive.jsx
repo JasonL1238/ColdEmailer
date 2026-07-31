@@ -10,11 +10,11 @@ import CompanyDrawer from '../components/CompanyDrawer'
 import ComposeModal from './ComposeModal'
 
 const CRITERIA_SUGGESTIONS = [
+  'Northwestern Alum',
+  'Penn alumni, Wharton alumni',
   'VP Engineering, Engineering Manager, hiring manager',
   'Founders, CTO, Head of Product',
   'Talent / recruiting leaders, Head of People',
-  'Penn alumni, Wharton alumni',
-  'Directors in AI / ML, research leads',
 ]
 
 export default function DeepDive() {
@@ -66,6 +66,10 @@ export default function DeepDive() {
                 + `(${r.criteria_matches ?? 0} match your criteria)`
               if (r.identity_verified === false) {
                 toast.error('Deep dive finished, but the site did not match this company.')
+              } else if (r.alumni_mode && r.floor_required && !r.floor_met) {
+                toast.error(
+                  `${msg}. Alumni floor not met — try Continue contacts.`,
+                )
               } else if (r.floor_required && !r.floor_met) {
                 toast.error(`${msg}. Contact floor not met.`)
               } else if (r.floor_required && r.criteria_ratio_met === false) {
@@ -111,21 +115,29 @@ export default function DeepDive() {
     return stopPolling
   }, [loadHistory, stopPolling])
 
-  const start = async () => {
-    const name = companyName.trim()
-    if (name.length < 2) {
+  const start = async (continueMode = null) => {
+    const name = companyName.trim() || result?.company_name || ''
+    if (!continueMode && name.length < 2) {
       toast.error('Enter a company name')
+      return
+    }
+    if (continueMode && !(result?.company_id || run?.company?.id)) {
+      toast.error('Run a full deep dive before continuing')
       return
     }
     setStarting(true)
     try {
-      const { data } = await deepResearchAPI.start({
-        company_name: name,
+      const payload = {
+        company_name: name || undefined,
+        company_id: result?.company_id || run?.company?.id || undefined,
         url: url.trim() || null,
         contact_criteria: criteria.trim(),
         min_contacts: 5,
-      })
+      }
+      if (continueMode) payload.continue_mode = continueMode
+      const { data } = await deepResearchAPI.start(payload)
       setRun(data)
+      if (name) setCompanyName(name)
       pollRun(data.id)
     } catch (e) {
       toast.error(errMessage(e, 'Could not start deep research'))
@@ -175,8 +187,9 @@ export default function DeepDive() {
         </h1>
         <p className="small muted" style={{ marginTop: 8, maxWidth: 640, lineHeight: 1.55 }}>
           Dig into one company for key changes, policy differentiators, and contacts
-          that match your criteria. Aims for at least 5 people with LinkedIn or email
-          when the company has 5+ employees — prioritizing your criteria.
+          that match your criteria. Alumni criteria (e.g. Northwestern Alum) aim for
+          at least 5 matching alumni — not random employees. After a run, continue
+          searching contacts, company research, or both.
         </p>
 
         <div className="stack" style={{ gap: 10, marginTop: 18 }}>
@@ -269,18 +282,28 @@ export default function DeepDive() {
               <h2 style={{ margin: 0, fontSize: 20 }}>{result.company_name}</h2>
               <div className="small muted" style={{ marginTop: 4 }}>
                 {result.contacts_saved ?? 0} contacts saved · {result.criteria_matches ?? 0} criteria matches
+                {result.alumni_mode ? ' · alumni mode' : ''}
                 {result.employee_estimate != null
                   ? ` · ~${result.employee_estimate} employees estimated`
                   : ''}
                 {result.floor_required && !result.floor_met ? ' · contact floor not fully met' : ''}
               </div>
             </div>
-            <div className="row" style={{ gap: 8 }}>
+            <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
               {result.company_id && (
                 <Button size="sm" onClick={() => openCompany(result.company_id)}>
                   Open company
                 </Button>
               )}
+              <Button size="sm" disabled={running || starting} onClick={() => start('contacts')}>
+                Continue contacts
+              </Button>
+              <Button size="sm" disabled={running || starting} onClick={() => start('research')}>
+                Continue research
+              </Button>
+              <Button size="sm" disabled={running || starting} onClick={() => start('both')}>
+                Continue both
+              </Button>
               {runContacts.filter((c) => c.email).length > 0 && (
                 <Button
                   size="sm"
@@ -340,7 +363,9 @@ export default function DeepDive() {
             ) : (
               <div className="stack" style={{ gap: 8 }}>
                 {runContacts.map((c) => {
-                  const criteriaHit = (c.notes || '').toLowerCase().includes('criteria match')
+                  const criteriaHit = /criteria match|warm match: criteria|northwestern|alumni|alum/i.test(
+                    `${c.notes || ''} ${c.affinity || ''} ${c.evidence || ''} ${c.role || ''}`,
+                  )
                   return (
                     <div key={c.id} className="card card-pad row-between" style={{ padding: '10px 14px' }}>
                       <div style={{ minWidth: 0 }}>

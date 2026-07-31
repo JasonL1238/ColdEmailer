@@ -42,14 +42,64 @@ except ImportError:  # pragma: no cover
 MIN_CONTACTS = 5
 CRITERIA_HIT_TARGET = 4  # of MIN_CONTACTS should match criteria when possible
 MAX_LINKEDIN_SEARCHES = 14
+MAX_ALUMNI_SEARCHES = 28
 MAX_OUTREACH_LOOKUPS = 12
 
-# Broader fallback roles used only to hit the contact floor.
+# Broader fallback roles used only to hit the contact floor when criteria
+# are role-shaped (never used to pad an alumni-only request).
 _FLOOR_ROLE_QUERIES = (
     "CEO", "CTO", "COO", "founder", "co-founder",
     "Head of Talent", "Head of Recruiting", "VP Engineering",
     "Head of People", "Engineering Manager", "Product Manager",
     "Director of Engineering", "Chief of Staff",
+)
+
+# Canonical school expansions for alumni criteria ("Northwestern Alum", …).
+_SCHOOL_ALIAS_MAP = {
+    "northwestern": [
+        "Northwestern University", "Northwestern", "Kellogg",
+        "Kellogg School of Management", "Kellogg School",
+        "Northwestern alum", "Northwestern alumni", "NU Kellogg",
+    ],
+    "penn": [
+        "University of Pennsylvania", "UPenn", "Penn", "Wharton",
+        "Penn Engineering", "Penn alum", "Penn alumni",
+    ],
+    "upenn": [
+        "University of Pennsylvania", "UPenn", "Wharton", "Penn",
+    ],
+    "wharton": [
+        "Wharton", "University of Pennsylvania", "UPenn", "Wharton School",
+    ],
+    "harvard": [
+        "Harvard University", "Harvard", "Harvard Business School", "HBS",
+        "Harvard College",
+    ],
+    "stanford": [
+        "Stanford University", "Stanford", "Stanford GSB", "GSB",
+    ],
+    "mit": [
+        "MIT", "Massachusetts Institute of Technology", "Sloan",
+    ],
+    "yale": ["Yale University", "Yale", "Yale SOM"],
+    "columbia": ["Columbia University", "Columbia", "Columbia Business School"],
+    "chicago": ["University of Chicago", "Chicago Booth", "Booth"],
+    "booth": ["Chicago Booth", "University of Chicago", "Booth"],
+    "berkeley": ["UC Berkeley", "Berkeley", "Haas"],
+    "ucla": ["UCLA", "University of California, Los Angeles", "Anderson"],
+    "nyu": ["NYU", "New York University", "Stern"],
+    "cornell": ["Cornell University", "Cornell", "Johnson"],
+    "duke": ["Duke University", "Duke", "Fuqua"],
+    "michigan": ["University of Michigan", "Michigan", "Ross"],
+    "kellogg": [
+        "Kellogg", "Kellogg School of Management", "Northwestern University",
+        "Northwestern",
+    ],
+}
+
+_ALUM_WORD_RE = re.compile(
+    r"\b(?:alum|alums|alumni|alumnus|alumna|graduate|grad)\b",
+    re.I,
 )
 
 _NAME_ROLE_RE = re.compile(
@@ -72,9 +122,11 @@ _EMPLOYMENT_CUE_RE = re.compile(
     r"\b(?:at|@|with|joining|joined|works?(?:\s+at)?|currently)\b",
     re.I,
 )
+# Reject non-employees / job ads. Do NOT reject school "alumni of X" —
+# that is exactly the alumni signal we hunt for.
 _NON_EMPLOYEE_CUE_RE = re.compile(
-    r"\b(?:ex-|former|previously|alumni of|hiring at|open to|"
-    r"looking (?:for|at)|recruiter for|journalist)\b",
+    r"\b(?:hiring at|open to work|looking (?:for|at)|recruiter for|"
+    r"journalist|job posting|we're hiring|we are hiring)\b",
     re.I,
 )
 
@@ -106,55 +158,260 @@ _SHORT_ROLE_TOKENS = {
 }
 
 
+def is_alumni_term(term: str) -> bool:
+    """True when the criteria phrase is school/alumni-shaped."""
+    t = (term or "").strip().lower()
+    if not t:
+        return False
+    if _ALUM_WORD_RE.search(t):
+        return True
+    # Bare school names count as alumni criteria too.
+    stem = re.sub(r"[^a-z0-9]+", " ", t).strip()
+    first = stem.split()[0] if stem else ""
+    return first in _SCHOOL_ALIAS_MAP or stem in {
+        a.lower() for aliases in _SCHOOL_ALIAS_MAP.values() for a in aliases
+    }
+
+
+def alumni_mode(criteria_terms: List[str]) -> bool:
+    """True when the request is primarily about finding alumni."""
+    if not criteria_terms:
+        return False
+    alum_n = sum(1 for t in criteria_terms if is_alumni_term(t))
+    return alum_n >= max(1, (len(criteria_terms) + 1) // 2)
+
+
+def school_aliases_for_term(term: str) -> List[str]:
+    """Expand 'Northwestern Alum' into searchable school phrases."""
+    t = (term or "").strip()
+    if not t:
+        return []
+    # Strip alum/graduate words to get the school stem.
+    stem = _ALUM_WORD_RE.sub(" ", t)
+    stem = re.sub(r"[^a-zA-Z0-9]+", " ", stem).strip()
+    if not stem:
+        stem = re.sub(r"[^a-zA-Z0-9]+", " ", t).strip()
+    lowered = stem.lower()
+    out: List[str] = []
+    # Direct map hit on first distinctive token or full stem.
+    for key, aliases in _SCHOOL_ALIAS_MAP.items():
+        if key == lowered or key in lowered.split() or lowered in {
+                a.lower() for a in aliases}:
+            out.extend(aliases)
+    if stem:
+        out.append(stem)
+        out.append(f"{stem} University")
+        out.append(f"{stem} alum")
+        out.append(f"{stem} alumni")
+    # Keep original term too.
+    out.append(t)
+    # Dedup, preserve order, drop empties / tiny noise.
+    seen = set()
+    clean: List[str] = []
+    for item in out:
+        s = re.sub(r"\s+", " ", item).strip()
+        key = s.lower()
+        if len(s) < 3 or key in seen:
+            continue
+        seen.add(key)
+        clean.append(s)
+    return clean[:16]
+
+
+# Presence of these markers makes an alias strong (match without nearby cues).
+_STRONG_SCHOOL_MARKERS_RE = re.compile(
+    r"\b(?:university|college|school|institute)\b",
+    re.I,
+)
+# Multi-word / acronym aliases that are distinctive without "university".
+_STRONG_ALIAS_EXACT = {
+    "chicago booth",
+    "yale som",
+    "stanford gsb",
+    "nu kellogg",
+    "penn engineering",
+    "harvard business school",
+    "kellogg school of management",
+    "kellogg school",
+    "wharton school",
+    "columbia business school",
+    "massachusetts institute of technology",
+    "university of pennsylvania",
+    "new york university",
+    "uc berkeley",
+    "mit",
+    "ucla",
+    "nyu",
+    "upenn",
+    "hbs",
+}
+# B-school tokens that are also common surnames — never match on bare
+# token + generic "MBA"/"Education" (that marks Pat Johnson as Cornell).
+_SURNAME_LIKE_ALIASES = {
+    "kellogg", "johnson", "ross", "stern", "booth", "haas",
+    "anderson", "sloan", "fuqua", "wharton",
+}
+# Weak university stems need a real education cue *near the hit* — never a
+# global "education:" scan (fires on unrelated schools after Mutual scrub).
+_WEAK_EDU_CONTEXT_RE = re.compile(
+    r"\b(?:education|university|college|school|institute|alum|alumni|"
+    r"alumnus|alumna|graduate|graduated|mba|attended|studied|class of)\b",
+    re.I,
+)
+# Employer / org collisions that must never count as school alumni.
+_SCHOOL_FALSE_POSITIVE_RE = re.compile(
+    r"\bnorthwestern\s+mutual\b|\bpenn\s+state\b|\bhawaii\s+pacific\b",
+    re.I,
+)
+
+
+def _alias_is_strong(stem: str) -> bool:
+    s = (stem or "").lower().strip()
+    if not s:
+        return False
+    if s in _STRONG_ALIAS_EXACT:
+        return True
+    return bool(_STRONG_SCHOOL_MARKERS_RE.search(s))
+
+
+def _alias_phrase_re(stem: str) -> str:
+    """Build a regex for an alias. Multi-word schools require whitespace
+    between tokens so \"Kellogg - School Principal\" ≠ \"Kellogg School\".
+    """
+    parts = [p for p in re.split(r"[\s\-_,./]+", (stem or "").lower()) if p]
+    if not parts:
+        return ""
+    if len(parts) >= 2:
+        return r"\s+".join(re.escape(p) for p in parts)
+    return re.escape(parts[0])
+
+
+def _surname_like_bound(scrubbed: str, match: re.Match) -> bool:
+    """True when this surname-like hit is school-bound, not a last name.
+
+    Allows \"Kellogg School\" / \"Kellogg MBA\" / \"Education: Kellogg\" /
+    \"at Kellogg\". Rejects \"Pat Johnson MBA\" where the token is a surname.
+    """
+    # Must be bound at THIS hit — not a later \"Ross School\" elsewhere.
+    after = scrubbed[match.end(): match.end() + 18]
+    before = scrubbed[max(0, match.start() - 28): match.start()]
+    bound_after = bool(re.match(
+        r"\s+(?:school|mba|graduate|alum|alumni)\b", after))
+    bound_before = bool(re.search(
+        r"\b(?:education|school|college|university|institute|at|from|"
+        r"alum|alumni|alumnus|alumna)\b[:\s]*$",
+        before))
+    if not (bound_after or bound_before):
+        return False
+    # \"pat johnson mba\" / \"jane wharton school\" — first-name + surname.
+    if re.search(r"[a-z]{2,}\s+$", before) and not re.search(
+            r"\b(?:education|university|college|alum|alumni|at|from)\b",
+            before):
+        return False
+    return True
+
+
+def _school_mentioned(aliases: List[str], *texts: str) -> bool:
+    """True when education evidence names the school.
+
+    Weak stems like \"Northwestern\" require nearby education context so
+    \"Northwestern Mutual\" does not count. Surname-like B-school tokens
+    (\"Kellogg\", \"Johnson\") only count when school-bound. Strong aliases
+    (\"Northwestern University\", \"Kellogg School\") may match alone.
+    """
+    blob = " ".join(texts).lower()
+    if not blob.strip():
+        return False
+    # Strip known false-positive org phrases before matching.
+    scrubbed = _SCHOOL_FALSE_POSITIVE_RE.sub(" ", blob)
+    # Prefer longer / stronger aliases first so "Kellogg School" wins
+    # over bare "Kellogg".
+    ordered = sorted(
+        {(a or "").lower().strip() for a in aliases if (a or "").strip()},
+        key=lambda x: (-len(x), x),
+    )
+    for a in ordered:
+        if len(a) < 3 or _ALUM_WORD_RE.fullmatch(a):
+            continue
+        stem = _ALUM_WORD_RE.sub(" ", a).strip() or a
+        phrase = _alias_phrase_re(stem)
+        if not phrase:
+            continue
+        pat = rf"(?<![a-z0-9]){phrase}(?![a-z0-9])"
+        if _alias_is_strong(stem):
+            if re.search(pat, scrubbed):
+                return True
+            continue
+        if stem in _SURNAME_LIKE_ALIASES:
+            for match in re.finditer(pat, scrubbed):
+                if _surname_like_bound(scrubbed, match):
+                    return True
+            continue
+        # Weak university stem: try every hit (Medicine then Education: X).
+        for match in re.finditer(pat, scrubbed):
+            start = max(0, match.start() - 36)
+            end = min(len(scrubbed), match.end() + 36)
+            window = scrubbed[start:end]
+            if _WEAK_EDU_CONTEXT_RE.search(window):
+                return True
+    return False
+
+
 def score_criteria_match(contact: Dict, criteria_terms: List[str]) -> Dict[str, Any]:
     """Score how well a contact matches the user's criteria.
 
-    Only role/evidence/notes count — search affinity tags must not launder
-    a match. Returns match_score (0-1), matched_terms, and criteria_match.
+    Role terms match against role text. Alumni terms match against role +
+    evidence for school aliases (education signal) — affinity tags alone
+    never count. Returns match_score, matched_terms, criteria_match.
     """
     if not criteria_terms:
         return {
             "match_score": 0.0,
             "matched_terms": [],
             "criteria_match": False,
+            "alumni_match": False,
             "found_via_criteria_search": bool(
                 any(str(a).startswith("criteria:")
                     for a in (contact.get("affinity") or []))
             ),
         }
-    # Score only role (+ user-visible notes we wrote). Search-snippet
-    # `evidence` often echoes the hunt query and would launder matches.
-    blob = " ".join([
+    role_blob = (contact.get("role") or "").lower()
+    # Evidence is allowed for alumni/school matching (education lines),
+    # but not for inventing a role title match from the hunt query alone.
+    edu_blob = " ".join([
         contact.get("role") or "",
-        contact.get("notes") or "",
+        contact.get("evidence") or "",
     ]).lower()
     matched: List[str] = []
+    alumni_hit = False
     for term in criteria_terms:
         t = term.lower().strip()
         if not t:
             continue
-        # Always use word boundaries — short terms like "ai"/"hr" must not
-        # hit inside "email" / "html".
+        if is_alumni_term(term):
+            aliases = school_aliases_for_term(term)
+            if _school_mentioned(aliases, edu_blob):
+                matched.append(term)
+                alumni_hit = True
+            continue
         phrase = re.escape(t).replace(r"\ ", r"[\s\-_/]+")
-        if re.search(rf"(?<![a-z0-9]){phrase}(?![a-z0-9])", blob):
+        if re.search(rf"(?<![a-z0-9]){phrase}(?![a-z0-9])", role_blob):
             matched.append(term)
             continue
         bits = [
             b for b in re.split(r"[^a-z0-9]+", t)
             if b and (len(b) >= 3 or b in _SHORT_ROLE_TOKENS)
         ]
-        if not bits:
-            continue
-        # Multi-word titles need every token (incl. short VP/CTO), so
-        # "VP Engineering" cannot collapse to a bare "engineering" hit.
-        if all(re.search(rf"(?<![a-z0-9]){re.escape(b)}(?![a-z0-9])", blob)
-               for b in bits):
+        if bits and all(
+                re.search(rf"(?<![a-z0-9]){re.escape(b)}(?![a-z0-9])", role_blob)
+                for b in bits):
             matched.append(term)
     score = len(matched) / max(len(criteria_terms), 1)
     return {
         "match_score": round(min(score, 1.0), 3),
         "matched_terms": matched,
         "criteria_match": bool(matched),
+        "alumni_match": alumni_hit,
         "found_via_criteria_search": bool(
             any(str(a).startswith("criteria:")
                 for a in (contact.get("affinity") or []))
@@ -198,7 +455,7 @@ def should_require_contact_floor(
 
 def _looks_like_employee_snippet(
         company_name: str, title: str, body: str) -> bool:
-    """Require company mention + employment cue; reject ex-/hiring noise."""
+    """Require company mention + employment cue; reject job-ad / former noise."""
     from contact_enrich import _company_mentioned
 
     blob = f"{title or ''} {body or ''}"
@@ -206,22 +463,152 @@ def _looks_like_employee_snippet(
         return False
     if _NON_EMPLOYEE_CUE_RE.search(blob):
         return False
-    # LinkedIn title pattern "Name - Role - Company" counts as employment.
     company_bits = [
         t for t in re.split(r"[^a-z0-9]+", (company_name or "").lower())
         if len(t) >= 3
     ]
+    blob_l = blob.lower()
+    if any(
+        re.search(
+            rf"\b(?:ex|former|previously)\b.{{0,30}}\b{re.escape(b)}\b",
+            blob_l,
+        )
+        for b in company_bits
+    ):
+        return False
+    # Title is another employer (e.g. "Janie Xu - Lyft") while Goldman is only
+    # a weak body mention — skip.
     title_l = (title or "").lower()
-    if company_bits and any(b in title_l for b in company_bits):
-        if re.search(r"\s[-–—|]\s", title or ""):
-            return True
-    return bool(_EMPLOYMENT_CUE_RE.search(blob))
+    title_has_company = any(b in title_l for b in company_bits)
+    if not title_has_company:
+        # "Experience: Goldman Sachs" / "Analyst at Goldman Sachs" are strong.
+        strong = any(
+            re.search(
+                rf"(?:experience\s*:\s*[^\n]{{0,40}}|{re.escape(cue)}\s+){re.escape(b)}",
+                blob_l,
+            )
+            for b in company_bits
+            for cue in ("at", "with", "@")
+        ) or any(
+            re.search(rf"experience\s*:\s*[^\n]{{0,60}}{re.escape(b)}", blob_l)
+            for b in company_bits
+        )
+        if not strong:
+            return False
+        # Reject titles that look like a different company name.
+        head = re.split(r"\s*[|\-–—]\s*", title or "")
+        if len(head) >= 2:
+            mid = head[1].strip().lower()
+            if (
+                mid
+                and not any(b in mid for b in company_bits)
+                and not re.search(
+                    r"\b(?:university|college|school|student|engineer|"
+                    r"analyst|associate|director|manager|intern|partner|"
+                    r"vice president|vp|mba)\b",
+                    mid,
+                )
+                and len(mid.split()) <= 4
+            ):
+                return False
+    if title_has_company and re.search(r"\s[-–—|]\s", title or ""):
+        return True
+    return bool(_EMPLOYMENT_CUE_RE.search(blob)) or any(
+        re.search(rf"experience\s*:\s*[^\n]{{0,60}}{re.escape(b)}", blob_l)
+        for b in company_bits
+    )
+
+
+# Neighbor profile cards in DDG bodies ("Jane Doe - Role", ellipsis-glued).
+_NEXT_PERSON_RE = re.compile(
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\s*[-–—|]",
+)
+# Do not treat school/org/role phrases as a neighboring person card.
+_NOT_PERSON_CARD_RE = re.compile(
+    r"\b(?:university|college|school|institute|linkedin|llc|inc|corp|"
+    r"partners?|capital|group|holdings|ventures|management|strategy|"
+    r"vice|president|managing|director|senior|analyst|associate|"
+    r"global|markets|investment|engineering|software|candidate|"
+    r"intern|manager|principal|officer|mba|goldman|sachs)\b",
+    re.I,
+)
+
+
+def _normalize_serp_blob(text: str) -> str:
+    """Unstick LinkedIn SERP concatenations so neighbor names are separable."""
+    t = text or ""
+    t = re.sub(r"LinkedIn(?=[A-Z])", "LinkedIn. ", t)
+    t = re.sub(r"\.{2,}", ". ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def _looks_like_person_card(label: str) -> bool:
+    bits = [b for b in re.split(r"\s+", (label or "").strip()) if b]
+    if len(bits) < 2 or len(bits) > 3:
+        return False
+    if _NOT_PERSON_CARD_RE.search(label or ""):
+        return False
+    return True
+
+
+def _cut_at_next_person(name: str, text: str) -> str:
+    """Keep text from `name` until the next distinct \"First Last -\" card."""
+    name = (name or "").strip()
+    text = text or ""
+    if not text:
+        return ""
+    name_l = name.lower()
+    idx = text.lower().find(name_l) if name else 0
+    if idx < 0:
+        return ""
+    rest = text[idx:]
+    cut = len(rest)
+    for m in _NEXT_PERSON_RE.finditer(rest):
+        other = (m.group(1) or "").strip()
+        if other.lower() == name_l:
+            continue
+        if m.start() <= len(name) + 2:
+            continue
+        if not _looks_like_person_card(other):
+            continue
+        cut = m.start()
+        break
+    return rest[:cut].strip()
+
+
+def person_scoped_evidence(name: str, title: str, body: str) -> str:
+    """Keep education/role text tied to one person in multi-profile SERPs.
+
+    DDG often concatenates neighboring LinkedIn cards; without scoping,
+    \"Allison … Kellogg … Ken Hirsch - Partner\" makes Ken look like a Kellogg alum.
+    """
+    title = _normalize_serp_blob(title or "")
+    body = _normalize_serp_blob(body or "")
+    name = (name or "").strip()
+    if not name:
+        return f"{title}. {body}"[:220]
+    name_l = name.lower()
+    chunks: List[str] = []
+    # Titles also get neighbor cards glued on — cut those off.
+    scoped_title = _cut_at_next_person(name, title)
+    if scoped_title:
+        chunks.append(scoped_title)
+    elif name_l in title.lower():
+        chunks.append(title.split(".")[0].strip()[:120])
+    scoped_body = _cut_at_next_person(name, body)
+    # Name only in title — do not attach any body (neighbor cards often omit
+    # the subject's name and start mid-sentence with Kellogg/Education).
+    if scoped_body:
+        chunks.append(scoped_body)
+    if not chunks:
+        chunks.append((title or "")[:120])
+    return " ".join(chunks)[:220]
 
 
 def extract_people_from_snippets(
         results: List[Dict],
-        company_name: str,
-        role_hint: Optional[str] = None) -> List[Dict]:
+        company_name: str) -> List[Dict]:
     """Turn DDG LinkedIn results into named contact candidates."""
     out: List[Dict] = []
     seen = set()
@@ -246,18 +633,37 @@ def extract_people_from_snippets(
                 name = m.group(1).strip()
         if not name or len(name_tokens(name)) < 2:
             continue
-        # Role must come from the snippet — never from the search query hint,
-        # or criteria scoring would launder the hunt term as evidence.
+        # Role must come from the snippet — never from the search query.
         title_role = None
         parts = re.split(r"\s*[-–—|]\s*", title)
         if len(parts) >= 2 and len(parts[1].split()) <= 6:
             maybe = parts[1].strip()[:80]
             if maybe and not re.search(r"linkedin", maybe, re.I):
                 title_role = maybe
-        if not title_role:
-            m = _NAME_ROLE_RE.search(f"{title} {body}")
-            if m and m.group(2):
-                title_role = m.group(2).strip()[:80]
+        evidence = person_scoped_evidence(name, title, body)
+        # Prefer an employment role from scoped evidence when the title
+        # segment is a school name ("Jane Doe - Northwestern University - …").
+        body_role = None
+        m_emp = re.search(
+            r"\b(?:associate|analyst|vice president|vp|director|manager|"
+            r"partner|intern|engineer|banker|md|managing director|"
+            r"vice\s+president)\b[^.|]{0,40}",
+            evidence or "",
+            re.I,
+        )
+        if m_emp:
+            body_role = m_emp.group(0).strip()[:80]
+        if title_role and re.search(
+                r"\b(?:university|college|school|institute)\b",
+                title_role, re.I):
+            title_role = body_role or title_role
+        elif not title_role:
+            if body_role:
+                title_role = body_role
+            else:
+                m = _NAME_ROLE_RE.search(evidence)
+                if m and m.group(2):
+                    title_role = m.group(2).strip()[:80]
         linkedin = None
         for url in urls:
             if linkedin_matches_person(url, name):
@@ -269,22 +675,19 @@ def extract_people_from_snippets(
         if key in seen:
             continue
         seen.add(key)
-        person = {
+        out.append({
             "name": name,
-            "role": title_role,  # may be None — better than fake criteria role
+            "role": title_role,
             "email": "",
             "linkedin_url": linkedin,
             "source_url": linkedin,
-            "evidence": f"{title}. {body}"[:280],
+            "evidence": evidence,
             "linkedin_source": "web_search",
             "on_domain": False,
             "seniority_rank": 12,
             "name_from_email": False,
             "affinity": [],
-        }
-        if role_hint:
-            person["search_hint"] = role_hint
-        out.append(person)
+        })
     return out
 
 
@@ -442,18 +845,38 @@ class DeepResearchService:
             company_id: Optional[str] = None,
             url: Optional[str] = None,
             contact_criteria: str = "",
-            min_contacts: int = MIN_CONTACTS) -> Dict:
+            min_contacts: int = MIN_CONTACTS,
+            continue_mode: Optional[str] = None) -> Dict:
         name = (company_name or "").strip()
         existing = None
+        mode = (continue_mode or "").strip().lower() or None
+        if mode and mode not in {"contacts", "research", "both"}:
+            raise ValueError("continue_mode must be contacts, research, or both")
         if company_id:
             existing = self.db.get_company(company_id)
             if not existing:
                 raise ValueError("Company not found")
             name = existing["name"]
             url = url or existing.get("url")
+        if mode and not company_id and not existing:
+            # Continue needs a company to extend.
+            if name:
+                existing = self.db.find_company_by_name(name)
+            if not existing:
+                raise ValueError(
+                    "Continue search needs an existing company. "
+                    "Run a full deep dive first, or pass company_id.")
+            company_id = existing["id"]
+            name = existing["name"]
+            url = url or existing.get("url")
         if not name:
             raise ValueError("Company name is required")
         min_contacts = max(1, min(int(min_contacts or MIN_CONTACTS), 15))
+        # Prefer prior criteria when continuing without a new one.
+        if mode and not (contact_criteria or "").strip() and existing:
+            prior = existing.get("deep_intel") or {}
+            if isinstance(prior, dict) and prior.get("contact_criteria"):
+                contact_criteria = prior["contact_criteria"]
 
         with self._lock:
             # Slot is held until the worker thread exits (_run_safe finally),
@@ -476,12 +899,16 @@ class DeepResearchService:
                 "url": url,
                 "contact_criteria": contact_criteria,
                 "min_contacts": min_contacts,
+                "continue_mode": mode,
             })
             self._running_job = job["id"]
 
         thread = threading.Thread(
             target=self._run_safe,
-            args=(job["id"], name, company_id, url, contact_criteria, min_contacts),
+            args=(
+                job["id"], name, company_id, url, contact_criteria,
+                min_contacts, mode,
+            ),
             daemon=True,
         )
         thread.start()
@@ -515,9 +942,13 @@ class DeepResearchService:
         job = self.db.get_job(job_id)
         return not job or job.get("status") != "running"
 
-    def _run_safe(self, job_id, name, company_id, url, criteria, min_contacts):
+    def _run_safe(
+            self, job_id, name, company_id, url, criteria, min_contacts,
+            continue_mode=None):
         try:
-            self._run(job_id, name, company_id, url, criteria, min_contacts)
+            self._run(
+                job_id, name, company_id, url, criteria, min_contacts,
+                continue_mode=continue_mode)
         except Exception as exc:  # pragma: no cover
             self.db.finish_job(
                 job_id, status="failed", error=str(exc)[:500],
@@ -535,43 +966,94 @@ class DeepResearchService:
             company_id: Optional[str],
             url: Optional[str],
             criteria: str,
-            min_contacts: int):
+            min_contacts: int,
+            continue_mode: Optional[str] = None):
         criteria_terms = parse_criteria(criteria)
+        want_alum = alumni_mode(criteria_terms)
+        mode = (continue_mode or "").strip().lower() or None
+        do_crawl = mode is None or mode in {"research", "both"}
+        do_contacts = mode is None or mode in {"contacts", "both"}
+        # Contacts-only continue: skip the heavy site crawl.
+        if mode == "contacts":
+            do_crawl = False
+
         stages = [
-            "Deep crawling company site",
-            "Gathering news and changes",
-            "Extracting interview intel",
-            "Hunting criteria-matched contacts",
-            "Filling contact floor",
+            "Deep crawling company site" if do_crawl else "Loading company",
+            "Gathering news and changes" if do_crawl or mode == "research"
+            else "Skipping news (contacts-only)",
+            "Extracting interview intel" if do_crawl or mode == "research"
+            else "Keeping existing intel",
+            "Hunting criteria-matched contacts" if do_contacts
+            else "Keeping existing contacts",
+            "Filling contact floor" if do_contacts else "Skipping contact floor",
             "Saving results",
         ]
         self.db.update_job(
             job_id, stage=stages[0], progress_current=0, progress_total=len(stages))
-        self.db.log_event("deep_research", job_id, "started", name)
+        self.db.log_event(
+            "deep_research", job_id, "started",
+            f"{name} continue={mode or 'full'}")
 
         profile = self.db.get_profile()
-        if self._cancelled(job_id):
-            return
-
-        enriched = self.enrichment.enrich(
-            name,
-            url,
-            preferred_school=profile.get("school"),
-            preferred_affiliations=profile.get("affiliations"),
-            mode="deep",
+        existing_company = (
+            self.db.get_company(company_id) if company_id else None
         )
         if self._cancelled(job_id):
             return
 
-        status = discovery_scrape_status(enriched)
+        if do_crawl:
+            enriched = self.enrichment.enrich(
+                name,
+                url,
+                preferred_school=profile.get("school"),
+                preferred_affiliations=profile.get("affiliations"),
+                mode="deep",
+            )
+        else:
+            # Contacts-only: reuse the stored company identity.
+            enriched = {
+                "url": (existing_company or {}).get("url") or url,
+                "domain": (existing_company or {}).get("domain"),
+                "summary": (existing_company or {}).get("summary"),
+                "product": (existing_company or {}).get("product"),
+                "hook": (existing_company or {}).get("hook"),
+                "recent_news": (existing_company or {}).get("recent_news"),
+                "why_care": (existing_company or {}).get("why_care"),
+                "industry": (existing_company or {}).get("industry"),
+                "location": (existing_company or {}).get("location"),
+                "contacts": [],
+                "emails": [],
+                "page_texts": [],
+                "research_sources": (existing_company or {}).get(
+                    "research_sources") or [],
+                "pages_scraped": (existing_company or {}).get("pages_scraped"),
+                "pages_attempted": (existing_company or {}).get(
+                    "pages_attempted"),
+                "research_quality": (existing_company or {}).get(
+                    "research_quality") or "medium",
+                "scraped_at": (existing_company or {}).get("scraped_at"),
+                "ok": True,
+                "identity_verified": True,
+            }
+        if self._cancelled(job_id):
+            return
+
+        status = discovery_scrape_status(enriched) if do_crawl else (
+            (existing_company or {}).get("scrape_status") or "scraped"
+        )
         identity_ok = (
             status != "wrong_site"
             and enriched.get("identity_verified", True)
         )
 
         self.db.update_job(job_id, stage=stages[1], progress_current=1)
-        news_snippets = self._gather_news(name, enriched.get("domain"))
+        prior_intel = {}
+        if existing_company and isinstance(existing_company.get("deep_intel"), dict):
+            prior_intel = dict(existing_company["deep_intel"])
+        news_snippets: List[str] = list(prior_intel.get("news_snippets") or [])
         page_texts = list(enriched.get("page_texts") or [])
+        if do_crawl or mode == "research":
+            news_snippets = self._gather_news(name, enriched.get("domain"))
         combined_site = "\n\n".join([
             *page_texts[:16],
             enriched.get("summary") or "",
@@ -584,10 +1066,34 @@ class DeepResearchService:
         if self._cancelled(job_id):
             return
         self.db.update_job(job_id, stage=stages[2], progress_current=2)
-        intel = llm_deep_intel(name, combined_site, news_snippets, criteria)
-        if not intel:
-            intel = heuristic_deep_intel(
-                combined_site, news_snippets, company_name=name)
+        if do_crawl or mode == "research":
+            intel = llm_deep_intel(name, combined_site, news_snippets, criteria)
+            if not intel:
+                intel = heuristic_deep_intel(
+                    combined_site, news_snippets, company_name=name)
+            # Merge onto prior intel so continue-research doesn't erase bullets.
+            for key in (
+                "key_changes", "improvements", "policy_highlights",
+                "differentiators", "talking_points",
+            ):
+                merged = list(dict.fromkeys(
+                    (intel.get(key) or []) + (prior_intel.get(key) or [])
+                ))[:8]
+                intel[key] = merged
+        else:
+            intel = {
+                "summary": prior_intel.get("summary") or enriched.get("summary"),
+                "key_changes": prior_intel.get("key_changes") or [],
+                "improvements": prior_intel.get("improvements") or [],
+                "policy_highlights": prior_intel.get("policy_highlights") or [],
+                "differentiators": prior_intel.get("differentiators") or [],
+                "talking_points": prior_intel.get("talking_points") or [],
+                "employee_estimate": prior_intel.get("employee_estimate"),
+                "recent_news": (
+                    prior_intel.get("recent_news")
+                    or enriched.get("recent_news")
+                ),
+            }
 
         if not intel.get("summary") and enriched.get("summary"):
             intel["summary"] = enriched["summary"]
@@ -601,14 +1107,13 @@ class DeepResearchService:
             llm_estimate = int(llm_estimate) if llm_estimate else None
         except (TypeError, ValueError):
             llm_estimate = None
-        # Prefer corroborated site/news numbers; LLM alone is advisory.
         emp_estimate = text_estimate or llm_estimate
         intel["employee_estimate"] = emp_estimate
 
         contacts: List[Dict] = []
         selected: List[Dict] = []
         require_floor = False
-        if identity_ok:
+        if identity_ok and do_contacts:
             contacts = list(enriched.get("contacts") or [])
             named_people = len({
                 (c.get("name") or "").strip().lower()
@@ -616,10 +1121,15 @@ class DeepResearchService:
                 if c.get("name") and not c.get("name_from_email")
                 and len(name_tokens(c.get("name"))) >= 2
             })
-            require_floor = should_require_contact_floor(
-                emp_estimate, min_contacts=min_contacts,
-                named_people=named_people,
-            )
+            # Alumni requests always aim for the contact floor — Goldman-scale
+            # firms are never "tiny" just because the crawl found few people.
+            if want_alum:
+                require_floor = True
+            else:
+                require_floor = should_require_contact_floor(
+                    emp_estimate, min_contacts=min_contacts,
+                    named_people=named_people,
+                )
 
             if self._cancelled(job_id):
                 return
@@ -657,6 +1167,7 @@ class DeepResearchService:
 
             scored.sort(key=lambda c: (
                 0 if c.get("criteria_match") else 1,
+                0 if c.get("alumni_match") else 1,
                 0 if c.get("found_via_criteria_search") else 1,
                 -(c.get("match_score") or 0),
                 0 if c.get("person_verified") else 1,
@@ -673,9 +1184,11 @@ class DeepResearchService:
                     else min(min_contacts, len(scored))
                 ),
                 criteria_terms=criteria_terms,
+                alumni_only_floor=want_alum,
             )
+        elif not identity_ok:
+            self.db.update_job(job_id, stage=stages[4], progress_current=4)
         else:
-            # Wrong site — do not hunt or attach people to a bad identity.
             self.db.update_job(job_id, stage=stages[4], progress_current=4)
 
         if self._cancelled(job_id):
@@ -694,6 +1207,9 @@ class DeepResearchService:
             criteria=criteria,
             job_id=job_id,
             identity_ok=identity_ok,
+            # Contacts-only continue must not flip scrape_status based on an
+            # empty enrich stub.
+            preserve_scrape_status=(mode == "contacts"),
         )
         if self._cancelled(job_id):
             # Persist already happened; still refuse to mark the job done.
@@ -718,13 +1234,26 @@ class DeepResearchService:
             )
         with_channel = sum(1 for c in selected if any(self._channel_ok(c)))
         persisted_count = len(saved_ids)
-        floor_met = (not require_floor) or persisted_count >= min_contacts
-        # 4/5 goal only evaluated when we required the contact floor.
-        criteria_ratio_met = (
-            not criteria_terms
-            or not require_floor
-            or criteria_hits >= CRITERIA_HIT_TARGET
-        )
+        alumni_hits = sum(
+            1 for c in selected
+            if c.get("alumni_match") and (
+                not saved_key_set or self._contact_key(c) in saved_key_set
+            )
+        ) if saved_ids else 0
+        # Alumni requests: floor means ≥min alumni matches saved, not just
+        # any five employees (and not role-only matches in mixed criteria).
+        if want_alum and require_floor:
+            floor_met = alumni_hits >= min_contacts
+            criteria_ratio_met = alumni_hits >= min(
+                CRITERIA_HIT_TARGET, min_contacts)
+            criteria_hits = alumni_hits
+        else:
+            floor_met = (not require_floor) or persisted_count >= min_contacts
+            criteria_ratio_met = (
+                not criteria_terms
+                or not require_floor
+                or criteria_hits >= CRITERIA_HIT_TARGET
+            )
         result_intel = (
             {
                 "error": enriched.get("mismatch") or "Wrong site",
@@ -751,6 +1280,8 @@ class DeepResearchService:
             "floor_required": require_floor,
             "floor_met": floor_met,
             "criteria_ratio_met": criteria_ratio_met,
+            "alumni_mode": want_alum,
+            "continue_mode": mode,
             "identity_verified": identity_ok,
             "deep_intel": result_intel,
             "contact_conflicts": conflicts,
@@ -800,6 +1331,43 @@ class DeepResearchService:
                 break
         return snippets[:15]
 
+    def _hunt_queries_for_term(
+            self, company_name: str, term: str) -> List[Tuple[str, str]]:
+        """Build (term, query) pairs for a criteria term, with alumni expansions."""
+        pairs: List[Tuple[str, str]] = []
+        if is_alumni_term(term):
+            aliases = school_aliases_for_term(term)
+            for alias in aliases:
+                if _ALUM_WORD_RE.fullmatch(alias.strip()):
+                    continue
+                # Skip ultra-short weak stems in search — too noisy
+                # (\"Penn\", \"Ross\") unless they include University/School.
+                a_l = alias.lower()
+                if len(alias.split()) == 1 and not re.search(
+                        r"university|college|school|kellogg|wharton|booth|"
+                        r"mit|ucla|nyu|upenn",
+                        a_l):
+                    if len(alias) < 8:
+                        continue
+                pairs.append((
+                    term,
+                    f'"{company_name}" "{alias}" site:linkedin.com/in'))
+                pairs.append((
+                    term,
+                    f'site:linkedin.com/in "{company_name}" "{alias}"'))
+            pairs.append((term, f'"{company_name}" "{term}" site:linkedin.com/in'))
+        else:
+            pairs.append((term, f'"{company_name}" "{term}" site:linkedin.com/in'))
+        # Dedup by query text
+        seen = set()
+        out: List[Tuple[str, str]] = []
+        for t, q in pairs:
+            if q in seen:
+                continue
+            seen.add(q)
+            out.append((t, q))
+        return out
+
     def _hunt_criteria_contacts(
             self,
             contacts: List[Dict],
@@ -812,35 +1380,67 @@ class DeepResearchService:
         if not criteria_terms:
             return list(merged.values())
 
+        want_alum = alumni_mode(criteria_terms)
+        budget = MAX_ALUMNI_SEARCHES if want_alum else MAX_LINKEDIN_SEARCHES
         searches = 0
-        for term in criteria_terms:
-            if searches >= MAX_LINKEDIN_SEARCHES:
-                break
-            query = f'"{company_name}" "{term}" site:linkedin.com/in'
-            try:
-                results = ddg_text_search(query, max_results=6) or []
-            except Exception:
-                results = []
-            searches += 1
-            for person in extract_people_from_snippets(
-                    results, company_name, role_hint=term):
+
+        def ingest(people: List[Dict], term: str):
+            for person in people:
+                # Drop alumni candidates that do not actually mention the school.
+                if is_alumni_term(term):
+                    aliases = school_aliases_for_term(term)
+                    if not _school_mentioned(
+                            aliases,
+                            person.get("role") or "",
+                            person.get("evidence") or ""):
+                        continue
+                    person["alumni_match"] = True
                 key = self._contact_key(person)
                 if key in merged:
                     existing = merged[key]
-                    if not existing.get("role") and person.get("role"):
-                        existing["role"] = person["role"]
-                    if not existing.get("linkedin_url") and person.get("linkedin_url"):
-                        existing["linkedin_url"] = person["linkedin_url"]
+                    for field in ("role", "linkedin_url", "evidence", "email"):
+                        if not existing.get(field) and person.get(field):
+                            existing[field] = person[field]
+                    if person.get("alumni_match"):
+                        existing["alumni_match"] = True
+                    aff = list(existing.get("affinity") or [])
+                    tag = f"criteria:{term}"
+                    if tag not in aff:
+                        aff.append(tag)
+                    existing["affinity"] = aff
                     continue
                 person.setdefault("affinity", []).append(f"criteria:{term}")
                 merged[key] = person
 
-            # Also try non-LinkedIn leadership pages mentioning the term.
-            if domain and searches < MAX_LINKEDIN_SEARCHES:
+        for term in criteria_terms:
+            for term_i, query in self._hunt_queries_for_term(company_name, term):
+                if searches >= budget:
+                    break
+                try:
+                    results = ddg_text_search(query, max_results=8) or []
+                except Exception:
+                    results = []
+                searches += 1
+                ingest(
+                    extract_people_from_snippets(
+                        results, company_name),
+                    term_i,
+                )
+            if searches >= budget:
+                break
+
+            # First-party pages mentioning the school/role.
+            if domain and searches < budget:
+                aliases = school_aliases_for_term(term) if is_alumni_term(term) else [term]
+                seed = next(
+                    (a for a in aliases if "university" in a.lower()
+                     or "school" in a.lower() or len(a) >= 8),
+                    aliases[0] if aliases else term,
+                )
                 try:
                     site_hits = ddg_text_search(
-                        f'site:{domain} "{term}" (team OR leadership OR people)',
-                        max_results=4,
+                        f'site:{domain} "{seed}" (team OR leadership OR people OR alumni)',
+                        max_results=5,
                     ) or []
                 except Exception:
                     site_hits = []
@@ -848,14 +1448,17 @@ class DeepResearchService:
                 for hit in site_hits:
                     title = hit.get("title") or ""
                     body = hit.get("body") or ""
-                    for m in _NAME_ROLE_RE.finditer(f"{title}. {body}"):
+                    blob = f"{title}. {body}"
+                    for m in _NAME_ROLE_RE.finditer(blob):
+                        pname = m.group(1).strip()
                         person = {
-                            "name": m.group(1).strip(),
+                            "name": pname,
                             "role": m.group(2).strip()[:80],
                             "email": "",
                             "linkedin_url": None,
                             "source_url": hit.get("href") or hit.get("url"),
-                            "evidence": f"{title}. {body}"[:280],
+                            "evidence": person_scoped_evidence(
+                                pname, title, body),
                             "on_domain": True,
                             "seniority_rank": 14,
                             "name_from_email": False,
@@ -863,9 +1466,7 @@ class DeepResearchService:
                         }
                         if len(name_tokens(person["name"])) < 2:
                             continue
-                        key = self._contact_key(person)
-                        if key not in merged:
-                            merged[key] = person
+                        ingest([person], term)
         return list(merged.values())
 
     def _ensure_contact_floor(
@@ -877,15 +1478,29 @@ class DeepResearchService:
             criteria_terms: List[str],
             min_contacts: int,
             require_floor: bool) -> List[Dict]:
-        """Keep searching until we have enough persistable people."""
+        """Keep searching until we have enough persistable people / alumni."""
         from ddg_search import ddg_text_search
 
         merged = self._merge_contacts(contacts)
         if not require_floor:
             return list(merged.values())
 
+        want_alum = alumni_mode(criteria_terms)
+        budget = MAX_ALUMNI_SEARCHES if want_alum else MAX_LINKEDIN_SEARCHES
+
         def rematerialize(people: List[Dict]) -> Dict[str, Dict]:
             return self._merge_contacts(people)
+
+        def counted(c: Dict) -> bool:
+            a = annotate_contact(c, check_mx=True)
+            email_ok, li_ok = self._channel_ok(a)
+            if not ((email_ok or li_ok) and a.get("name")
+                    and not a.get("name_from_email")):
+                return False
+            if want_alum:
+                match = score_criteria_match(a, criteria_terms)
+                return bool(match.get("alumni_match"))
+            return True
 
         def persistable_count() -> int:
             seen_ids = set()
@@ -895,38 +1510,76 @@ class DeepResearchService:
                 if oid in seen_ids:
                     continue
                 seen_ids.add(oid)
-                a = annotate_contact(c, check_mx=True)
-                email_ok, li_ok = self._channel_ok(a)
-                if (email_ok or li_ok) and a.get("name") and not a.get("name_from_email"):
+                if counted(c):
                     n += 1
             return n
 
-        # Prefer criteria-shaped queries first, then floor roles.
-        role_queries = list(criteria_terms) + [
-            r for r in _FLOOR_ROLE_QUERIES
-            if r.lower() not in {t.lower() for t in criteria_terms}
-        ]
-        searches = 0
-        for role in role_queries:
-            if persistable_count() >= min_contacts:
-                break
-            if searches >= MAX_LINKEDIN_SEARCHES:
-                break
-            query = f'"{company_name}" "{role}" site:linkedin.com/in'
-            try:
-                results = ddg_text_search(query, max_results=5) or []
-            except Exception:
-                results = []
-            searches += 1
-            for person in extract_people_from_snippets(
-                    results, company_name, role_hint=role):
-                key = self._contact_key(person)
-                if key not in merged:
-                    if any(t.lower() in (role or "").lower() for t in criteria_terms):
-                        person.setdefault("affinity", []).append(f"criteria:{role}")
-                    merged[key] = person
+        # Alumni: keep expanding school queries. Role floor queries are NOT
+        # used to pad an alumni request with the CEO / random VPs.
+        if want_alum:
+            pairs: List[Tuple[str, str]] = []
+            for term in criteria_terms:
+                if is_alumni_term(term):
+                    pairs.extend(self._hunt_queries_for_term(company_name, term))
+            # Dedup by query
+            seen_q = set()
+            uniq_pairs = []
+            for t, q in pairs:
+                if q in seen_q:
+                    continue
+                seen_q.add(q)
+                uniq_pairs.append((t, q))
+            searches = 0
+            for term, query in uniq_pairs:
+                if persistable_count() >= min_contacts:
+                    break
+                if searches >= budget:
+                    break
+                try:
+                    results = ddg_text_search(query, max_results=8) or []
+                except Exception:
+                    results = []
+                searches += 1
+                for person in extract_people_from_snippets(
+                        results, company_name):
+                    aliases = school_aliases_for_term(term)
+                    if not _school_mentioned(
+                            aliases,
+                            person.get("role") or "",
+                            person.get("evidence") or ""):
+                        continue
+                    person["alumni_match"] = True
+                    person.setdefault("affinity", []).append(f"criteria:{term}")
+                    key = self._contact_key(person)
+                    if key not in merged:
+                        merged[key] = person
+        else:
+            role_queries = list(criteria_terms) + [
+                r for r in _FLOOR_ROLE_QUERIES
+                if r.lower() not in {t.lower() for t in criteria_terms}
+            ]
+            searches = 0
+            for role in role_queries:
+                if persistable_count() >= min_contacts:
+                    break
+                if searches >= budget:
+                    break
+                query = f'"{company_name}" "{role}" site:linkedin.com/in'
+                try:
+                    results = ddg_text_search(query, max_results=5) or []
+                except Exception:
+                    results = []
+                searches += 1
+                for person in extract_people_from_snippets(
+                        results, company_name):
+                    key = self._contact_key(person)
+                    if key not in merged:
+                        if any(t.lower() in (role or "").lower()
+                               for t in criteria_terms):
+                            person.setdefault("affinity", []).append(
+                                f"criteria:{role}")
+                        merged[key] = person
 
-        # Fill LinkedIn/email gaps for anyone still missing a channel.
         need_fill = [
             c for c in merged.values()
             if c.get("name") and not c.get("name_from_email")
@@ -943,7 +1596,6 @@ class DeepResearchService:
             )
             merged = rematerialize(list(merged.values()) + filled)
 
-        # Last pass: for named people missing LinkedIn, search once each.
         if persistable_count() < min_contacts:
             updated = []
             for c in list(merged.values()):
@@ -969,11 +1621,11 @@ class DeepResearchService:
             domain: Optional[str],
             *,
             min_contacts: int,
-            criteria_terms: List[str]) -> List[Dict]:
-        """Pick ≥min_contacts when possible; bias to criteria matches."""
-        # Start from verified outreach selection with a high limit.
+            criteria_terms: List[str],
+            alumni_only_floor: bool = False) -> List[Dict]:
+        """Pick ≥min_contacts when possible; bias to criteria / alumni matches."""
         base = select_outreach_contacts(
-            scored, emails, domain, limit=max(min_contacts + 5, 10),
+            scored, emails, domain, limit=max(min_contacts + 8, 12),
             person_only=True, check_mx=True,
         )
         by_key = {self._contact_key(c): c for c in scored}
@@ -990,53 +1642,36 @@ class DeepResearchService:
                 return False
             return True
 
-        # Merge verification flags from select_outreach into scored rows.
-        for c in base:
+        for c in base + scored:
             key = self._contact_key(c)
             full = dict(by_key.get(key) or c)
             full.update({k: v for k, v in c.items() if v is not None})
             if criteria_terms:
                 full.update(score_criteria_match(full, criteria_terms))
-            if not accept(full):
-                continue
-            if key in seen:
+            if not accept(full) or key in seen:
                 continue
             seen.add(key)
             selected.append(full)
 
-        # Add more scored people (criteria first) until floor.
-        for c in scored:
-            if len(selected) >= max(min_contacts, CRITERIA_HIT_TARGET):
-                # Still prefer adding criteria matches up to a soft cap.
-                if len(selected) >= min_contacts + 3:
-                    break
-                if not c.get("criteria_match"):
-                    continue
-            key = self._contact_key(c)
-            if key in seen:
-                continue
-            if not accept(c):
-                continue
-            seen.add(key)
-            selected.append(c)
-
-        # Re-sort: criteria matches first, then quality.
         selected.sort(key=lambda c: (
             0 if c.get("criteria_match") else 1,
+            0 if c.get("alumni_match") else 1,
             -(c.get("match_score") or 0),
             0 if c.get("email_verified") else 1,
             0 if c.get("linkedin_verified") else 1,
             c.get("seniority_rank", 20),
         ))
 
-        # Ensure we keep at least CRITERIA_HIT_TARGET matches when available,
-        # then fill to min_contacts with best others.
+        alumni = [c for c in selected if c.get("alumni_match")]
         matches = [c for c in selected if c.get("criteria_match")]
         others = [c for c in selected if not c.get("criteria_match")]
+        if alumni_only_floor:
+            # Persist alumni only — never pad the floor with role-only hits.
+            return alumni[: max(min_contacts + 5, 12)]
+
         keep = matches[:max(CRITERIA_HIT_TARGET, min_contacts)]
         if len(keep) < min_contacts:
             keep.extend(others[: min_contacts - len(keep)])
-        # If we still have room and more matches, keep extras (goal: as many as possible)
         if len(keep) < len(matches):
             for c in matches:
                 if c not in keep:
@@ -1150,7 +1785,8 @@ class DeepResearchService:
             news_snippets: List[str],
             criteria: str,
             job_id: str,
-            identity_ok: bool = True) -> Dict:
+            identity_ok: bool = True,
+            preserve_scrape_status: bool = False) -> Dict:
         status = discovery_scrape_status(enriched)
         trusted = identity_ok and status != "wrong_site"
 
@@ -1170,6 +1806,9 @@ class DeepResearchService:
                     or by_name.get("domain") == domain_hint):
                 existing = by_name
 
+        if preserve_scrape_status and existing and existing.get("scrape_status"):
+            status = existing["scrape_status"]
+
         preserve = bool(existing) and not trusted
         deep_intel = {
             "key_changes": intel.get("key_changes") or [],
@@ -1186,30 +1825,41 @@ class DeepResearchService:
         updates: Dict[str, Any] = {}
         if trusted:
             updates = {
-                "scraped_at": enriched.get("scraped_at"),
-                "pages_scraped": enriched.get("pages_scraped"),
-                "pages_attempted": enriched.get("pages_attempted"),
                 "deep_intel": deep_intel,
                 "scrape_status": status,
-                "summary": intel.get("summary") or enriched.get("summary"),
-                "industry": enriched.get("industry"),
-                "product": enriched.get("product"),
-                "hook": enriched.get("hook"),
-                "recent_news": (
-                    intel.get("recent_news") or enriched.get("recent_news")
-                ),
-                "why_care": enriched.get("why_care"),
-                "location": enriched.get("location"),
-                "research_sources": enriched.get("research_sources") or [],
-                "research_quality": (
-                    "high" if enriched.get("ok")
-                    else (enriched.get("research_quality") or "medium")
-                ),
             }
-            if enriched.get("url"):
-                updates["url"] = enriched["url"]
-            if enriched.get("domain"):
-                updates["domain"] = enriched["domain"]
+            if not preserve_scrape_status:
+                updates.update({
+                    "scraped_at": enriched.get("scraped_at"),
+                    "pages_scraped": enriched.get("pages_scraped"),
+                    "pages_attempted": enriched.get("pages_attempted"),
+                })
+            # Refresh research fields unless this is a contacts-only continue
+            # (keep prior summary / sources intact).
+            if not preserve_scrape_status:
+                updates.update({
+                    "summary": intel.get("summary") or enriched.get("summary"),
+                    "industry": enriched.get("industry"),
+                    "product": enriched.get("product"),
+                    "hook": enriched.get("hook"),
+                    "recent_news": (
+                        intel.get("recent_news") or enriched.get("recent_news")
+                    ),
+                    "why_care": enriched.get("why_care"),
+                    "location": enriched.get("location"),
+                    "research_sources": enriched.get("research_sources") or [],
+                    "research_quality": (
+                        "high" if enriched.get("ok")
+                        else (enriched.get("research_quality") or "medium")
+                    ),
+                })
+                if enriched.get("url"):
+                    updates["url"] = enriched["url"]
+                if enriched.get("domain"):
+                    updates["domain"] = enriched["domain"]
+            else:
+                # Contacts-only: still store criteria on deep_intel.
+                updates["deep_intel"] = deep_intel
         elif preserve:
             # Keep prior trusted profile AND prior deep_intel. Only annotate
             # a transient last_error so interview research is not destroyed.
