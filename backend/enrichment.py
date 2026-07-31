@@ -15,7 +15,6 @@ from bs4 import BeautifulSoup
 
 from contact_enrich import enrich_contacts_outreach
 from contact_verify import (
-    GENERIC_LOCALS,
     annotate_contact,
     is_generic_inbox,
     linkedin_matches_person,
@@ -622,7 +621,6 @@ def extract_contact_candidates(
                     contact["linkedin_url"] = url
                     break
 
-    generic_locals = set(_LOCAL_PRIORITY) | set(GENERIC_LOCALS)
     return sorted(
         merged.values(),
         key=lambda c: (

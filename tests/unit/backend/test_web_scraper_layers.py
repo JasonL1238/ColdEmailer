@@ -1,6 +1,4 @@
 """Layered scraper: API discovery → HTTPX HTML → Playwright gate."""
-import json
-
 import pytest
 
 from web_scraper import (

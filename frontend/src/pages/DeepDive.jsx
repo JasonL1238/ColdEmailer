@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
 import {
-  AlertCircle, Building2, ExternalLink, History, Microscope, Search, Sparkles, Users, X,
+  AlertCircle, Building2, ChevronDown, ChevronRight, ExternalLink, History, Layers,
+  Microscope, Search, Sparkles, Users, X,
 } from 'lucide-react'
 import { companiesAPI, deepResearchAPI, errMessage } from '../api'
 import {
@@ -40,6 +41,8 @@ export default function DeepDive() {
   const [drawerCompany, setDrawerCompany] = useState(null)
   const [composeIds, setComposeIds] = useState(null)
   const [historyLoaded, setHistoryLoaded] = useState(false)
+  const [consolidated, setConsolidated] = useState([])
+  const [expanded, setExpanded] = useState(() => new Set())
   const pollRef = useRef(null)
   const loadHistoryRef = useRef(null)
 
@@ -142,7 +145,23 @@ export default function DeepDive() {
     } finally {
       setHistoryLoaded(true)
     }
+    // Separate try: a consolidated failure must not blank the run history.
+    try {
+      const { data } = await deepResearchAPI.consolidated()
+      setConsolidated(Array.isArray(data) ? data : [])
+    } catch {
+      /* keep prior UI */
+    }
   }, [pollRun])
+
+  const toggleExpanded = useCallback((id) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     loadHistoryRef.current = loadHistory
@@ -330,7 +349,7 @@ export default function DeepDive() {
             Deep dive
           </div>
         </div>
-        <h1 style={{ fontSize: 26, fontWeight: 700, letterSpacing: '-0.02em', margin: 0 }}>
+        <h1 className="hero-title">
           Interview-grade company research
         </h1>
         <p className="small muted" style={{ marginTop: 8, maxWidth: 640, lineHeight: 1.55 }}>
@@ -377,7 +396,7 @@ export default function DeepDive() {
             style={{
               gap: 12, flexWrap: 'wrap', alignItems: 'center',
               padding: '8px 12px', borderRadius: 10,
-              background: 'var(--surface-2, rgba(0,0,0,0.03))',
+              background: 'var(--surface-2)',
             }}
           >
             <label className="row" style={{ gap: 8, cursor: running || starting ? 'default' : 'pointer' }}>
@@ -646,6 +665,38 @@ export default function DeepDive() {
         />
       )}
 
+      {consolidated.length > 0 && (
+        <div style={{ marginBottom: 22 }}>
+          <div className="row-between" style={{ marginBottom: 10 }}>
+            <div className="row" style={{ gap: 8 }}>
+              <Layers size={14} />
+              <div style={{ fontWeight: 650, fontSize: 13.5 }}>By company</div>
+            </div>
+            <div className="tiny muted">
+              {consolidated.length} researched · every dive merged
+            </div>
+          </div>
+          <div className="stack" style={{ gap: 8 }}>
+            {consolidated.map((entry) => (
+              <CompanyDigest
+                key={entry.company.id}
+                entry={entry}
+                open={expanded.has(entry.company.id)}
+                onToggle={() => toggleExpanded(entry.company.id)}
+                onOpenCompany={() => openCompany(entry.company.id)}
+                onCompose={(ids) => setComposeIds(ids)}
+                onRerun={(term) => {
+                  setCompanyName(entry.company.name || '')
+                  setUrl(entry.company.url || '')
+                  setCriteria(term || '')
+                  window.scrollTo({ top: 0, behavior: 'smooth' })
+                }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
       {history.length > 0 && (
         <div>
           <div className="row" style={{ gap: 8, marginBottom: 10 }}>
@@ -736,6 +787,203 @@ export default function DeepDive() {
           onDone={() => setComposeIds(null)}
         />
       )}
+    </div>
+  )
+}
+
+const DIGEST_SECTIONS = [
+  ['key_changes', 'Key changes'],
+  ['improvements', 'Improvements'],
+  ['policy_highlights', 'Policies'],
+  ['differentiators', 'Differentiators'],
+  ['talking_points', 'Talking points'],
+]
+
+/** One company's whole deep-research history, collapsed into a single card. */
+function CompanyDigest({ entry, open, onToggle, onOpenCompany, onCompose, onRerun }) {
+  const { company, contacts, intel, runs } = entry
+  const criteria = entry.criteria || []
+  const sections = DIGEST_SECTIONS
+    .map(([key, label]) => [label, intel?.[key] || []])
+    .filter(([, items]) => items.length > 0)
+  const bulletTotal = sections.reduce((n, [, items]) => n + items.length, 0)
+  const readyIds = (contacts?.groups || [])
+    .flatMap((g) => g.contacts)
+    .filter((c) => c.email)
+    .map((c) => c.id)
+  const uniqueReady = [...new Set(readyIds)]
+
+  return (
+    <div className="card">
+      <button
+        type="button"
+        className="card-pad row-between"
+        onClick={onToggle}
+        aria-expanded={open}
+        style={{
+          width: '100%', textAlign: 'left', cursor: 'pointer', border: 'none',
+          background: 'none', font: 'inherit', color: 'inherit',
+        }}
+      >
+        <div className="row" style={{ gap: 10, minWidth: 0 }}>
+          {open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 650, fontSize: 14 }}>{company.name}</div>
+            <div className="tiny muted" style={{ marginTop: 2 }}>
+              {entry.run_count} {entry.run_count === 1 ? 'dive' : 'dives'}
+              {' · '}{contacts?.total ?? 0} contacts
+              {contacts?.matched ? ` · ${contacts.matched} matched` : ''}
+              {bulletTotal ? ` · ${bulletTotal} findings` : ''}
+              {entry.last_researched_at ? ` · ${timeAgo(entry.last_researched_at)}` : ''}
+            </div>
+          </div>
+        </div>
+        <div className="row" style={{ gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          {criteria.length === 0 && <Chip tone="gray">No criteria</Chip>}
+          {criteria.slice(0, 3).map((c) => (
+            <Chip key={c} tone="violet" title={c}>{c}</Chip>
+          ))}
+          {criteria.length > 3 && (
+            <Chip tone="gray">+{criteria.length - 3}</Chip>
+          )}
+        </div>
+      </button>
+
+      {open && (
+        <div className="card-pad" style={{ paddingTop: 0 }}>
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+            <Button size="sm" onClick={onOpenCompany} icon={Building2}>Open company</Button>
+            {uniqueReady.length > 0 && (
+              <Button size="sm" onClick={() => onCompose(uniqueReady)} icon={Sparkles}>
+                Draft {uniqueReady.length}
+              </Button>
+            )}
+            <Button size="sm" onClick={() => onRerun(criteria[criteria.length - 1] || '')}>
+              Dive again
+            </Button>
+            {company.domain && (
+              <span className="tiny muted" style={{ alignSelf: 'center' }}>{company.domain}</span>
+            )}
+          </div>
+
+          {runs.length > 1 && (
+            <div style={{ marginBottom: 14 }}>
+              <DigestLabel>Runs</DigestLabel>
+              <div className="stack" style={{ gap: 4 }}>
+                {runs.map((r, i) => (
+                  <div key={r.job_id || i} className="row-between tiny">
+                    <span>{r.criteria || <span className="muted">No criteria</span>}</span>
+                    <span className="muted">
+                      {r.bullet_count ? `${r.bullet_count} findings` : '—'}
+                      {r.researched_at ? ` · ${timeAgo(r.researched_at)}` : ''}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {sections.length > 0 && (
+            <div className="stack" style={{ gap: 12, marginBottom: 14 }}>
+              {sections.map(([label, items]) => (
+                <div key={label}>
+                  <DigestLabel>{label}</DigestLabel>
+                  <ul className="deep-list">
+                    {items.map((item) => (
+                      <li key={item.text}>
+                        {item.text}
+                        {/* Only tag a finding when the dives disagree about it. */}
+                        {criteria.length > 1 && item.criteria?.length > 0
+                          && item.criteria.length < criteria.length && (
+                          <span className="tiny muted"> — {item.criteria.join(', ')}</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(contacts?.groups?.length > 0 || contacts?.unmatched?.length > 0) && (
+            <div className="stack" style={{ gap: 12 }}>
+              {contacts.groups.map((group) => (
+                <ContactGroup
+                  key={group.term}
+                  label={group.term}
+                  people={group.contacts}
+                  onCompose={onCompose}
+                />
+              ))}
+              {contacts.unmatched.length > 0 && (
+                <ContactGroup
+                  label="Other contacts"
+                  people={contacts.unmatched}
+                  onCompose={onCompose}
+                  muted
+                />
+              )}
+            </div>
+          )}
+
+          {sections.length === 0 && !contacts?.total && (
+            <div className="small muted">No grounded findings or contacts saved yet.</div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DigestLabel({ children }) {
+  return (
+    <div
+      className="tiny"
+      style={{
+        fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em',
+        marginBottom: 6, opacity: 0.7,
+      }}
+    >
+      {children}
+    </div>
+  )
+}
+
+function ContactGroup({ label, people, onCompose, muted }) {
+  const emailable = people.filter((p) => p.email).map((p) => p.id)
+  return (
+    <div>
+      <div className="row-between" style={{ marginBottom: 6 }}>
+        <DigestLabel>
+          {muted ? label : <Chip tone="violet">{label}</Chip>}
+          {' '}<span className="muted">{people.length}</span>
+        </DigestLabel>
+        {emailable.length > 0 && (
+          <button
+            type="button"
+            className="linkish tiny"
+            onClick={() => onCompose(emailable)}
+          >
+            Draft {emailable.length}
+          </button>
+        )}
+      </div>
+      <div className="stack" style={{ gap: 3 }}>
+        {people.map((p) => (
+          <div key={p.id} className="row-between tiny">
+            <span style={{ minWidth: 0 }}>
+              <strong>{p.name || p.email || 'Unnamed'}</strong>
+              {p.role && <span className="muted"> · {p.role}</span>}
+            </span>
+            <span className="row" style={{ gap: 5 }}>
+              {p.email
+                ? <Chip tone="green">Email</Chip>
+                : p.linkedin_url ? <Chip tone="accent">LinkedIn</Chip>
+                  : <Chip tone="gray">No channel</Chip>}
+            </span>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }

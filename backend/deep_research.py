@@ -34,6 +34,7 @@ from discovery import (
     discovery_scrape_status,
 )
 from enrichment import EnrichmentService, select_outreach_contacts
+from research_digest import append_run
 
 try:
     from llm_client import complete_json, get_cloud_llm_provider
@@ -2102,6 +2103,16 @@ class DeepResearchService:
             "news_snippets": news_snippets[:10],
             "researched_at": enriched.get("scraped_at"),
         }
+        # Append rather than replace: a second dive with different criteria
+        # must not erase what the first one found. Flat keys above still mean
+        # "latest run" for every existing reader.
+        deep_intel = append_run(
+            existing.get("deep_intel") if existing else None,
+            deep_intel,
+            criteria=criteria,
+            job_id=job_id,
+            researched_at=enriched.get("scraped_at"),
+        )
 
         updates: Dict[str, Any] = {}
         if trusted:

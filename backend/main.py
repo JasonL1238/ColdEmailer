@@ -28,6 +28,7 @@ from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
                 repair_speculative_company_summaries,
                 repair_unverified_legacy_replies)
 from deep_research import DeepResearchService
+from research_digest import consolidate, has_deep_research
 from discovery import DiscoveryService, discovery_scrape_status
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
                             TemplateUnavailable)
@@ -35,10 +36,10 @@ from email_sender import EmailSender
 from enrichment import EnrichmentService
 from generation import GenerationBusy, GenerationService
 from models import (
-    EMAIL_ADDRESS_RE, BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
+    BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
     ContactCreate, ContactUpdate, DeepResearchRequest, DiscoveryRequest,
     EmailUpdate, EnrichRequest, GenerateRequest, ProfileUpdate, ResumeUpdate,
-    SendRequest, LinkedInDraftRequest, validate_linkedin_profile_url,
+    SendRequest, LinkedInDraftRequest,
 )
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
@@ -276,6 +277,28 @@ async def start_deep_research(payload: DeepResearchRequest):
 @app.get("/api/deep-research")
 async def list_deep_research_jobs():
     return [_parse_job(j) for j in deep_research.list_jobs(limit=20)]
+
+
+# Must stay above /api/deep-research/{job_id} — a literal path declared after
+# a path parameter would be swallowed by it.
+@app.get("/api/deep-research/consolidated")
+async def list_consolidated_research(search: Optional[str] = None):
+    """Every company that has been deep-dived, with all of its runs merged.
+
+    Two dives on one company — even with different criteria — come back as a
+    single section rather than two unrelated job rows.
+    """
+    out = []
+    for company in db.list_companies(search=search):
+        if not has_deep_research(company):
+            continue
+        contacts = db.list_contacts(company_id=company["id"])
+        out.append(consolidate(company, contacts))
+    out.sort(
+        key=lambda c: (c.get("last_researched_at") or "", c["company"].get("name") or ""),
+        reverse=True,
+    )
+    return out
 
 
 @app.get("/api/deep-research/{job_id}")

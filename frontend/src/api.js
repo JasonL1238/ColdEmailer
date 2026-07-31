@@ -27,6 +27,9 @@ export const discoveryAPI = {
 export const deepResearchAPI = {
   start: (payload) => api.post('/deep-research', payload),
   list: () => api.get('/deep-research'),
+  consolidated: (search) => api.get('/deep-research/consolidated', {
+    params: search ? { search } : undefined,
+  }),
   get: (id) => api.get(`/deep-research/${id}`),
   cancel: (id) => api.post(`/deep-research/${id}/cancel`),
 }
