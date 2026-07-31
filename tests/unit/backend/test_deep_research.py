@@ -1,7 +1,11 @@
 """Deep research: criteria matching, alumni hunting, contact floor."""
+import time
+
 from deep_research import (
     CRITERIA_HIT_TARGET,
+    HARD_STOP_SEC,
     MIN_CONTACTS,
+    UNTIL_MAX_ROUNDS,
     DeepResearchService,
     alumni_mode,
     estimate_employee_count,
@@ -585,6 +589,137 @@ class TestContactFloorSelection:
         assert len(merged) == 1
         only = next(iter(merged.values()))
         assert "linkedin.com/in/jane-doe" in (only.get("linkedin_url") or "")
+
+
+class TestUntilCriteriaAndHardStop:
+    def test_hard_stop_is_thirty_minutes(self):
+        assert HARD_STOP_SEC == 30 * 60
+
+    def test_timed_out_on_deadline(self):
+        svc = DeepResearchService(db=None, enrichment=None)
+        assert svc._timed_out(time.monotonic() - 1) is True
+        assert svc._timed_out(time.monotonic() + 60) is False
+
+    def test_select_respects_raised_matched_cap(self, monkeypatch):
+        scored = []
+        for i in range(25):
+            scored.append({
+                "name": f"Person{i} Smith",
+                "role": "VP Engineering",
+                "email": f"p{i}@acme.com",
+                "linkedin_url": f"https://www.linkedin.com/in/p{i}-smith",
+                "email_kind": "personal",
+                "email_verified": True,
+                "email_person_match": True,
+                "email_mx_ok": True,
+                "on_domain": True,
+                "linkedin_verified": True,
+                "person_verified": True,
+                "name_from_email": False,
+                "criteria_match": True,
+                "match_score": 1.0,
+                "matched_terms": ["VP Engineering"],
+                "affinity": [],
+            })
+        import deep_research as dr
+        monkeypatch.setattr(
+            dr, "select_outreach_contacts",
+            lambda contacts, emails, domain, limit=5, **_k: list(contacts)[:limit],
+        )
+        svc = DeepResearchService(db=None, enrichment=None)
+        selected = svc._select_persistable(
+            scored, [c["email"] for c in scored], "acme.com",
+            min_contacts=25,
+            criteria_terms=["VP Engineering"],
+            max_matched=25,
+        )
+        assert sum(1 for c in selected if c.get("criteria_match")) == 25
+
+    def test_until_floor_stops_when_should_stop_fires(self, monkeypatch):
+        monkeypatch.setattr(
+            "ddg_search.ddg_text_search",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not search")),
+        )
+        svc = DeepResearchService(db=None, enrichment=None)
+        out = svc._ensure_contact_floor(
+            [],
+            company_name="Acme",
+            domain="acme.com",
+            criteria_terms=["VP Engineering"],
+            min_contacts=5,
+            require_floor=True,
+            target_criteria_matches=5,
+            should_stop=lambda: True,
+        )
+        assert out == []
+        assert UNTIL_MAX_ROUNDS >= 2
+
+    def test_linkedin_fill_stop_keeps_unvisited_contacts(self, monkeypatch):
+        """Hard-stop mid LinkedIn backfill must not drop or duplicate people."""
+        import deep_research as dr
+
+        people = [
+            {
+                "name": "Jane Doe",
+                "role": "VP Engineering",
+                "email": "jane.doe@acme.com",
+                "linkedin_url": "",
+                "email_kind": "personal",
+                "email_verified": True,
+                "email_person_match": True,
+                "email_mx_ok": True,
+                "on_domain": True,
+                "name_from_email": False,
+                "affinity": ["criteria:VP Engineering"],
+            },
+            {
+                "name": "Alex Kim",
+                "role": "VP Engineering",
+                "email": "alex.kim@acme.com",
+                "linkedin_url": "",
+                "email_kind": "personal",
+                "email_verified": True,
+                "email_person_match": True,
+                "email_mx_ok": True,
+                "on_domain": True,
+                "name_from_email": False,
+                "affinity": ["criteria:VP Engineering"],
+            },
+        ]
+        calls = {"n": 0}
+
+        def fake_li(name, _company):
+            calls["n"] += 1
+            slug = name.lower().replace(" ", "-")
+            return f"https://www.linkedin.com/in/{slug}"
+
+        monkeypatch.setattr(dr, "find_linkedin_via_search", fake_li)
+        monkeypatch.setattr(
+            dr, "annotate_contact",
+            lambda c, **_k: {**c, "person_verified": True},
+        )
+        monkeypatch.setattr(
+            "ddg_search.ddg_text_search", lambda *_a, **_k: [],
+        )
+
+        def stop_after_first():
+            return calls["n"] >= 1
+
+        svc = DeepResearchService(db=None, enrichment=None)
+        out = svc._ensure_contact_floor(
+            people,
+            company_name="Acme",
+            domain="acme.com",
+            criteria_terms=["VP Engineering"],
+            min_contacts=5,
+            require_floor=True,
+            target_criteria_matches=5,
+            should_stop=stop_after_first,
+        )
+        names = [(c.get("name") or "") for c in out]
+        assert "Jane Doe" in names
+        assert "Alex Kim" in names
+        assert len(names) == len(set(names))
 
 
 class TestDeepEnrichMode:

@@ -77,7 +77,14 @@ class DeepResearchRequest(BaseModel):
         max_length=500,
         description="Roles, schools, or traits to prioritize (e.g. 'VP Engineering, Penn alumni')",
     )
-    min_contacts: int = Field(5, ge=1, le=15)
+    min_contacts: int = Field(5, ge=1, le=50)
+    # Keep hunting until this many criteria-matched people are found (or the
+    # 30-minute hard stop). None = single-pass floor behavior.
+    target_criteria_matches: Optional[int] = Field(
+        None, ge=1, le=50,
+        description="Stop only after finding this many criteria matches "
+                    "(hard-capped at 30 minutes).",
+    )
     # Continue an existing dive: contacts | research | both. Omit for a full run.
     continue_mode: Optional[str] = Field(
         None, pattern="^(contacts|research|both)$")

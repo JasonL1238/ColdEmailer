@@ -6,13 +6,15 @@ Goes beyond normal enrichment:
   - Extract key changes, improvements, and differentiating policies
   - Hunt contacts that match user criteria; aim for ≥5 people with
     LinkedIn and/or email when the company appears to have ≥5 employees
-    (best-effort; floor_met reports whether the target was hit)
+  - Optional until-N mode keeps hunting until N criteria matches
+  - Every run hard-stops at 30 minutes and saves partial results
 """
 from __future__ import annotations
 
 import re
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from contact_enrich import (
     enrich_contacts_outreach,
@@ -47,6 +49,16 @@ MAX_GENERAL_ROSTER_SEARCHES = 10
 MAX_OUTREACH_LOOKUPS = 12
 MAX_MATCHED_PERSIST = 20
 MAX_OTHER_PERSIST = 12
+# Wall-clock cap for every deep dive (including until-N mode).
+HARD_STOP_SEC = 30 * 60
+# Don't start another expensive stage with less than this remaining.
+MIN_STAGE_BUDGET_SEC = 45
+# Reserve wall-clock for contact hunting so the crawl cannot burn the
+# whole hard-stop window (especially important for until-N).
+CONTACT_RESERVE_SEC = 5 * 60
+CONTACT_RESERVE_UNTIL_SEC = 15 * 60
+# Extra search rounds when hunting until a criteria-match target.
+UNTIL_MAX_ROUNDS = 8
 
 # Broader fallback roles used only to hit the contact floor when criteria
 # are role-shaped (never used to pad an alumni-only request).
@@ -849,6 +861,7 @@ class DeepResearchService:
             url: Optional[str] = None,
             contact_criteria: str = "",
             min_contacts: int = MIN_CONTACTS,
+            target_criteria_matches: Optional[int] = None,
             continue_mode: Optional[str] = None) -> Dict:
         name = (company_name or "").strip()
         existing = None
@@ -874,12 +887,20 @@ class DeepResearchService:
             url = url or existing.get("url")
         if not name:
             raise ValueError("Company name is required")
-        min_contacts = max(1, min(int(min_contacts or MIN_CONTACTS), 15))
+        min_contacts = max(1, min(int(min_contacts or MIN_CONTACTS), 50))
+        target_n: Optional[int] = None
+        if target_criteria_matches is not None:
+            target_n = max(1, min(int(target_criteria_matches), 50))
+            min_contacts = max(min_contacts, target_n)
         # Prefer prior criteria when continuing without a new one.
         if mode and not (contact_criteria or "").strip() and existing:
             prior = existing.get("deep_intel") or {}
             if isinstance(prior, dict) and prior.get("contact_criteria"):
                 contact_criteria = prior["contact_criteria"]
+        if target_n and not (contact_criteria or "").strip():
+            raise ValueError(
+                "target_criteria_matches requires contact_criteria "
+                "(who to keep searching for).")
 
         with self._lock:
             # Slot is held until the worker thread exits (_run_safe finally),
@@ -902,7 +923,9 @@ class DeepResearchService:
                 "url": url,
                 "contact_criteria": contact_criteria,
                 "min_contacts": min_contacts,
+                "target_criteria_matches": target_n,
                 "continue_mode": mode,
+                "hard_stop_sec": HARD_STOP_SEC,
             })
             self._running_job = job["id"]
 
@@ -910,7 +933,7 @@ class DeepResearchService:
             target=self._run_safe,
             args=(
                 job["id"], name, company_id, url, contact_criteria,
-                min_contacts, mode,
+                min_contacts, mode, target_n,
             ),
             daemon=True,
         )
@@ -945,13 +968,17 @@ class DeepResearchService:
         job = self.db.get_job(job_id)
         return not job or job.get("status") != "running"
 
+    def _timed_out(self, deadline: float) -> bool:
+        return time.monotonic() >= deadline
+
     def _run_safe(
             self, job_id, name, company_id, url, criteria, min_contacts,
-            continue_mode=None):
+            continue_mode=None, target_criteria_matches=None):
         try:
             self._run(
                 job_id, name, company_id, url, criteria, min_contacts,
-                continue_mode=continue_mode)
+                continue_mode=continue_mode,
+                target_criteria_matches=target_criteria_matches)
         except Exception as exc:  # pragma: no cover
             self.db.finish_job(
                 job_id, status="failed", error=str(exc)[:500],
@@ -970,15 +997,45 @@ class DeepResearchService:
             url: Optional[str],
             criteria: str,
             min_contacts: int,
-            continue_mode: Optional[str] = None):
+            continue_mode: Optional[str] = None,
+            target_criteria_matches: Optional[int] = None):
         criteria_terms = parse_criteria(criteria)
         want_alum = alumni_mode(criteria_terms)
+        until_n = (
+            max(1, min(int(target_criteria_matches), 50))
+            if target_criteria_matches is not None else None
+        )
         mode = (continue_mode or "").strip().lower() or None
         do_crawl = mode is None or mode in {"research", "both"}
         do_contacts = mode is None or mode in {"contacts", "both"}
         # Contacts-only continue: skip the heavy site crawl.
         if mode == "contacts":
             do_crawl = False
+        deadline = time.monotonic() + HARD_STOP_SEC
+        timed_out = False
+
+        def should_stop() -> bool:
+            nonlocal timed_out
+            if self._cancelled(job_id):
+                return True
+            if self._timed_out(deadline):
+                timed_out = True
+                return True
+            return False
+
+        def budget_left(min_needed: float = MIN_STAGE_BUDGET_SEC) -> bool:
+            """False when too little wall-clock remains to start a stage.
+
+            Does not set timed_out — that flag is reserved for the real
+            hard-stop deadline so the UI doesn't claim "30 min" early.
+            """
+            nonlocal timed_out
+            if self._cancelled(job_id):
+                return False
+            if self._timed_out(deadline):
+                timed_out = True
+                return False
+            return (deadline - time.monotonic()) >= min_needed
 
         stages = [
             "Deep crawling company site" if do_crawl else "Loading company",
@@ -988,30 +1045,84 @@ class DeepResearchService:
             else "Keeping existing intel",
             "Hunting criteria-matched contacts" if do_contacts
             else "Keeping existing contacts",
-            "Filling contact floor" if do_contacts else "Skipping contact floor",
+            (
+                f"Hunting until {until_n} criteria matches"
+                if do_contacts and until_n
+                else ("Filling contact floor" if do_contacts
+                      else "Skipping contact floor")
+            ),
             "Saving results",
         ]
         self.db.update_job(
             job_id, stage=stages[0], progress_current=0, progress_total=len(stages))
         self.db.log_event(
             "deep_research", job_id, "started",
-            f"{name} continue={mode or 'full'}")
+            f"{name} continue={mode or 'full'}"
+            + (f" until={until_n}" if until_n else ""))
 
         profile = self.db.get_profile()
         existing_company = (
             self.db.get_company(company_id) if company_id else None
         )
-        if self._cancelled(job_id):
+        if should_stop():
+            if not timed_out:
+                return
+            # Timed out before crawl — nothing useful to save.
+            self.db.finish_job(
+                job_id, status="done",
+                result={
+                    "company_name": name,
+                    "timed_out": True,
+                    "contacts_saved": 0,
+                    "criteria_matches": 0,
+                    "target_criteria_matches": until_n,
+                    "floor_met": False,
+                },
+                only_if_running=True,
+            )
             return
 
         if do_crawl:
-            enriched = self.enrichment.enrich(
-                name,
-                url,
-                preferred_school=profile.get("school"),
-                preferred_affiliations=profile.get("affiliations"),
-                mode="deep",
-            )
+            remaining = deadline - time.monotonic()
+            # Cap the crawl so contact hunting still gets reserved time
+            # (skip reserve on research-only continues that won't hunt).
+            if do_contacts:
+                reserve = (
+                    CONTACT_RESERVE_UNTIL_SEC if until_n
+                    else CONTACT_RESERVE_SEC
+                )
+            else:
+                reserve = MIN_STAGE_BUDGET_SEC
+            crawl_budget = min(remaining, max(30.0, HARD_STOP_SEC - reserve))
+            if remaining <= 0 or crawl_budget <= 0:
+                if remaining <= 0:
+                    timed_out = True
+                enriched = {
+                    "url": url,
+                    "domain": None,
+                    "summary": None,
+                    "product": None,
+                    "hook": None,
+                    "recent_news": None,
+                    "why_care": None,
+                    "industry": None,
+                    "location": None,
+                    "contacts": [],
+                    "emails": [],
+                    "page_texts": [],
+                    "research_sources": [],
+                    "ok": False,
+                    "identity_verified": True,
+                }
+            else:
+                enriched = self.enrichment.enrich(
+                    name,
+                    url,
+                    preferred_school=profile.get("school"),
+                    preferred_affiliations=profile.get("affiliations"),
+                    mode="deep",
+                    deadline_sec=crawl_budget,
+                )
         else:
             # Contacts-only: reuse the stored company identity.
             enriched = {
@@ -1038,7 +1149,7 @@ class DeepResearchService:
                 "ok": True,
                 "identity_verified": True,
             }
-        if self._cancelled(job_id):
+        if should_stop() and not timed_out:
             return
 
         status = discovery_scrape_status(enriched) if do_crawl else (
@@ -1055,7 +1166,7 @@ class DeepResearchService:
             prior_intel = dict(existing_company["deep_intel"])
         news_snippets: List[str] = list(prior_intel.get("news_snippets") or [])
         page_texts = list(enriched.get("page_texts") or [])
-        if do_crawl or mode == "research":
+        if (do_crawl or mode == "research") and budget_left():
             news_snippets = self._gather_news(name, enriched.get("domain"))
         combined_site = "\n\n".join([
             *page_texts[:16],
@@ -1066,14 +1177,21 @@ class DeepResearchService:
             enriched.get("why_care") or "",
         ])
 
-        if self._cancelled(job_id):
+        if should_stop() and not timed_out:
             return
         self.db.update_job(job_id, stage=stages[2], progress_current=2)
         if do_crawl or mode == "research":
-            intel = llm_deep_intel(name, combined_site, news_snippets, criteria)
-            if not intel:
+            # Hard-stop / low budget: skip LLM so we stay near the 30-min cap.
+            if not budget_left():
                 intel = heuristic_deep_intel(
-                    combined_site, news_snippets, company_name=name)
+                    combined_site, news_snippets, company_name=name,
+                ) or {}
+            else:
+                intel = llm_deep_intel(
+                    name, combined_site, news_snippets, criteria)
+                if not intel:
+                    intel = heuristic_deep_intel(
+                        combined_site, news_snippets, company_name=name)
             # Merge onto prior intel so continue-research doesn't erase bullets.
             for key in (
                 "key_changes", "improvements", "policy_highlights",
@@ -1116,7 +1234,7 @@ class DeepResearchService:
         contacts: List[Dict] = []
         selected: List[Dict] = []
         require_floor = False
-        if identity_ok and do_contacts:
+        if identity_ok and do_contacts and not (should_stop() and not timed_out):
             contacts = list(enriched.get("contacts") or [])
             named_people = len({
                 (c.get("name") or "").strip().lower()
@@ -1124,9 +1242,10 @@ class DeepResearchService:
                 if c.get("name") and not c.get("name_from_email")
                 and len(name_tokens(c.get("name"))) >= 2
             })
-            # Alumni requests always aim for the contact floor — Goldman-scale
-            # firms are never "tiny" just because the crawl found few people.
-            if want_alum:
+            # Alumni / until-N requests always aim for the contact floor —
+            # Goldman-scale firms are never "tiny" just because the crawl
+            # found few people.
+            if want_alum or until_n:
                 require_floor = True
             else:
                 require_floor = should_require_contact_floor(
@@ -1134,32 +1253,39 @@ class DeepResearchService:
                     named_people=named_people,
                 )
 
-            if self._cancelled(job_id):
+            if should_stop() and not timed_out:
                 return
             self.db.update_job(job_id, stage=stages[3], progress_current=3)
-            contacts = self._hunt_criteria_contacts(
-                contacts, name, enriched.get("domain"), criteria_terms)
+            if budget_left():
+                contacts = self._hunt_criteria_contacts(
+                    contacts, name, enriched.get("domain"), criteria_terms,
+                    should_stop=should_stop,
+                )
 
-            contacts = enrich_contacts_outreach(
-                contacts,
-                company_name=name,
-                domain=enriched.get("domain"),
-                check_mx=True,
-                max_linkedin_lookups=MAX_OUTREACH_LOOKUPS,
-                max_email_lookups=MAX_OUTREACH_LOOKUPS,
-            )
+            if budget_left():
+                contacts = enrich_contacts_outreach(
+                    contacts,
+                    company_name=name,
+                    domain=enriched.get("domain"),
+                    check_mx=True,
+                    max_linkedin_lookups=MAX_OUTREACH_LOOKUPS,
+                    max_email_lookups=MAX_OUTREACH_LOOKUPS,
+                )
 
-            if self._cancelled(job_id):
+            if should_stop() and not timed_out:
                 return
             self.db.update_job(job_id, stage=stages[4], progress_current=4)
-            contacts = self._ensure_contact_floor(
-                contacts,
-                company_name=name,
-                domain=enriched.get("domain"),
-                criteria_terms=criteria_terms,
-                min_contacts=min_contacts,
-                require_floor=require_floor,
-            )
+            if budget_left(min_needed=15):
+                contacts = self._ensure_contact_floor(
+                    contacts,
+                    company_name=name,
+                    domain=enriched.get("domain"),
+                    criteria_terms=criteria_terms,
+                    min_contacts=min_contacts,
+                    require_floor=require_floor,
+                    target_criteria_matches=until_n,
+                    should_stop=should_stop,
+                )
 
             scored: List[Dict] = []
             for c in contacts:
@@ -1188,17 +1314,24 @@ class DeepResearchService:
                 ),
                 criteria_terms=criteria_terms,
                 alumni_only_floor=want_alum,
+                max_matched=max(MAX_MATCHED_PERSIST, until_n or 0),
             )
         elif not identity_ok:
             self.db.update_job(job_id, stage=stages[4], progress_current=4)
         else:
             self.db.update_job(job_id, stage=stages[4], progress_current=4)
 
-        if self._cancelled(job_id):
+        # User cancel abandons before durable writes. Hard-stop timeout still
+        # saves whatever we found so far.
+        if should_stop() and not timed_out:
             return
+        # Re-check timeout so the result flag is accurate even if we already
+        # broke out of hunting loops.
+        if self._timed_out(deadline):
+            timed_out = True
         self.db.update_job(job_id, stage=stages[5], progress_current=5)
 
-        # Last chance before mutating durable state.
+        # Last chance before mutating durable state (cancel only).
         if self._cancelled(job_id):
             return
         company = self._persist_company(
@@ -1210,9 +1343,13 @@ class DeepResearchService:
             criteria=criteria,
             job_id=job_id,
             identity_ok=identity_ok,
-            # Contacts-only continue must not flip scrape_status based on an
-            # empty enrich stub.
-            preserve_scrape_status=(mode == "contacts"),
+            # Contacts-only continue, or a timeout against an existing company
+            # / failed crawl, must not overwrite a richer prior scrape.
+            preserve_scrape_status=(
+                mode == "contacts"
+                or (timed_out and bool(existing_company))
+                or (timed_out and not enriched.get("ok"))
+            ),
         )
         if self._cancelled(job_id):
             # Persist already happened; still refuse to mark the job done.
@@ -1236,10 +1373,14 @@ class DeepResearchService:
             cid = saved_by_key.get(self._contact_key(c))
             if not cid:
                 continue
-            is_match = (
-                bool(c.get("alumni_match")) if want_alum
-                else bool(c.get("criteria_match"))
-            )
+            # Until-N counts any criteria match; alumni-only floor still
+            # requires alumni_match so CEOs don't inflate the alumni bucket.
+            if until_n:
+                is_match = bool(c.get("criteria_match") or c.get("alumni_match"))
+            elif want_alum:
+                is_match = bool(c.get("alumni_match"))
+            else:
+                is_match = bool(c.get("criteria_match"))
             if is_match:
                 matched_ids.append(cid)
             else:
@@ -1248,11 +1389,14 @@ class DeepResearchService:
         criteria_hits = len(matched_ids)
         with_channel = sum(1 for c in selected if any(self._channel_ok(c)))
         persisted_count = len(saved_ids)
-        # Alumni floor = matched alumni count (matched_ids), not total saved.
-        if want_alum and require_floor:
-            floor_met = criteria_hits >= min_contacts
-            criteria_ratio_met = criteria_hits >= min(
-                CRITERIA_HIT_TARGET, min_contacts)
+        target_for_floor = until_n or min_contacts
+        # Alumni / until-N floor = matched criteria count, not total saved.
+        if (want_alum or until_n) and require_floor:
+            floor_met = criteria_hits >= target_for_floor
+            criteria_ratio_met = criteria_hits >= (
+                target_for_floor if until_n
+                else min(CRITERIA_HIT_TARGET, min_contacts)
+            )
         else:
             floor_met = (not require_floor) or persisted_count >= min_contacts
             criteria_ratio_met = (
@@ -1283,6 +1427,13 @@ class DeepResearchService:
             "matched_contact_ids": matched_ids,
             "other_contact_ids": other_ids,
             "criteria_matches": criteria_hits,
+            # Only report until-N outcome when this run actually hunted contacts.
+            "target_criteria_matches": until_n if do_contacts else None,
+            "target_met": (
+                (criteria_hits >= until_n)
+                if (until_n and do_contacts) else None
+            ),
+            "timed_out": timed_out,
             "with_email_or_linkedin": with_channel,
             "employee_estimate": emp_estimate if identity_ok else None,
             "floor_required": require_floor,
@@ -1300,7 +1451,8 @@ class DeepResearchService:
         if finished:
             self.db.log_event(
                 "company", company["id"], "deep_researched",
-                f"{contacts_added} contacts, {criteria_hits} criteria matches")
+                f"{contacts_added} contacts, {criteria_hits} criteria matches"
+                + (" (timed out)" if timed_out else ""))
 
     def _gather_news(self, company_name: str, domain: Optional[str]) -> List[str]:
         from contact_enrich import _company_mentioned
@@ -1400,7 +1552,8 @@ class DeepResearchService:
             contacts: List[Dict],
             company_name: str,
             domain: Optional[str],
-            criteria_terms: List[str]) -> List[Dict]:
+            criteria_terms: List[str],
+            should_stop: Optional[Callable[[], bool]] = None) -> List[Dict]:
         from ddg_search import ddg_text_search
 
         merged = self._merge_contacts(contacts)
@@ -1410,6 +1563,7 @@ class DeepResearchService:
         want_alum = alumni_mode(criteria_terms)
         budget = MAX_ALUMNI_SEARCHES if want_alum else MAX_LINKEDIN_SEARCHES
         searches = 0
+        stop = should_stop or (lambda: False)
 
         def ingest(people: List[Dict], term: str):
             for person in people:
@@ -1446,8 +1600,10 @@ class DeepResearchService:
                 merged[key] = person
 
         for term in criteria_terms:
+            if stop():
+                break
             for term_i, query in self._hunt_queries_for_term(company_name, term):
-                if searches >= budget:
+                if searches >= budget or stop():
                     break
                 try:
                     results = ddg_text_search(query, max_results=8) or []
@@ -1458,16 +1614,17 @@ class DeepResearchService:
                     extract_people_from_snippets(results, company_name),
                     term_i,
                 )
-            if searches >= budget:
+            if searches >= budget or stop():
                 break
 
         # Always pull a general company roster so non-criteria contacts
         # still show up (separated in the UI from matches).
-        merged = self._merge_contacts(
-            list(merged.values()) + self._hunt_general_roster(
-                company_name, domain, budget=MAX_GENERAL_ROSTER_SEARCHES,
+        if not stop():
+            merged = self._merge_contacts(
+                list(merged.values()) + self._hunt_general_roster(
+                    company_name, domain, budget=MAX_GENERAL_ROSTER_SEARCHES,
+                )
             )
-        )
         return list(merged.values())
 
     def _hunt_general_roster(
@@ -1536,8 +1693,14 @@ class DeepResearchService:
             domain: Optional[str],
             criteria_terms: List[str],
             min_contacts: int,
-            require_floor: bool) -> List[Dict]:
-        """Keep searching until we have enough persistable people / alumni."""
+            require_floor: bool,
+            target_criteria_matches: Optional[int] = None,
+            should_stop: Optional[Callable[[], bool]] = None) -> List[Dict]:
+        """Keep searching until we have enough persistable people / alumni.
+
+        When ``target_criteria_matches`` is set, count only criteria matches
+        and cycle search rounds until the target is hit or ``should_stop``.
+        """
         from ddg_search import ddg_text_search
 
         merged = self._merge_contacts(contacts)
@@ -1545,7 +1708,18 @@ class DeepResearchService:
             return list(merged.values())
 
         want_alum = alumni_mode(criteria_terms)
+        until_mode = target_criteria_matches is not None
+        # Until-N always counts criteria matches (alumni or role).
+        count_criteria_only = until_mode or want_alum
+        target = (
+            max(1, int(target_criteria_matches))
+            if until_mode else min_contacts
+        )
         budget = MAX_ALUMNI_SEARCHES if want_alum else MAX_LINKEDIN_SEARCHES
+        if until_mode:
+            budget = max(budget, MAX_ALUMNI_SEARCHES)
+        rounds = UNTIL_MAX_ROUNDS if until_mode else 1
+        stop = should_stop or (lambda: False)
 
         def rematerialize(people: List[Dict]) -> Dict[str, Dict]:
             return self._merge_contacts(people)
@@ -1556,9 +1730,16 @@ class DeepResearchService:
             if not ((email_ok or li_ok) and a.get("name")
                     and not a.get("name_from_email")):
                 return False
-            if want_alum:
+            if count_criteria_only:
                 match = score_criteria_match(a, criteria_terms)
-                return bool(match.get("alumni_match"))
+                # Until-N: any user criteria term counts (role or alumni).
+                # Alumni-only floor (no until-N): require alumni_match so we
+                # don't pad with random VPs.
+                if until_mode:
+                    return bool(match.get("criteria_match"))
+                if want_alum:
+                    return bool(match.get("alumni_match"))
+                return bool(match.get("criteria_match"))
             return True
 
         def persistable_count() -> int:
@@ -1573,13 +1754,13 @@ class DeepResearchService:
                     n += 1
             return n
 
-        # Alumni: keep expanding school queries. Role floor queries are NOT
-        # used to pad an alumni request with the CEO / random VPs.
-        if want_alum:
+        # Alumni hunting: alumni-mode floors, OR until-N when any alumni
+        # terms are present (even if they're a minority of the criteria).
+        alum_terms = [t for t in criteria_terms if is_alumni_term(t)]
+        if want_alum or (until_mode and alum_terms):
             pairs: List[Tuple[str, str]] = []
-            for term in criteria_terms:
-                if is_alumni_term(term):
-                    pairs.extend(self._hunt_queries_for_term(company_name, term))
+            for term in alum_terms:
+                pairs.extend(self._hunt_queries_for_term(company_name, term))
             # Dedup by query
             seen_q = set()
             uniq_pairs = []
@@ -1589,62 +1770,99 @@ class DeepResearchService:
                 seen_q.add(q)
                 uniq_pairs.append((t, q))
             searches = 0
-            for term, query in uniq_pairs:
-                if persistable_count() >= min_contacts:
+            for _round in range(rounds):
+                if persistable_count() >= target or stop():
                     break
-                if searches >= budget:
+                before = len(merged)
+                for term, query in uniq_pairs:
+                    if persistable_count() >= target or stop():
+                        break
+                    if not until_mode and searches >= budget:
+                        break
+                    # Later until-N rounds vary the query so we don't burn
+                    # the hard-stop clock reissuing identical SERPs.
+                    q = query if _round == 0 else f'{query} ("alumni" OR education)'
+                    try:
+                        results = ddg_text_search(q, max_results=8) or []
+                    except Exception:
+                        results = []
+                    searches += 1
+                    for person in extract_people_from_snippets(
+                            results, company_name):
+                        aliases = school_aliases_for_term(term)
+                        if not _school_mentioned(
+                                aliases,
+                                person.get("role") or "",
+                                person.get("evidence") or ""):
+                            continue
+                        person["alumni_match"] = True
+                        person.setdefault("affinity", []).append(
+                            f"criteria:{term}")
+                        key = self._contact_key(person)
+                        if key not in merged:
+                            merged[key] = person
+                if not until_mode:
                     break
-                try:
-                    results = ddg_text_search(query, max_results=8) or []
-                except Exception:
-                    results = []
-                searches += 1
-                for person in extract_people_from_snippets(
-                        results, company_name):
-                    aliases = school_aliases_for_term(term)
-                    if not _school_mentioned(
-                            aliases,
-                            person.get("role") or "",
-                            person.get("evidence") or ""):
-                        continue
-                    person["alumni_match"] = True
-                    person.setdefault("affinity", []).append(f"criteria:{term}")
-                    key = self._contact_key(person)
-                    if key not in merged:
-                        merged[key] = person
-        else:
-            role_queries = list(criteria_terms) + [
-                r for r in _FLOOR_ROLE_QUERIES
-                if r.lower() not in {t.lower() for t in criteria_terms}
-            ]
+                if len(merged) == before:
+                    break
+        # Role hunting: normal non-alumni floor, OR until-N when the user
+        # also listed role criteria (mixed alumni + role requests).
+        role_terms = [t for t in criteria_terms if not is_alumni_term(t)]
+        run_role_hunt = (not want_alum) or (until_mode and bool(role_terms))
+        if run_role_hunt:
+            if until_mode:
+                # Only the user's non-alumni criteria — never pad with CEOs.
+                role_queries = list(role_terms) if role_terms else list(
+                    criteria_terms)
+            else:
+                role_queries = list(criteria_terms) + [
+                    r for r in _FLOOR_ROLE_QUERIES
+                    if r.lower() not in {t.lower() for t in criteria_terms}
+                ]
             searches = 0
-            for role in role_queries:
-                if persistable_count() >= min_contacts:
+            for _round in range(rounds):
+                if persistable_count() >= target or stop():
                     break
-                if searches >= budget:
+                before = len(merged)
+                for role in role_queries:
+                    if persistable_count() >= target or stop():
+                        break
+                    if not until_mode and searches >= budget:
+                        break
+                    query = f'"{company_name}" "{role}" site:linkedin.com/in'
+                    if _round > 0:
+                        query = (
+                            f'"{company_name}" "{role}" '
+                            f'(linkedin.com/in OR "currently" OR team)'
+                        )
+                    try:
+                        results = ddg_text_search(query, max_results=5) or []
+                    except Exception:
+                        results = []
+                    searches += 1
+                    for person in extract_people_from_snippets(
+                            results, company_name):
+                        key = self._contact_key(person)
+                        if key not in merged:
+                            if any(t.lower() in (role or "").lower()
+                                   for t in criteria_terms):
+                                person.setdefault("affinity", []).append(
+                                    f"criteria:{role}")
+                            merged[key] = person
+                if not until_mode:
                     break
-                query = f'"{company_name}" "{role}" site:linkedin.com/in'
-                try:
-                    results = ddg_text_search(query, max_results=5) or []
-                except Exception:
-                    results = []
-                searches += 1
-                for person in extract_people_from_snippets(
-                        results, company_name):
-                    key = self._contact_key(person)
-                    if key not in merged:
-                        if any(t.lower() in (role or "").lower()
-                               for t in criteria_terms):
-                            person.setdefault("affinity", []).append(
-                                f"criteria:{role}")
-                        merged[key] = person
+                if len(merged) == before:
+                    break
+
+        if stop():
+            return list(merged.values())
 
         need_fill = [
             c for c in merged.values()
             if c.get("name") and not c.get("name_from_email")
             and not (c.get("email") or c.get("linkedin_url"))
         ]
-        if need_fill:
+        if need_fill and not stop():
             filled = enrich_contacts_outreach(
                 need_fill,
                 company_name=company_name,
@@ -1655,21 +1873,22 @@ class DeepResearchService:
             )
             merged = rematerialize(list(merged.values()) + filled)
 
-        if persistable_count() < min_contacts:
-            updated = []
+        if persistable_count() < target and not stop():
+            # Mutate in place so a mid-loop hard-stop never drops unvisited
+            # people, then rematerialize once to promote email→LinkedIn keys.
             for c in list(merged.values()):
-                person = dict(c)
+                if stop():
+                    break
                 if (
-                    not person.get("linkedin_url")
-                    and person.get("name")
-                    and len(name_tokens(person.get("name"))) >= 2
+                    not c.get("linkedin_url")
+                    and c.get("name")
+                    and len(name_tokens(c.get("name"))) >= 2
                 ):
-                    found = find_linkedin_via_search(person["name"], company_name)
+                    found = find_linkedin_via_search(c["name"], company_name)
                     if found:
-                        person["linkedin_url"] = found
-                        person["linkedin_source"] = "web_search"
-                updated.append(person)
-            merged = rematerialize(updated)
+                        c["linkedin_url"] = found
+                        c["linkedin_source"] = "web_search"
+            merged = rematerialize(list(merged.values()))
 
         return list(merged.values())
 
@@ -1681,8 +1900,10 @@ class DeepResearchService:
             *,
             min_contacts: int,
             criteria_terms: List[str],
-            alumni_only_floor: bool = False) -> List[Dict]:
+            alumni_only_floor: bool = False,
+            max_matched: int = MAX_MATCHED_PERSIST) -> List[Dict]:
         """Pick ≥min_contacts when possible; bias to criteria / alumni matches."""
+        matched_cap = max(MAX_MATCHED_PERSIST, int(max_matched or 0))
         base = select_outreach_contacts(
             scored, emails, domain, limit=max(min_contacts + 8, 12),
             person_only=True, check_mx=True,
@@ -1730,7 +1951,7 @@ class DeepResearchService:
             matches = [c for c in selected if c.get("criteria_match")]
             others = [c for c in selected if not c.get("criteria_match")]
 
-        keep = matches[:MAX_MATCHED_PERSIST]
+        keep = matches[:matched_cap]
         # Fill toward min_contacts with others only when we still need bodies
         # for outreach — never reclassify them as criteria matches.
         if len(keep) < min_contacts:

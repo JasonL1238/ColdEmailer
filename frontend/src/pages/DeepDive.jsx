@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
 import {
   AlertCircle, Building2, ExternalLink, History, Microscope, Search, Sparkles, Users, X,
 } from 'lucide-react'
 import { companiesAPI, deepResearchAPI, errMessage } from '../api'
-import { Button, Chip, EmptyState, ProgressBar, Spinner, timeAgo } from '../ui'
+import {
+  Button, Chip, EmptyState, ProgressBar, Spinner, contactStatusMeta, timeAgo,
+} from '../ui'
 import { useApp } from '../App'
 import CompanyDrawer from '../components/CompanyDrawer'
 import ComposeModal from './ComposeModal'
@@ -17,11 +19,21 @@ const CRITERIA_SUGGESTIONS = [
   'Talent / recruiting leaders, Head of People',
 ]
 
+const EMAILED_STATUSES = new Set(['sent', 'replied'])
+
+function isEmailed(contact) {
+  return EMAILED_STATUSES.has(contact?.status)
+    || Boolean(contact?.last_sent_at)
+}
+
 export default function DeepDive() {
   const { navigate } = useApp()
   const [companyName, setCompanyName] = useState('')
   const [url, setUrl] = useState('')
   const [criteria, setCriteria] = useState('')
+  const [untilEnabled, setUntilEnabled] = useState(false)
+  const [targetMatches, setTargetMatches] = useState(5)
+  const [contactFilter, setContactFilter] = useState('all') // all | ready | emailed
   const [run, setRun] = useState(null)
   const [history, setHistory] = useState([])
   const [starting, setStarting] = useState(false)
@@ -62,10 +74,36 @@ export default function DeepDive() {
             if (data.status === 'done') {
               const r = data.result || {}
               const saved = r.contacts_saved ?? r.contacts_selected ?? 0
+              const matches = r.criteria_matches ?? 0
               const msg = `Deep dive ready — ${saved} contacts `
-                + `(${r.criteria_matches ?? 0} match your criteria)`
+                + `(${matches} match your criteria)`
               if (r.identity_verified === false) {
                 toast.error('Deep dive finished, but the site did not match this company.')
+              } else if (
+                r.timed_out
+                && r.target_criteria_matches
+                && r.target_met !== true
+              ) {
+                toast.error(
+                  `Hit 30-minute limit with ${matches}/${r.target_criteria_matches}`
+                  + ' criteria matches — partial results saved.',
+                )
+              } else if (r.timed_out) {
+                // Hard-stop saved partial results — prefer that message over
+                // floor-not-met, which is expected when time ran out.
+                const floorNote = (
+                  r.floor_required && !r.floor_met
+                ) ? ' Contact floor not fully met.' : ''
+                toast.success(
+                  `${msg}. Stopped at the 30-minute limit.${floorNote}`,
+                )
+              } else if (
+                r.target_criteria_matches
+                && r.target_met === false
+              ) {
+                toast.error(
+                  `${msg}. Target was ${r.target_criteria_matches} criteria matches — try Continue contacts.`,
+                )
               } else if (r.alumni_mode && r.floor_required && !r.floor_met) {
                 toast.error(
                   `${msg}. Alumni floor not met — try Continue contacts.`,
@@ -156,14 +194,24 @@ export default function DeepDive() {
       toast.error('Run a full deep dive before continuing')
       return
     }
+    if (untilEnabled && !criteria.trim()) {
+      toast.error('Add contact criteria before hunting until a target count')
+      return
+    }
     setStarting(true)
+    setContactFilter('all')
     try {
+      const target = Math.max(1, Math.min(50, Number(targetMatches) || 5))
       const body = {
         company_name: name || undefined,
         company_id: companyId || undefined,
         url: url.trim() || null,
         contact_criteria: criteria.trim(),
-        min_contacts: 5,
+        min_contacts: untilEnabled ? target : 5,
+      }
+      // Research-only continue does not hunt contacts — don't attach a target.
+      if (untilEnabled && mode !== 'research') {
+        body.target_criteria_matches = target
       }
       if (mode) body.continue_mode = mode
       const { data } = await deepResearchAPI.start(body)
@@ -210,35 +258,68 @@ export default function DeepDive() {
     : runContacts.length
   const canContinue = Boolean(companyId || resolvedName.length >= 2)
 
-  const renderContactRow = (c, { criteriaHit } = {}) => (
-    <div key={c.id} className="card card-pad row-between" style={{ padding: '10px 14px' }}>
-      <div style={{ minWidth: 0 }}>
-        <div className="row" style={{ gap: 8 }}>
-          <div style={{ fontWeight: 600, fontSize: 13 }}>{c.name || 'Unnamed'}</div>
-          {criteriaHit && <Chip tone="violet">Criteria</Chip>}
+  const emailedCount = useMemo(
+    () => runContacts.filter(isEmailed).length,
+    [runContacts],
+  )
+  // "Ready" for compose = has email and not already emailed.
+  const readyToEmail = useMemo(
+    () => runContacts.filter((c) => c.email && !isEmailed(c)),
+    [runContacts],
+  )
+  const readyCount = readyToEmail.length
+
+  const readyIds = useMemo(
+    () => new Set(readyToEmail.map((c) => c.id)),
+    [readyToEmail],
+  )
+  const applyContactFilter = (list) => {
+    if (contactFilter === 'emailed') return list.filter(isEmailed)
+    if (contactFilter === 'ready') return list.filter((c) => readyIds.has(c.id))
+    return list
+  }
+  const visibleMatched = applyContactFilter(matchedContacts)
+  const visibleOther = applyContactFilter(otherContacts)
+
+  const renderContactRow = (c, { criteriaHit } = {}) => {
+    const st = contactStatusMeta(c)
+    const emailed = isEmailed(c)
+    return (
+      <div key={c.id} className="card card-pad row-between" style={{ padding: '10px 14px' }}>
+        <div style={{ minWidth: 0 }}>
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ fontWeight: 600, fontSize: 13 }}>{c.name || 'Unnamed'}</div>
+            {criteriaHit && <Chip tone="violet">Criteria</Chip>}
+            <Chip tone={st.tone} title={st.title}>{st.label}</Chip>
+          </div>
+          {c.role && <div className="tiny" style={{ marginTop: 2 }}>{c.role}</div>}
+          <div className="row" style={{ gap: 10, marginTop: 4, flexWrap: 'wrap' }}>
+            {c.email && <span className="tiny mono">{c.email}</span>}
+            {c.linkedin_url && (
+              <a href={c.linkedin_url} target="_blank" rel="noreferrer"
+                className="tiny row" style={{ gap: 4 }}>
+                LinkedIn <ExternalLink size={10} />
+              </a>
+            )}
+            {emailed && c.last_sent_at && (
+              <span className="tiny muted">Emailed {timeAgo(c.last_sent_at)}</span>
+            )}
+          </div>
         </div>
-        {c.role && <div className="tiny" style={{ marginTop: 2 }}>{c.role}</div>}
-        <div className="row" style={{ gap: 10, marginTop: 4, flexWrap: 'wrap' }}>
-          {c.email && <span className="tiny mono">{c.email}</span>}
-          {c.linkedin_url && (
-            <a href={c.linkedin_url} target="_blank" rel="noreferrer"
-              className="tiny row" style={{ gap: 4 }}>
-              LinkedIn <ExternalLink size={10} />
-            </a>
+        <div className="row" style={{ gap: 4 }}>
+          {c.email && (
+            <button
+              className="icon-btn"
+              title={emailed ? 'Generate another email' : 'Generate email'}
+              onClick={() => setComposeIds([c.id])}
+            >
+              <Sparkles size={14} />
+            </button>
           )}
         </div>
       </div>
-      {c.email && (
-        <button
-          className="icon-btn"
-          title="Generate email"
-          onClick={() => setComposeIds([c.id])}
-        >
-          <Sparkles size={14} />
-        </button>
-      )}
-    </div>
-  )
+    )
+  }
 
   return (
     <div className="page">
@@ -254,9 +335,8 @@ export default function DeepDive() {
         </h1>
         <p className="small muted" style={{ marginTop: 8, maxWidth: 640, lineHeight: 1.55 }}>
           Dig into one company for key changes, policy differentiators, and contacts
-          that match your criteria. Alumni criteria (e.g. Northwestern Alum) aim for
-          at least 5 matching alumni — not random employees. After a run, continue
-          searching contacts, company research, or both.
+          that match your criteria. Optionally keep hunting until you hit a target
+          count of matches — every run hard-stops at 30 minutes.
         </p>
 
         <div className="stack" style={{ gap: 10, marginTop: 18 }}>
@@ -291,6 +371,39 @@ export default function DeepDive() {
               onKeyDown={(e) => e.key === 'Enter' && !running && start()}
               disabled={running || starting}
             />
+          </div>
+          <div
+            className="row"
+            style={{
+              gap: 12, flexWrap: 'wrap', alignItems: 'center',
+              padding: '8px 12px', borderRadius: 10,
+              background: 'var(--surface-2, rgba(0,0,0,0.03))',
+            }}
+          >
+            <label className="row" style={{ gap: 8, cursor: running || starting ? 'default' : 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={untilEnabled}
+                disabled={running || starting}
+                onChange={(e) => setUntilEnabled(e.target.checked)}
+              />
+              <span className="small">Keep searching until I find</span>
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={targetMatches}
+              disabled={running || starting || !untilEnabled}
+              onChange={(e) => setTargetMatches(e.target.value)}
+              style={{
+                width: 64, padding: '4px 8px', borderRadius: 8,
+                border: '1px solid var(--border)', font: 'inherit',
+                opacity: untilEnabled ? 1 : 0.5,
+              }}
+            />
+            <span className="small muted">people matching my criteria</span>
+            <Chip tone="gray">Hard stop 30 min</Chip>
           </div>
           <div className="row" style={{ gap: 10, justifyContent: 'space-between', flexWrap: 'wrap' }}>
             <div className="suggestion-row" style={{ marginTop: 0, flex: 1 }}>
@@ -329,7 +442,12 @@ export default function DeepDive() {
               <Spinner size={14} />
               <div style={{ fontWeight: 650 }}>{run.stage || 'Researching…'}</div>
             </div>
-            <Chip tone="accent">Deep dive</Chip>
+            <div className="row" style={{ gap: 6 }}>
+              {payload.target_criteria_matches && (
+                <Chip tone="violet">Until {payload.target_criteria_matches} matches</Chip>
+              )}
+              <Chip tone="accent">≤30 min</Chip>
+            </div>
           </div>
           <ProgressBar
             current={run.progress_current || 0}
@@ -354,11 +472,18 @@ export default function DeepDive() {
               <h2 style={{ margin: 0, fontSize: 20 }}>{result.company_name}</h2>
               <div className="small muted" style={{ marginTop: 4 }}>
                 {result.contacts_saved ?? 0} contacts saved · {result.criteria_matches ?? 0} criteria matches
+                {result.target_criteria_matches
+                  ? ` · target ${result.target_criteria_matches}${result.target_met ? ' met' : ' not met'}`
+                  : ''}
+                {result.timed_out ? ' · stopped at 30 min' : ''}
                 {result.alumni_mode ? ' · alumni mode' : ''}
                 {result.employee_estimate != null
                   ? ` · ~${result.employee_estimate} employees estimated`
                   : ''}
                 {result.floor_required && !result.floor_met ? ' · contact floor not fully met' : ''}
+                {runContacts.length > 0
+                  ? ` · ${emailedCount} emailed · ${runContacts.length - emailedCount} not emailed`
+                  : ''}
               </div>
             </div>
             <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
@@ -393,11 +518,16 @@ export default function DeepDive() {
                   size="sm"
                   variant="primary"
                   icon={Sparkles}
-                  onClick={() => setComposeIds(
-                    runContacts.filter((c) => c.email).map((c) => c.id),
-                  )}
+                  onClick={() => {
+                    const ids = (
+                      readyToEmail.length
+                        ? readyToEmail
+                        : runContacts.filter((c) => c.email)
+                    ).map((c) => c.id)
+                    setComposeIds(ids)
+                  }}
                 >
-                  Generate emails
+                  Generate emails{readyCount > 0 ? ` (${readyCount} ready)` : ''}
                 </Button>
               )}
             </div>
@@ -431,44 +561,74 @@ export default function DeepDive() {
           )}
 
           <div className="card card-pad">
-            <div className="row-between" style={{ marginBottom: 10 }}>
+            <div className="row-between" style={{ marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
               <div className="row" style={{ gap: 8 }}>
                 <Users size={15} />
                 <div style={{ fontWeight: 650 }}>
                   Contacts ({contactCountLabel})
                 </div>
               </div>
-              <Chip tone={result.criteria_ratio_met ? 'green' : 'amber'}>
-                {result.criteria_matches ?? matchedContacts.length} match criteria
-                {' · '}
-                {otherContacts.length} other
-              </Chip>
+              <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                {[
+                  ['all', `All (${runContacts.length})`],
+                  ['ready', `Ready (${readyCount})`],
+                  ['emailed', `Emailed (${emailedCount})`],
+                ].map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className="suggestion"
+                    style={{
+                      opacity: contactFilter === key ? 1 : 0.65,
+                      fontWeight: contactFilter === key ? 700 : 500,
+                    }}
+                    onClick={() => setContactFilter(key)}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <Chip tone={result.criteria_ratio_met ? 'green' : 'amber'}>
+                  {result.criteria_matches ?? matchedContacts.length} match criteria
+                  {' · '}
+                  {otherContacts.length} other
+                </Chip>
+              </div>
             </div>
             {runContacts.length === 0 ? (
               <div className="small muted">No contacts saved from this run.</div>
+            ) : visibleMatched.length === 0 && visibleOther.length === 0 ? (
+              <div className="small muted">
+                No contacts in this filter — try All or Ready.
+              </div>
             ) : (
               <div className="stack" style={{ gap: 16 }}>
                 <div>
                   <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
-                    Criteria matches ({matchedContacts.length})
+                    Criteria matches ({visibleMatched.length}
+                    {contactFilter !== 'all' ? ` of ${matchedContacts.length}` : ''})
                   </div>
                   {matchedContacts.length === 0 ? (
                     <div className="small muted">No criteria matches yet — try Continue contacts.</div>
+                  ) : visibleMatched.length === 0 ? (
+                    <div className="small muted">No criteria matches in this filter.</div>
                   ) : (
                     <div className="stack" style={{ gap: 8 }}>
-                      {matchedContacts.map((c) => renderContactRow(c, { criteriaHit: true }))}
+                      {visibleMatched.map((c) => renderContactRow(c, { criteriaHit: true }))}
                     </div>
                   )}
                 </div>
                 <div>
                   <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
-                    Other contacts ({otherContacts.length})
+                    Other contacts ({visibleOther.length}
+                    {contactFilter !== 'all' ? ` of ${otherContacts.length}` : ''})
                   </div>
                   {otherContacts.length === 0 ? (
                     <div className="small muted">No additional company contacts in this run.</div>
+                  ) : visibleOther.length === 0 ? (
+                    <div className="small muted">No other contacts in this filter.</div>
                   ) : (
                     <div className="stack" style={{ gap: 8 }}>
-                      {otherContacts.map((c) => renderContactRow(c))}
+                      {visibleOther.map((c) => renderContactRow(c))}
                     </div>
                   )}
                 </div>
@@ -508,9 +668,17 @@ export default function DeepDive() {
                   style={{ textAlign: 'left', cursor: 'pointer', border: 'none', font: 'inherit', color: 'inherit' }}
                   onClick={() => {
                     setRun(j)
+                    setContactFilter('all')
                     const name = payload.company_name || res.company_name || ''
                     if (name) setCompanyName(name)
                     if (payload.contact_criteria) setCriteria(payload.contact_criteria)
+                    else setCriteria('')
+                    if (payload.target_criteria_matches) {
+                      setUntilEnabled(true)
+                      setTargetMatches(payload.target_criteria_matches)
+                    } else {
+                      setUntilEnabled(false)
+                    }
                     // Always hydrate — list rows omit the company object that
                     // Continue needs for company_id.
                     if (j.status === 'running' || j.status === 'done') {

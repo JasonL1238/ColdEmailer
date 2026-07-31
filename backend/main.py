@@ -262,6 +262,7 @@ async def start_deep_research(payload: DeepResearchRequest):
             url=payload.url,
             contact_criteria=payload.contact_criteria or "",
             min_contacts=payload.min_contacts,
+            target_criteria_matches=payload.target_criteria_matches,
             continue_mode=payload.continue_mode,
         )
     except ValueError as exc:
