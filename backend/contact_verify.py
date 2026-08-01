@@ -259,18 +259,6 @@ def verify_linkedin(url: Optional[str], name: Optional[str]) -> Dict:
     }
 
 
-def name_likely_from_email(name: Optional[str], email: Optional[str]) -> bool:
-    """True when `name` looks like it was invented from the email local-part."""
-    if not name or not email:
-        return False
-    local = email_local(email).split("+", 1)[0]
-    parts = [p for p in re.split(r"[._+-]+", local) if p.isalpha() and len(p) > 1]
-    if not parts:
-        return False
-    guessed = " ".join(p.capitalize() for p in parts[:3])
-    return guessed.strip().lower() == (name or "").strip().lower()
-
-
 def annotate_contact(contact: Dict, check_mx: bool = True) -> Dict:
     """Attach verification fields onto a contact candidate dict."""
     out = dict(contact)
