@@ -470,12 +470,54 @@ Body:
     def _model_used():
         return last_model_used()
 
+    # What each rung of the cadence is *for*. A second nudge that repeats the
+    # first one word for word is worse than not sending it — the recipient has
+    # already decided not to answer that message, and receiving it again reads
+    # as an autoresponder. Each rung changes the ask instead of the volume, and
+    # the last one says out loud that it is the last one.
+    #
+    # Keyed by position in the sequence, never by raw step number. Rung 3 of a
+    # 3-step cadence is the goodbye; rung 3 of a 4-step cadence is a middle
+    # rung, and a table indexed by step told that recipient in writing "this is
+    # my last note on it" — then wrote again a week later.
+    _FOLLOW_UP_ANGLES = {
+        1: ("Reference the earlier email and add one small new reason to reply "
+            "(continued interest, or a specific detail about {company}). One "
+            "clear call to action."),
+        2: ("They have now seen one reminder, so do NOT repeat it. Make the ask "
+            "smaller than last time — a single question they can answer in one "
+            "line, or a pointer to whoever is better placed. Acknowledge they "
+            "are busy without apologising for writing."),
+        3: ("They have ignored two reminders. Change what you are asking for "
+            "entirely: no meeting, no call — offer something concrete and "
+            "one-directional instead (send a short note, a link, a piece of "
+            "work) and ask only whether it is worth sending. Two sentences is "
+            "plenty."),
+    }
+    _LAST_ANGLE = ("This is the final message in the sequence and must say so "
+                   "plainly. No new pitch, no new ask beyond a one-line reply. "
+                   "Leave the door open and thank them.")
+
     def compose_follow_up(self, contact: Dict, company: Optional[Dict],
-                          original: Dict) -> Dict:
-        """Short follow-up referencing the original sent email."""
+                          original: Dict, *, step: int = 1,
+                          total_steps: int = 1,
+                          previous: Optional[Dict] = None) -> Dict:
+        """One rung of the follow-up cadence, referencing what already went out.
+
+        `original` is the first-contact email the thread hangs off; `previous`
+        is the most recent thing this person actually received, which from the
+        second rung on is the earlier follow-up rather than the original. They
+        are passed separately because they answer different questions: the
+        original supplies the subject and the premise, the previous supplies
+        the date being followed up on and the wording to avoid repeating.
+        """
         profile = self.db.get_profile()
         llm_reason = None
-        sent_date = (original.get("sent_at") or "")[:10] or "recently"
+        previous = previous or original
+        step = max(1, int(step or 1))
+        total_steps = max(step, int(total_steps or 1))
+        sent_date = (previous.get("sent_at") or "")[:10] or "recently"
+        first_date = (original.get("sent_at") or "")[:10] or "recently"
         signature = self._signature(profile)
         first = (contact.get("name") or "").split(" ")[0] or "there"
         company_name = contact.get("company_name") or (company or {}).get("name") or "your company"
@@ -484,26 +526,51 @@ Body:
             "- Do NOT mention a resume, portfolio, CV or any attachment, even if one "
             "is attached."
         )
+        is_last = step >= total_steps
+        # "Last" wins over the per-rung angle, and only a genuinely last rung
+        # gets it — a single follow-up is not a goodbye letter, and rung 3 of 4
+        # must not promise the sequence is over.
+        if is_last and step > 1:
+            angle = self._LAST_ANGLE
+        else:
+            angle = self._FOLLOW_UP_ANGLES.get(step) or self._FOLLOW_UP_ANGLES[3]
+        angle = angle.format(company=company_name)
+        # A follow-up's subject stays on the original thread — Gmail groups by
+        # References, but a recipient scanning their inbox reads the subject.
+        subject = original.get("subject") or "my earlier note"
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+        # The subject is written by the model from scraped company text, or
+        # edited by the user. Fenced once for the ORIGINAL EMAIL block and
+        # again here: the OUTPUT FORMAT line quoted it raw, which is the most
+        # authoritative part of the prompt to smuggle an instruction into.
+        example_subject = _as_data(subject, 200)
 
         if llm_complete:
-            prompt = f"""Write a brief, polite follow-up to a cold email that got no reply.
+            ordinal = {1: "first", 2: "second", 3: "third", 4: "fourth"}.get(step, f"{step}th")
+            prior = ""
+            if previous.get("id") and previous.get("id") != original.get("id"):
+                prior = (f"\nMOST RECENT FOLLOW-UP (sent {sent_date}, also unanswered):\n"
+                         f"{_as_data(previous.get('body'), 900)}\n")
+            prompt = f"""Write the {ordinal} follow-up ({step} of {total_steps}) to a cold email that got no reply.
 
-ORIGINAL EMAIL (sent {sent_date}):
-Subject: {original.get('subject')}
-{(original.get('body') or '')[:1200]}
-
-RECIPIENT: {contact.get('name') or 'Unknown'} at {company_name}
+ORIGINAL EMAIL (sent {first_date}):
+Subject: {_as_data(original.get('subject'), 200)}
+{_as_data(original.get('body'), 1200)}
+{prior}
+RECIPIENT: {_as_data(contact.get('name') or 'Unknown', 120)} at {_as_data(company_name, 120)}
 SENDER: {profile.get('full_name') or 'the sender'}
 
 RULES:
-- 50 to 90 words. Reference the earlier email naturally ("I wanted to follow up on my note from {sent_date}").
-- Add one small new reason to reply (continued interest, a specific detail about {company_name}).
-- Not pushy, not apologetic. One clear call to action.
+- 40 to 80 words. Shorter than the message before it.
+- Reference the earlier note by date ("my note from {sent_date}") without quoting it back.
+- {angle}
+- Not pushy, not apologetic, no guilt. Do not say "just checking in" or "bumping this".
 - No signature in the body; no markdown; no em dashes.
 {attachment_rule}
 
 OUTPUT FORMAT (exactly):
-Subject: <subject — usually "Re: {original.get('subject')}">
+Subject: <subject — usually "{example_subject}">
 Body:
 <body ending after the closing line>"""
             out, llm_reason = self._llm_text(prompt, max_tokens=1024)
@@ -518,11 +585,40 @@ Body:
                         "used_template_fallback": False, "fallback_reason": None,
                         "llm_model": self._model_used()}
 
-        body = (f"Hi {first},\n\nI wanted to follow up on my email from {sent_date} about "
+        # Keyless / AI-down mode is a supported way to run this app, so the
+        # template ladder has to change per rung too. Emitting rung 1's wording
+        # three times is the exact failure the cadence exists to avoid.
+        body = self._follow_up_template(first, company_name, sent_date, step, is_last)
+        body = body.rstrip() + ("\n" + signature if signature else "")
+        return {"subject": subject,
+                "body": body, "used_template_fallback": True,
+                "fallback_reason": llm_reason or "llm_unavailable"}
+
+    @staticmethod
+    def _follow_up_template(first: str, company_name: str, sent_date: str,
+                            step: int, is_last: bool) -> str:
+        """The offline ladder — one distinct body per rung, up to the cap.
+
+        This used to have three branches for four possible rungs, so with the
+        maximum cadence the recipient got rungs 2 and 3 as the same message
+        with a different date in it. Keyless operation is a supported mode, not
+        a degraded one: the ladder has to cover MAX_FOLLOW_UP_STEPS.
+        """
+        if is_last and step > 1:
+            return (f"Hi {first},\n\nLast note from me on this — I don't want to keep "
+                    f"filling your inbox. I'm still interested in {company_name}, and if "
+                    f"the timing is ever better I'd be glad to pick it up then.\n\n"
+                    f"Either way, thanks for reading.\n\nAll the best,")
+        if step >= 3:
+            return (f"Hi {first},\n\nI'll stop guessing at what would be useful. I put "
+                    f"together a short note on what I'd work on first at {company_name} — "
+                    f"want me to send it over?\n\nYes or no is all I need.\n\nBest,")
+        if step == 2:
+            return (f"Hi {first},\n\nFollowing my note from {sent_date} — I'll keep this "
+                    f"to one question: is there someone at {company_name} better placed "
+                    f"for this than you?\n\nA one-line answer is plenty, and no reply is "
+                    f"an answer too.\n\nThanks,")
+        return (f"Hi {first},\n\nI wanted to follow up on my email from {sent_date} about "
                 f"{company_name}. I'm still very interested and would welcome the chance to "
                 f"talk — even 10 minutes would be great.\n\nIf now isn't the right time or "
                 f"someone else is better placed, I'd appreciate a pointer.\n\nThanks so much,")
-        body = body.rstrip() + ("\n" + signature if signature else "")
-        return {"subject": f"Re: {original.get('subject') or 'my earlier note'}",
-                "body": body, "used_template_fallback": True,
-                "fallback_reason": llm_reason or "llm_unavailable"}

@@ -250,7 +250,7 @@ def test_an_unverified_flag_does_not_block_a_follow_up(monkeypatch):
     matching "this person already replied" chip) removed the app's core
     recurring action for ~90% of the pipeline."""
     class _Composer:
-        def compose_follow_up(self, contact, company, original):
+        def compose_follow_up(self, contact, company, original, **kwargs):
             return {"subject": f"Re: {original['subject']}", "body": "just following up",
                     "used_template_fallback": True, "fallback_reason": "llm_unavailable"}
 

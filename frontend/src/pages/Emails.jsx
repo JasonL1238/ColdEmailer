@@ -69,6 +69,41 @@ export const addressWarning = (e) => {
 export const hasVerifiedReply = (e) => !!e.has_response && !e.reply_unverified
 export const hasUnverifiedReply = (e) => !!(e.reply_unverified || e.contact_reply_unverified)
 
+/* Where this person sits in the follow-up cadence, and therefore what the
+   detail pane should offer.
+
+   `has_follow_up` alone cannot answer it. That flag goes true the moment a
+   follow-up exists and stays true after it is sent, so with a two-step cadence
+   the second nudge could never be drafted: the button it lives behind had
+   already been replaced by a "follow-up drafted" chip, permanently. Sent and
+   pending are different facts here — one advances the cadence, the other is
+   the user's own unsent work. */
+export const DEFAULT_CADENCE = { enabled: true, steps: [7] }
+
+export const followUpState = (email, cadence) => {
+  // No cadence at all means "/api/settings has not come back yet", not
+  // "switched off". Reading the two the same way blanked the follow-up control
+  // on every sent email until the settings request resolved — and left it
+  // blank for good against a backend too old to send the field.
+  const c = cadence || DEFAULT_CADENCE
+  const steps = (c.enabled && c.steps?.length) ? c.steps.length : 0
+  if (!steps) return { kind: 'off' }
+  // A row carrying neither new field came from a backend that predates them;
+  // there, `has_follow_up` is the only thing that exists and "a follow-up
+  // exists" is the safe reading. Keyed on both fields being absent, because a
+  // row that has them and simply says "one sent, none pending" is the ordinary
+  // case for rung 2 — treating that as pending is what blocked the whole
+  // feature.
+  const legacyRow = email.follow_up_pending === undefined
+    && email.follow_ups_sent === undefined
+  if (email.follow_up_pending || (legacyRow && email.has_follow_up)) {
+    return { kind: 'pending' }
+  }
+  const sent = Number(email.follow_ups_sent || 0)
+  if (sent >= steps) return { kind: 'done', sent, total: steps }
+  return { kind: 'ready', step: sent + 1, total: steps }
+}
+
 export default function Emails() {
   const { navigate, settings } = useApp()
   const [emails, setEmails] = useState(null)
@@ -198,6 +233,69 @@ export default function Emails() {
     finally { setBusy(false) }
   }
 
+  // "3 on step 1, 2 on step 2" — which rung the due contacts are on. Worth
+  // saying out loud: a step-3 batch is the last thing these people will hear
+  // from you, which is not a thing to press a button on inattentively.
+  const dueStepSummary = useMemo(() => {
+    const counts = new Map()
+    for (const f of followUps) {
+      const step = f.next_follow_up_step
+      if (step) counts.set(step, (counts.get(step) || 0) + 1)
+    }
+    if (counts.size === 0) return ''
+    if (counts.size === 1) {
+      const [step] = [...counts.keys()]
+      const total = followUps[0]?.follow_up_steps_total
+      return total > 1 ? `step ${step} of ${total}` : ''
+    }
+    return [...counts.entries()].sort((a, b) => a[0] - b[0])
+      .map(([step, n]) => `${n} on step ${step}`).join(', ')
+  }, [followUps])
+
+  const { job: draftJob, track: trackDraftJob } = useJobPolling((j) => {
+    if (j.status === 'done' || j.status === 'cancelled') {
+      const r = j.result || {}
+      const skipped = r.skipped ?? 0
+      if (skipped > 0) {
+        // Say what was skipped rather than reporting a clean run: the reasons
+        // are things the user needs to know about (someone replied, an address
+        // bounced, the generation quota ran out mid-batch).
+        toast(`Drafted ${r.drafted ?? 0}. Skipped ${skipped}: ${
+          [...new Set((r.notes || []).map((n) => n.error))].slice(0, 2).join('; ')}`,
+        { icon: 'ℹ️', duration: 8000 })
+      } else {
+        toast.success(`${r.drafted ?? 0} follow-up${r.drafted === 1 ? '' : 's'} drafted`)
+      }
+      setBusy(false)
+      load()
+      setTab('drafts')
+    } else if (j.status === 'failed') {
+      toast.error(j.error || 'Drafting follow-ups failed')
+      setBusy(false)
+    }
+  })
+
+  const draftAllDue = async () => {
+    setBusy(true)
+    try {
+      const { data } = await emailsAPI.draftAllFollowUps()
+      trackDraftJob(data)
+    } catch (e) {
+      toast.error(errMessage(e))
+      setBusy(false)
+    }
+  }
+
+  const stopDrafting = async () => {
+    if (!draftJob?.id) return
+    try {
+      await emailsAPI.cancelDraftFollowUps(draftJob.id)
+      // Whatever was already written stays in Drafts, and the job records the
+      // real count on the cancelled row, so let the poller deliver it.
+      toast('Stopping after the current contact…', { icon: '✋' })
+    } catch (e) { toast.error(errMessage(e)) }
+  }
+
   const checkReplies = async (recheck = false) => {
     setBusy(true)
     try {
@@ -271,11 +369,27 @@ export default function Emails() {
           <div className="row">
             <Clock size={16} style={{ color: 'var(--amber)' }} />
             <span className="small">
-              <b>{followUps.length} {followUps.length === 1 ? 'contact' : 'contacts'}</b> went quiet for 7+ days.
-              Draft follow-ups with one click below (look for the <CornerUpLeft size={11} style={{ verticalAlign: -1 }} /> icon in Sent).
+              <b>{followUps.length} {followUps.length === 1 ? 'contact is' : 'contacts are'}</b> due
+              for their next follow-up{dueStepSummary ? ` (${dueStepSummary})` : ''}.
+              Drafting writes them all; nothing is sent until you send it.
             </span>
           </div>
-          <Button size="sm" onClick={() => setTab('sent')}>View sent</Button>
+          <div className="row">
+            <Button size="sm" onClick={() => setTab('sent')}>View sent</Button>
+            {draftJob?.status === 'running' ? (
+              <>
+                <span className="tiny muted">
+                  Drafting {draftJob.progress_current ?? 0}/{draftJob.progress_total ?? followUps.length}…
+                </span>
+                <Button size="sm" onClick={stopDrafting}>Stop</Button>
+              </>
+            ) : (
+              <Button size="sm" variant="primary" icon={CornerUpLeft} disabled={busy}
+                onClick={draftAllDue}>
+                Draft {followUps.length} follow-up{followUps.length === 1 ? '' : 's'}
+              </Button>
+            )}
+          </div>
         </div>
       )}
 
@@ -377,6 +491,7 @@ export default function Emails() {
               onRegenerate={() => regenerate(active.id)}
               onFollowUp={() => makeFollowUp(active.id)}
               followUpDue={followUps.some((f) => f.id === active.id)}
+              cadence={settings?.follow_up_cadence}
               busy={busy}
               llmReady={!!settings?.llm_provider}
               dirtyRef={pendingEdits}
@@ -403,13 +518,14 @@ export default function Emails() {
 
 /* ---------- detail pane ---------- */
 
-function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onRegenerate, onFollowUp, followUpDue, busy, llmReady, dirtyRef }) {
+function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onRegenerate, onFollowUp, followUpDue, cadence, busy, llmReady, dirtyRef }) {
   const [subject, setSubject] = useState(email.subject)
   const [body, setBody] = useState(email.body)
   const [saving, setSaving] = useState(false)
   const dirty = subject !== email.subject || body !== email.body
   const delivered = email.status === 'sent' || isDelivered(email)
   const editable = !delivered
+  const fuState = followUpState(email, cadence)
 
   // Publish dirtiness so the list can warn before discarding unsaved writing.
   useEffect(() => {
@@ -506,14 +622,20 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
                       <MessageSquare size={11} /> reply unverified
                     </Chip>
                   )}
-                  {email.has_follow_up ? (
+                  {fuState.kind === 'pending' ? (
                     // Clicking again just creates a duplicate follow-up to the
                     // same person, so say one exists instead of offering another.
                     <Chip tone="sky"><CornerUpLeft size={11} /> follow-up drafted</Chip>
-                  ) : (
+                  ) : fuState.kind === 'done' ? (
+                    <Chip tone="slate" title={`Your cadence is ${fuState.total} follow-up${fuState.total === 1 ? '' : 's'}. Add a step in Settings to chase again.`}>
+                      <CornerUpLeft size={11} /> {fuState.sent} of {fuState.total} follow-ups sent
+                    </Chip>
+                  ) : fuState.kind === 'off' ? null : (
                     <Button size="sm" icon={CornerUpLeft} onClick={onFollowUp} disabled={busy}
                       variant={followUpDue ? 'primary' : 'secondary'}>
-                      {followUpDue ? 'Follow up (due)' : 'Draft follow-up'}
+                      {fuState.total > 1
+                        ? `${followUpDue ? 'Follow up (due)' : 'Draft follow-up'} · ${fuState.step} of ${fuState.total}`
+                        : (followUpDue ? 'Follow up (due)' : 'Draft follow-up')}
                     </Button>
                   )}
                 </>

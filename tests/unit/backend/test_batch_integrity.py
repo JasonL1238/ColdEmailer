@@ -817,14 +817,16 @@ def test_deleting_a_company_with_only_drafts_is_not_blocked():
 class _RecordingComposer:
     def __init__(self):
         self.calls = []
+        self.follow_up_kwargs = []
 
     def compose(self, contact, company, **kwargs):
         self.calls.append(("compose", kwargs.get("email_type")))
         return {"subject": "Internship inquiry at Acme", "body": "cold first contact",
                 "used_template_fallback": True, "fallback_reason": "llm_unavailable"}
 
-    def compose_follow_up(self, contact, company, original):
+    def compose_follow_up(self, contact, company, original, **kwargs):
         self.calls.append(("compose_follow_up", original["id"]))
+        self.follow_up_kwargs.append(kwargs)
         return {"subject": f"Re: {original['subject']}", "body": "just following up",
                 "used_template_fallback": True, "fallback_reason": "llm_unavailable"}
 

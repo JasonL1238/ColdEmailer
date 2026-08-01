@@ -1,8 +1,8 @@
 /* Settings: sender profile, Gmail connection, AI provider, limits */
 import { useEffect, useState } from 'react'
 import toast from 'react-hot-toast'
-import { Save, Unplug, CheckCircle2, XCircle, Sparkles, Mail } from 'lucide-react'
-import { settingsAPI, gmailAPI, errMessage } from '../api'
+import { Save, Unplug, CheckCircle2, XCircle, Sparkles, Mail, CornerUpLeft, Plus } from 'lucide-react'
+import { settingsAPI, gmailAPI, cadenceAPI, errMessage } from '../api'
 import { Button, Chip } from '../ui'
 import { useApp } from '../App'
 
@@ -150,6 +150,115 @@ export default function Settings() {
           </div>
         </div>
       </div>
+
+      <FollowUpCadence />
     </div>
   )
 }
+
+/* How many times one silent contact gets chased, and how long the gaps are.
+
+   Defaults to a single nudge after a week — what this app did before cadences
+   existed. Extra rungs mean more mail to real people, so they are added
+   deliberately here rather than arriving with an update. */
+export const cadenceSummary = (cadence) => {
+  const steps = cadence?.steps || []
+  if (!cadence?.enabled || steps.length === 0) return 'No follow-ups will be drafted.'
+  const days = steps.reduce((sum, gap, i) => [...sum, (sum[i - 1] || 0) + gap], [])
+  return `${steps.length} follow-up${steps.length === 1 ? '' : 's'}, on day `
+    + days.join(', ') + ' after the first email (if they stay silent).'
+}
+
+function FollowUpCadence() {
+  const { settings, refreshSettings } = useApp()
+  const [draft, setDraft] = useState(null)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (settings?.follow_up_cadence && draft === null) {
+      setDraft({
+        enabled: !!settings.follow_up_cadence.enabled,
+        steps: [...(settings.follow_up_cadence.steps || [])],
+      })
+    }
+  }, [settings, draft])
+
+  if (!draft) return null
+
+  const setStep = (i, value) => setDraft((d) => {
+    const steps = [...d.steps]
+    // Clamped on entry, not on save: an out-of-range gap decides when real
+    // email goes out, so it must never be possible to look at a saved value
+    // and a different stored one.
+    steps[i] = Math.max(1, Math.min(90, Number(value) || 1))
+    return { ...d, steps }
+  })
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      const { data } = await cadenceAPI.update(draft)
+      setDraft({ enabled: !!data.enabled, steps: [...(data.steps || [])] })
+      await refreshSettings()
+      toast.success('Follow-up cadence saved')
+    } catch (e) { toast.error(errMessage(e)) }
+    finally { setSaving(false) }
+  }
+
+  return (
+    <div className="card card-pad stack mt-16" style={{ gap: 12 }}>
+      <div className="row-between">
+        <div className="row" style={{ gap: 8 }}>
+          <CornerUpLeft size={16} style={{ color: 'var(--text-2)' }} />
+          <b>Follow-up cadence</b>
+        </div>
+        <label className="row small" style={{ gap: 6, cursor: 'pointer' }}>
+          <input type="checkbox" className="checkbox" checked={draft.enabled}
+            onChange={(e) => setDraft((d) => ({ ...d, enabled: e.target.checked }))} />
+          Draft follow-ups
+        </label>
+      </div>
+
+      <div className="small muted">{cadenceSummary(draft)}</div>
+
+      <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+        {draft.steps.map((gap, i) => (
+          <div key={i} className="row" style={{ gap: 6 }}>
+            <span className="tiny muted">
+              {i === 0 ? 'First follow-up after' : `then ${ordinal(i + 1)} after`}
+            </span>
+            <input className="input" type="number" min={1} max={90} value={gap}
+              style={{ width: 70 }} disabled={!draft.enabled}
+              onChange={(e) => setStep(i, e.target.value)} />
+            <span className="tiny muted">days</span>
+            <Button size="sm" variant="ghost"
+              onClick={() => setDraft((d) => ({ ...d, steps: d.steps.filter((_, j) => j !== i) }))}>
+              Remove
+            </Button>
+          </div>
+        ))}
+        {draft.steps.length < 4 && (
+          <Button size="sm" icon={Plus}
+            onClick={() => setDraft((d) => ({ ...d, steps: [...d.steps, 7] }))}>
+            Add step
+          </Button>
+        )}
+      </div>
+
+      <div className="tiny muted">
+        Each gap counts from the last message that person actually received, not
+        from the first. Nothing sends itself — due follow-ups are written as
+        drafts for you to read and send. A reply, a bounce, or trashing the
+        draft stops the sequence.
+      </div>
+
+      <div>
+        <Button size="sm" variant="primary" icon={Save} onClick={save} disabled={saving}>
+          {saving ? 'Saving…' : 'Save cadence'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+const ordinal = (n) => ({ 2: 'the next', 3: 'the third', 4: 'the fourth' }[n] || `#${n}`)

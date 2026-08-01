@@ -163,9 +163,14 @@ _ADDED_COLUMNS = {
     # substitute silently — and when EMAIL_LLM_MODEL names one vendor's model
     # while EMAIL_LLM_PROVIDER names another, it substitutes a different vendor
     # at a very different price — and the resulting draft looks identical.
+    # `follow_up_step` is which rung of the cadence this message is: 0 for a
+    # first-contact email, 1 for the first follow-up, 2 for the next. Without it
+    # a second follow-up is indistinguishable from the first, so the composer
+    # cannot vary its wording and nothing can tell "one nudge" from "three".
     "emails": {"send_attempted_at": "TEXT", "send_attempt_error": "TEXT",
                "response_verified_at": "TEXT", "recipient_email": "TEXT",
-               "llm_model": "TEXT", "bounced_at": "TEXT"},
+               "llm_model": "TEXT", "bounced_at": "TEXT",
+               "follow_up_step": "INTEGER DEFAULT 0"},
     # Why the search matched this company, per the model that suggested it.
     # Kept apart from `summary` on purpose: summary is scraped evidence and is
     # quoted into emails, this is an unverified guess and must not be.
@@ -209,6 +214,67 @@ _HAS_FOLLOW_UP_SQL = (
     "WHERE f.status <> 'trashed' AND (o.id = e.id OR "
     "(e.contact_id IS NOT NULL AND o.contact_id = e.contact_id)))"
 )
+
+
+# How many follow-ups have actually *gone out* to this person, and whether one
+# is sitting unsent right now. `has_follow_up` above cannot answer either: it
+# collapses "drafted" and "delivered" into one flag, which is exactly the
+# distinction a cadence turns on — a sent follow-up advances to the next rung,
+# an unsent one means there is nothing to do until the user sends or trashes it.
+#
+# Both count by `is_follow_up` + contact rather than by joining
+# `original_email_id`, so deleting the email a follow-up answered cannot make
+# the follow-up itself vanish from the count and re-arm a rung already used.
+_FOLLOW_UPS_SENT_SQL = (
+    "(SELECT COUNT(*) FROM emails f WHERE f.is_follow_up = 1 AND f.status = 'sent' "
+    "AND e.contact_id IS NOT NULL AND f.contact_id = e.contact_id)"
+)
+_FOLLOW_UP_PENDING_SQL = (
+    "EXISTS (SELECT 1 FROM emails f WHERE f.is_follow_up = 1 "
+    "AND f.status NOT IN ('sent', 'trashed') "
+    "AND e.contact_id IS NOT NULL AND f.contact_id = e.contact_id)"
+)
+
+
+# The cadence: how many days of silence before each successive follow-up, and
+# therefore how many there are at all. `[7]` is one nudge a week after the
+# first-contact email — exactly what this app did before cadences existed, and
+# the default for that reason. Adding rungs sends more mail to real people, so
+# it is a choice the user makes rather than one an upgrade makes for them.
+#
+# Each gap is measured from the *previous message to that person*, not from the
+# first one: with [7, 7] the second follow-up goes a week after the first, not
+# on the same day it becomes eligible.
+FOLLOW_UP_CADENCE_DEFAULT = {"enabled": True, "steps": [7]}
+MAX_FOLLOW_UP_STEPS = 4
+MIN_FOLLOW_UP_GAP_DAYS = 1
+MAX_FOLLOW_UP_GAP_DAYS = 90
+
+
+def normalize_follow_up_cadence(raw: Any) -> Dict[str, Any]:
+    """Coerce whatever is stored (or posted) into a cadence we can act on.
+
+    Deliberately total: a corrupt or hand-edited settings row must not be able
+    to stop follow-ups working, and must never widen the schedule beyond the
+    caps — an out-of-range gap is clamped, not honoured, because the value ends
+    up deciding when real email is sent.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    steps: List[int] = []
+    for value in (raw.get("steps") or [])[:MAX_FOLLOW_UP_STEPS]:
+        if isinstance(value, bool):        # bool is an int subclass; not a gap
+            continue
+        try:
+            gap = int(value)
+        except (TypeError, ValueError):
+            continue
+        steps.append(max(MIN_FOLLOW_UP_GAP_DAYS, min(MAX_FOLLOW_UP_GAP_DAYS, gap)))
+    if not steps:
+        # No usable rungs. Keep the shape valid and switch the pipeline off
+        # rather than silently falling back to a schedule nobody asked for.
+        return {"enabled": False, "steps": []}
+    return {"enabled": bool(raw.get("enabled", True)), "steps": steps}
 
 
 # True when *this person* has answered any of our emails — not just when this
@@ -659,6 +725,25 @@ class Database:
         self.set_setting("profile", profile)
         return profile
 
+    def get_follow_up_cadence(self) -> Dict[str, Any]:
+        """The configured follow-up schedule, always in a usable shape.
+
+        Absent means "never configured", which gets the one-nudge default the
+        app has always behaved as. Present-but-unusable is a different thing —
+        a user who emptied the schedule meant to switch follow-ups off, so that
+        is honoured rather than reset back to the default.
+        """
+        stored = self.get_setting("follow_up_cadence")
+        if stored is None:
+            return dict(FOLLOW_UP_CADENCE_DEFAULT,
+                        steps=list(FOLLOW_UP_CADENCE_DEFAULT["steps"]))
+        return normalize_follow_up_cadence(stored)
+
+    def update_follow_up_cadence(self, raw: Any) -> Dict[str, Any]:
+        cadence = normalize_follow_up_cadence(raw)
+        self.set_setting("follow_up_cadence", cadence)
+        return cadence
+
     # ---------- companies ----------
 
     def create_company(self, name: str, **kwargs) -> Dict[str, Any]:
@@ -1044,7 +1129,9 @@ class Database:
             "response_at": kwargs.get("response_at"),
             "response_verified_at": kwargs.get("response_verified_at"),
             "original_email_id": kwargs.get("original_email_id"),
+            "bounced_at": kwargs.get("bounced_at"),
             "is_follow_up": 1 if kwargs.get("is_follow_up") else 0,
+            "follow_up_step": int(kwargs.get("follow_up_step") or 0),
             "used_template_fallback": 1 if kwargs.get("used_template_fallback") else 0,
             "fallback_reason": kwargs.get("fallback_reason"),
             "llm_model": kwargs.get("llm_model"),
@@ -1070,6 +1157,8 @@ class Database:
                       ct.bounced_at AS contact_bounced_at,
                       c.name AS company_name,
                       {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
+                      {_FOLLOW_UPS_SENT_SQL} AS follow_ups_sent,
+                      {_FOLLOW_UP_PENDING_SQL} AS follow_up_pending,
                       {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
                       {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
                       {_CONTACT_REPLY_UNVERIFIED_SQL} AS contact_reply_unverified
@@ -1088,7 +1177,7 @@ class Database:
             "resume_id", "used_template_fallback", "fallback_reason", "llm_model",
             "custom_instructions", "is_follow_up", "original_email_id",
             "send_attempted_at", "send_attempt_error", "recipient_email",
-            "bounced_at",
+            "bounced_at", "follow_up_step",
         }
         updates = {k: v for k, v in updates.items() if k in allowed}
         for bool_key in ("has_response", "is_follow_up", "used_template_fallback"):
@@ -1108,6 +1197,8 @@ class Database:
                    ct.bounced_at AS contact_bounced_at,
                    c.name AS company_name,
                    {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
+                   {_FOLLOW_UPS_SENT_SQL} AS follow_ups_sent,
+                   {_FOLLOW_UP_PENDING_SQL} AS follow_up_pending,
                    {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
                    {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
                    {_CONTACT_REPLY_UNVERIFIED_SQL} AS contact_reply_unverified
@@ -1122,76 +1213,136 @@ class Database:
         sql += " ORDER BY e.created_at DESC"
         return [self._annotate_email(row) for row in self.query(sql, params)]
 
-    def get_follow_up_candidates(self, days: int = 7) -> List[Dict[str, Any]]:
-        """One candidate per contact who has never replied to anything.
+    def get_follow_up_candidates(self, days: Optional[int] = None
+                                 ) -> List[Dict[str, Any]]:
+        """One candidate per contact who is due for their next follow-up.
 
-        Filtering has_response on the individual email row is not enough: a
-        contact who answered a later email would still surface here as "went
-        quiet", and a contact mailed three times would be offered three
-        separate follow-ups. The MAX(e.sent_at) aggregate makes SQLite pick
-        the most recent unanswered email for each contact.
+        Cadence-aware. Which rung a contact is on is `sent follow-ups + 1`, and
+        the wait before it is `steps[rung - 1]` days of silence measured from
+        the *most recent message we sent them* — original or follow-up. Passing
+        `days` overrides the gap for every rung (the `?days=` API knob), but
+        never the rung count: nothing can talk this into a fifth nudge.
 
-        "Replied" means a reply the current checker confirmed. An unverified
-        legacy flag is not evidence, and treating it as one silently removed
-        most of the pipeline from this list — the banner said "2 contacts went
-        quiet" while a hundred genuinely unanswered ones were suppressed.
+        The exclusions:
 
-        Every test that decides whether a *contact* is due has to run on the
-        whole group, not on individual rows. A row-level `sent_at < cutoff`
-        or "this email has no follow-up yet" simply deletes the newest email
-        from the group, and MAX() then hands back a superseded one: the
-        contact you mailed two days ago (or already followed up on) reappears
-        as "gone quiet", attached to a month-old message.
+        * A reply the current checker confirmed, on *any* email to this person.
+          An unverified legacy flag is not evidence — treating it as one
+          silently removed most of the pipeline, so the banner said "2 contacts
+          went quiet" while a hundred genuinely unanswered ones were hidden.
+        * A bounce, at contact or email level. A bounce reads as "no reply",
+          which is exactly what makes a contact due, so a dead address was
+          chased on a schedule and every retry cost sending reputation that the
+          deliverable addresses depend on.
+        * Any follow-up to this person that is not sent — a draft is already
+          waiting on the user, and a trashed one is them saying no.
+        * No unanswered first-contact email left to hang the follow-up on.
+
+        Grouping is done here rather than with `GROUP BY … MAX(sent_at)`. That
+        aggregate picks the non-aggregate columns from an arbitrary row, so
+        every row-level filter in the WHERE clause silently deleted the newest
+        email from a group and handed back a superseded one — the contact you
+        mailed yesterday reappearing as "gone quiet", attached to month-old
+        mail. Cadence arithmetic needs the whole group anyway: the wait is
+        measured from the last touch, which is usually a follow-up, and those
+        were exactly the rows the old WHERE clause threw away.
         """
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        cadence = self.get_follow_up_cadence()
+        steps = list(cadence.get("steps") or [])
+        if not cadence.get("enabled") or not steps:
+            return []
+
         rows = self.query(
             """SELECT e.*, ct.name AS contact_name,
                    COALESCE(e.recipient_email, ct.email) AS contact_email,
-                      c.name AS company_name, MAX(e.sent_at) AS _latest_sent_at
+                      ct.bounced_at AS contact_bounced_at,
+                      c.name AS company_name
                FROM emails e
                LEFT JOIN contacts ct ON e.contact_id = ct.id
                LEFT JOIN companies c ON ct.company_id = c.id
-               WHERE e.status='sent' AND e.has_response=0 AND e.is_follow_up=0
-                 AND e.sent_at IS NOT NULL
+               WHERE e.status='sent' AND e.sent_at IS NOT NULL
+                 -- A rung is spent by being delivered, not by carrying a
+                 -- usable timestamp. `migrate_legacy_data` imports a legacy
+                 -- row with "status": "sent" and no date as sent_at NULL, and
+                 -- `repair_delivered_email_status` only backfills rows with a
+                 -- gmail_message_id — so such a follow-up was invisible to
+                 -- both the rung count and every blocking test, and the
+                 -- contact was handed a second copy of the nudge they already
+                 -- received. The pre-cadence query had no date predicate at
+                 -- all, so this was a regression, not an inherited gap.
                  AND NOT EXISTS (
-                     SELECT 1 FROM emails f WHERE f.original_email_id = e.id
-                 )
-                 AND NOT EXISTS (
-                     SELECT 1 FROM emails f
-                     JOIN emails o ON f.original_email_id = o.id
-                     WHERE e.contact_id IS NOT NULL
-                       AND o.contact_id = e.contact_id
+                     SELECT 1 FROM emails u
+                     WHERE (u.is_follow_up = 1
+                            OR u.original_email_id IS NOT NULL)
+                       AND u.status = 'sent' AND u.sent_at IS NULL
+                       AND e.contact_id IS NOT NULL
+                       AND u.contact_id = e.contact_id
                  )
                  AND NOT EXISTS (
                      SELECT 1 FROM emails r
                      WHERE r.contact_id = e.contact_id AND r.has_response = 1
                        AND r.response_verified_at IS NOT NULL
                  )
-                 -- A bounce reads as "no reply", which is exactly what makes a
-                 -- contact due for a follow-up. Chasing an address the
-                 -- postmaster has already rejected cannot succeed, and each
-                 -- retry costs sending reputation that the deliverable
-                 -- addresses depend on.
-                 --
-                 -- Both tests are contact-level. A row-level `e.bounced_at IS
-                 -- NULL` is exactly what the docstring above warns against: it
-                 -- deletes the bounced email from the group, and MAX() then
-                 -- hands back a superseded older one, so the contact
-                 -- reappears as "gone quiet" attached to stale mail.
                  AND ct.bounced_at IS NULL
                  AND NOT EXISTS (
                      SELECT 1 FROM emails b
                      WHERE b.contact_id = e.contact_id
                        AND b.bounced_at IS NOT NULL
                  )
-               GROUP BY COALESCE(e.contact_id, e.id)
-               HAVING _latest_sent_at < ?
-               ORDER BY _latest_sent_at ASC""",
-            (cutoff,),
-        )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM emails f
+                     WHERE (f.is_follow_up = 1
+                            OR f.original_email_id IS NOT NULL)
+                       AND f.status <> 'sent'
+                       AND e.contact_id IS NOT NULL
+                       AND f.contact_id = e.contact_id
+                 )
+               ORDER BY e.sent_at ASC""")
+
+        groups: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
-            row.pop("_latest_sent_at", None)
-        return rows
+            # An email whose contact row is gone stands alone, the way
+            # COALESCE(contact_id, id) used to group it.
+            groups.setdefault(row.get("contact_id") or f"email:{row['id']}",
+                              []).append(row)
+
+        now = datetime.now()
+        out: List[Dict[str, Any]] = []
+        for group in groups.values():
+            sent_follow_ups = sum(1 for r in group if r.get("is_follow_up"))
+            step = sent_follow_ups + 1
+            if step > len(steps):
+                continue                       # cadence finished for this person
+            # Every sent message counts as a touch, including one carrying an
+            # unverified reply flag: they still received it, so the clock for
+            # the next nudge starts there.
+            last_touch = max(r["sent_at"] for r in group)
+            gap = steps[step - 1] if days is None else days
+            cutoff = (now - timedelta(days=gap)).isoformat(timespec="seconds")
+            if last_touch >= cutoff:
+                continue
+            # The follow-up threads onto a first-contact email, and one that is
+            # already flagged as answered is the wrong premise for "no reply
+            # yet" even when the flag was never verified.
+            anchors = [r for r in group
+                       if not r.get("is_follow_up") and not r.get("has_response")]
+            if not anchors:
+                continue
+            candidate = dict(max(anchors, key=lambda r: r["sent_at"]))
+            candidate["follow_ups_sent"] = sent_follow_ups
+            # Named apart from the row's own `follow_up_step` column (0 here —
+            # this is a first-contact email); this is the rung it would create.
+            candidate["next_follow_up_step"] = step
+            candidate["follow_up_steps_total"] = len(steps)
+            candidate["last_touch_at"] = last_touch
+            try:
+                candidate["days_since_touch"] = (
+                    now - datetime.fromisoformat(last_touch)).days
+            except (TypeError, ValueError):
+                candidate["days_since_touch"] = None
+            out.append(candidate)
+
+        out.sort(key=lambda r: r["last_touch_at"])
+        return out
 
     # ---------- jobs ----------
 

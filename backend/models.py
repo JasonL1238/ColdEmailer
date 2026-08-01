@@ -57,6 +57,26 @@ class ProfileUpdate(BaseModel):
         return validate_email_address(v)
 
 
+class CadenceUpdate(BaseModel):
+    """The follow-up schedule: days of silence before each successive nudge.
+
+    Bounded here as well as in `normalize_follow_up_cadence` — this rejects a
+    malformed request outright, the normalizer keeps a settings row that was
+    written before these bounds existed (or edited by hand) usable. The caps
+    matter because this value decides when real email goes to real people.
+    """
+    enabled: bool = True
+    steps: List[int] = Field(default_factory=list, max_length=4)
+
+    @field_validator("steps")
+    @classmethod
+    def _check_steps(cls, v):
+        for gap in v:
+            if not 1 <= gap <= 90:
+                raise ValueError("Each follow-up gap must be 1 to 90 days")
+        return v
+
+
 class DiscoveryRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=300)
     count: int = Field(10, ge=1, le=100)

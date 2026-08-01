@@ -169,7 +169,11 @@ export default function Dashboard() {
               <div className="row">
                 <Clock size={17} style={{ color: 'var(--amber)' }} />
                 <div>
-                  <b>{follow_ups_due} {follow_ups_due === 1 ? 'contact hasn’t' : 'contacts haven’t'} replied in over a week.</b>{' '}
+                  {/* Not "in over a week": the wait is whatever the cadence
+                      says, so with a 3-day first step this claimed a week for
+                      someone emailed on Monday. */}
+                  <b>{follow_ups_due} {follow_ups_due === 1 ? 'contact is' : 'contacts are'} due
+                  for a follow-up.</b>{' '}
                   <span className="muted">Following up doubles response rates.</span>
                 </div>
               </div>

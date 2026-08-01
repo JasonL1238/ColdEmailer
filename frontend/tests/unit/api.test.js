@@ -17,7 +17,7 @@ vi.mock('axios', () => ({
 
 import {
   discoveryAPI, companiesAPI, contactsAPI, resumesAPI, emailsAPI,
-  settingsAPI, dashboardAPI, errMessage,
+  settingsAPI, dashboardAPI, cadenceAPI, errMessage,
 } from '../../src/api.js'
 
 beforeEach(() => {
@@ -98,6 +98,38 @@ describe('API client', () => {
     dashboardAPI.get()
     expect(mockAxiosInstance.get).toHaveBeenCalledWith('/settings')
     expect(mockAxiosInstance.get).toHaveBeenCalledWith('/dashboard')
+  })
+})
+
+describe('follow-up cadence wiring', () => {
+  it('asks for due follow-ups without a days override', () => {
+    /* This one line decides whether the cadence is honoured at all. With the
+       old `days = 7` default, Emails.jsx's argument-less call pinned every
+       query to a week: a "chase after 3 days" setting never surfaced anyone,
+       and a [7,14] cadence listed people as due for rung 2 whom the server
+       then refused with "nobody is due". Reverting it broke no test. */
+    emailsAPI.followUps()
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/follow-ups', { params: {} })
+  })
+
+  it('passes an explicit days override through', () => {
+    emailsAPI.followUps(3)
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/follow-ups', { params: { days: 3 } })
+  })
+
+  it('drafts and cancels the batch run', () => {
+    emailsAPI.draftAllFollowUps()
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/follow-ups/draft-all')
+    emailsAPI.cancelDraftFollowUps('job1')
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/follow-ups/draft-all/job1/cancel')
+  })
+
+  it('reads and writes the cadence', () => {
+    cadenceAPI.get()
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/follow-ups/cadence')
+    cadenceAPI.update({ enabled: true, steps: [3, 7] })
+    expect(mockAxiosInstance.put).toHaveBeenCalledWith('/follow-ups/cadence',
+      { enabled: true, steps: [3, 7] })
   })
 })
 

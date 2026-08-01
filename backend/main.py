@@ -6,7 +6,7 @@ import json
 import os
 import threading
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -22,6 +22,8 @@ if os.path.isfile(_root_env):
 
 from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
                 normalize_linkedin_url,
+                MAX_FOLLOW_UP_STEPS, MIN_FOLLOW_UP_GAP_DAYS,
+                MAX_FOLLOW_UP_GAP_DAYS,
                 repair_contact_email_kinds,
                 repair_contact_reply_status, repair_delivered_email_status,
                 repair_mismatched_company_sites,
@@ -39,6 +41,7 @@ from generation import GenerationBusy, GenerationService
 from models import (
     BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
     ContactCreate, ContactUpdate, DeepResearchRequest, DiscoveryRequest,
+    CadenceUpdate,
     EmailUpdate, EnrichRequest, GenerateRequest, ProfileUpdate, ResumeUpdate,
     SendRequest, LinkedInDraftRequest,
 )
@@ -193,6 +196,10 @@ async def get_settings():
     return {
         "profile": profile,
         "profile_incomplete": missing,
+        # Carried on the app-wide settings payload because every screen that
+        # offers a follow-up has to know how many rungs there are before it can
+        # say whether another one is owed.
+        "follow_up_cadence": db.get_follow_up_cadence(),
         "llm_provider": get_cloud_llm_provider(),
         "gmail_connected": email_sender.is_connected(),
         "gmail_credentials_present": os.path.isfile(email_sender.credentials_path),
@@ -1431,7 +1438,21 @@ async def regenerate_email(email_id: str):
         if not original:
             raise HTTPException(400, "The original email this follow-up replies to "
                                      "no longer exists, so it cannot be rewritten.")
-        composed = composer.compose_follow_up(contact, company, original)
+        # Rewrite the rung it already is. Recomposing every follow-up as step 1
+        # would hand the third nudge the first one's wording — the exact
+        # repetition the cadence exists to prevent.
+        cadence_steps = db.get_follow_up_cadence().get("steps") or []
+        step = int(email.get("follow_up_step") or 0) or (
+            db.query_one("SELECT COUNT(*) AS n FROM emails WHERE contact_id=? "
+                         "AND is_follow_up=1 AND status='sent'",
+                         (email["contact_id"],))["n"] + 1)
+        previous = db.query_one(
+            "SELECT * FROM emails WHERE contact_id=? AND status='sent' "
+            "AND sent_at IS NOT NULL ORDER BY sent_at DESC LIMIT 1",
+            (email["contact_id"],))
+        composed = composer.compose_follow_up(
+            contact, company, original, step=step,
+            total_steps=max(step, len(cadence_steps)), previous=previous)
     else:
         try:
             composed = composer.compose(
@@ -1454,8 +1475,201 @@ async def regenerate_email(email_id: str):
 
 # ---------- follow-ups ----------
 
+def _wait_for_generation_slot(job_id: str, seconds: float) -> bool:
+    """Sleep out a per-minute window in small steps so Stop still works.
+    Returns True when the job was cancelled while waiting."""
+    import time as _t
+    deadline = _t.monotonic() + max(0.0, seconds)
+    while True:
+        remaining = deadline - _t.monotonic()
+        if remaining <= 0:
+            break
+        job = db.get_job(job_id)
+        if not job or job["status"] == "cancelled":
+            return True
+        _t.sleep(min(0.5, remaining))
+    job = db.get_job(job_id)
+    return not job or job["status"] == "cancelled"
+
+
+def _thread_root(email: Dict) -> Dict:
+    """The first-contact email a follow-up hangs off.
+
+    Follow-ups are written with `original_email_id` pointing straight at the
+    root, so this walks at most one link — but it is written as a bounded walk
+    because a hand-edited or legacy row could chain, and a cycle here would
+    hang the request thread rather than fail it.
+    """
+    current = email
+    seen = {current.get("id")}
+    while current.get("is_follow_up") and current.get("original_email_id"):
+        parent_id = current["original_email_id"]
+        if parent_id in seen:
+            break
+        seen.add(parent_id)
+        parent = db.get_email(parent_id)
+        if not parent:
+            break
+        current = parent
+    return current
+
+
+def _follow_up_plan(contact_id: Optional[str], *, manual: bool) -> Dict[str, Any]:
+    """Whether this person may get another follow-up, and which rung it is.
+
+    Returns {"step", "total", "previous", "refusal"}. Every caller that creates
+    a follow-up goes through here, so the batch button and the single button
+    cannot drift into disagreeing about who is safe to chase.
+
+    `manual` is the user clicking "Draft follow-up" on a specific sent email.
+    It relaxes exactly one rule: a follow-up they trashed retires the contact
+    from the automatic due list (trashing is how you say "not this one"), but
+    it must not veto them asking for another one by hand.
+    """
+    cadence = db.get_follow_up_cadence()
+    steps = list(cadence.get("steps") or [])
+    plan = {"step": None, "total": len(steps), "previous": None,
+            "refusal": None, "manual": manual}
+    if not cadence.get("enabled") or not steps:
+        plan["refusal"] = ("Follow-ups are switched off. Turn the cadence back on "
+                           "in Settings to draft one.")
+        return plan
+    if not contact_id:
+        plan["refusal"] = "Contact for this email no longer exists"
+        return plan
+
+    # A follow-up is written on the premise of silence ("no reply yet"). The
+    # reply can easily sit on a sibling email, so ask about the *person*, the
+    # way get_follow_up_candidates does — the row-level has_response flag says
+    # nothing about whether they have already written back.
+    #
+    # Only a reply the current checker verified may block this. An unverified
+    # legacy flag (the old checker counted bounces, auto-replies and our own
+    # messages) is not evidence, and letting it refuse switched follow-ups off
+    # for most of the database.
+    if db.query_one(
+            "SELECT 1 FROM emails WHERE contact_id=? AND has_response=1 "
+            "AND response_verified_at IS NOT NULL LIMIT 1", (contact_id,)):
+        plan["refusal"] = (
+            "This person already replied (on one of your emails to them), so a "
+            "\"no reply yet\" follow-up would be wrong. Reply in Gmail instead.")
+        return plan
+
+    # The postmaster already refused this address. A bounce reads as "no
+    # reply", which is exactly the condition that makes someone a follow-up
+    # candidate — the due list has always known that, but the manual button
+    # did not, so the one route a user actually clicks was the one that would
+    # cheerfully draft mail to a dead mailbox.
+    contact_row = db.get_contact(contact_id) or {}
+    if contact_row.get("bounced_at") or db.query_one(
+            "SELECT 1 FROM emails WHERE contact_id=? AND bounced_at IS NOT NULL "
+            "LIMIT 1", (contact_id,)):
+        plan["refusal"] = (
+            "Mail to this address bounced, so a follow-up would bounce too. Add "
+            "a different address for this person first.")
+        return plan
+
+    # Nothing dedupes downstream: two clicks used to mean two near-identical
+    # follow-ups in Drafts, both caught by "Select all", both delivered. The
+    # question is per *person*, not per row — someone with several sent
+    # first-contact emails was otherwise given one follow-up per email.
+    #
+    # `sent` is never blocking: that rung is spent, and the count below decides
+    # whether another is owed. `trashed` differs by route. Trashing a draft is
+    # how the user says "not this one", so it retires the contact from the
+    # automatic due list — but it must not veto them clicking Draft follow-up
+    # themselves, which is a fresh, explicit request.
+    spent = "('sent', 'trashed')" if manual else "('sent')"
+    if db.query_one(
+            f"SELECT 1 FROM emails WHERE contact_id=? "
+            f"AND (is_follow_up=1 OR original_email_id IS NOT NULL) "
+            f"AND status NOT IN {spent} LIMIT 1", (contact_id,)):
+        plan["refusal"] = ("A follow-up to this person has already been drafted "
+                           "— find it in Drafts.")
+        return plan
+
+    # No sent_at predicate on purpose. A rung is spent by being delivered, and
+    # a legacy import can leave a delivered follow-up with no timestamp
+    # (migrate_legacy_data passes the legacy row's missing date straight
+    # through). Filtering those out made them invisible to the rung count, so
+    # this handed out rung 1 again to someone who already had it.
+    sent_rows = db.query(
+        # Undated rows sort first, so sent_rows[-1] — the message the next rung
+        # is written against — is the most recent one we actually know a date
+        # for.
+        "SELECT * FROM emails WHERE contact_id=? AND status='sent' "
+        "ORDER BY sent_at IS NULL DESC, sent_at ASC", (contact_id,))
+    if not sent_rows:
+        plan["refusal"] = "Nothing has been sent to this person yet."
+        return plan
+    already = sum(1 for r in sent_rows
+                  if r.get("is_follow_up") or r.get("original_email_id"))
+    if already >= len(steps):
+        plan["refusal"] = (
+            f"All {len(steps)} follow-up{'s' if len(steps) != 1 else ''} in your "
+            f"cadence have already gone to this person. Add a step in Settings "
+            f"if you want another.")
+        return plan
+    plan["step"] = already + 1
+    plan["previous"] = sent_rows[-1]
+    return plan
+
+
+# One follow-up may be created at a time, process-wide.
+#
+# Composing a follow-up is an LLM round trip lasting seconds, and it sits
+# *between* the gate and the INSERT. So the batch job could be inside the call
+# for contact C while the user clicked "Draft follow-up" on C in another tab:
+# both gates passed, both wrote, and C ended up with two rung-1 drafts carrying
+# the same text — both caught by "Select all", both delivered. Nothing
+# downstream dedupes drafts, and the in-batch send guard only catches two
+# follow-ups inside a single batch.
+#
+# A lock rather than a unique index because the rule is "one *unsent* follow-up
+# per person", which SQLite cannot express as a partial unique index over a
+# mutable status column without also forbidding the legitimate second rung.
+_follow_up_lock = threading.Lock()
+
+
+def _create_follow_up(original: Dict, contact: Dict, plan: Dict) -> Dict:
+    """Compose and store one rung, re-checking the gate under the lock.
+
+    `plan` is what the caller was told a moment ago; the authoritative decision
+    is the one made here, with nothing able to interleave between it and the
+    INSERT. Returns None when the recheck now refuses.
+    """
+    company = db.get_company(contact["company_id"]) if contact.get("company_id") else None
+    composed = composer.compose_follow_up(
+        contact, company, original,
+        step=plan["step"], total_steps=plan["total"], previous=plan["previous"])
+    with _follow_up_lock:
+        fresh = _follow_up_plan(contact["id"], manual=plan.get("manual", False))
+        if fresh["refusal"]:
+            return None
+        follow_up = db.create_email(
+            contact_id=contact["id"],
+            company_id=contact.get("company_id"),
+            email_type="follow_up",
+            resume_id=original.get("resume_id"),
+            subject=composed["subject"],
+            body=composed["body"],
+            status="draft",
+            original_email_id=original["id"],
+            is_follow_up=True,
+            follow_up_step=fresh["step"],
+            used_template_fallback=composed["used_template_fallback"],
+            fallback_reason=composed["fallback_reason"],
+            llm_model=composed.get("llm_model"),
+        )
+    db.log_event("email", follow_up["id"], "follow_up_generated",
+                 f"{contact.get('name') or contact.get('email') or ''} "
+                 f"(step {fresh['step']} of {fresh['total']})".strip())
+    return follow_up
+
+
 @app.get("/api/follow-ups")
-async def follow_ups_due(days: int = Query(7, ge=1, le=90)):
+async def follow_ups_due(days: Optional[int] = Query(None, ge=1, le=90)):
+    """Contacts due for their next rung. `days` overrides the cadence gap."""
     candidates = db.get_follow_up_candidates(days=days)
     for c in candidates:
         try:
@@ -1466,68 +1680,167 @@ async def follow_ups_due(days: int = Query(7, ge=1, le=90)):
     return candidates
 
 
+@app.get("/api/follow-ups/cadence")
+async def get_follow_up_cadence():
+    cadence = db.get_follow_up_cadence()
+    return {**cadence, "max_steps": MAX_FOLLOW_UP_STEPS,
+            "min_gap_days": MIN_FOLLOW_UP_GAP_DAYS,
+            "max_gap_days": MAX_FOLLOW_UP_GAP_DAYS}
+
+
+@app.put("/api/follow-ups/cadence")
+async def set_follow_up_cadence(payload: CadenceUpdate):
+    cadence = db.update_follow_up_cadence(payload.model_dump())
+    db.log_event("settings", "follow_up_cadence", "cadence_updated",
+                 f"{'on' if cadence['enabled'] else 'off'}: "
+                 f"{cadence['steps'] or 'no steps'}")
+    return cadence
+
+
 @app.post("/api/emails/{email_id}/follow-up")
 async def generate_follow_up(email_id: str):
-    original = db.get_email(email_id)
-    if not original or original["status"] != "sent":
+    email = db.get_email(email_id)
+    if not email or email["status"] != "sent":
         raise HTTPException(404, "Original sent email not found")
-    # Nothing dedupes downstream: two clicks used to mean two near-identical
-    # follow-ups in Drafts, both caught by "Select all", both delivered.
-    #
-    # The question is per *person*, not per row — the same way the reply guard
-    # below and get_follow_up_candidates ask it. Someone with several sent
-    # first-contact emails was otherwise offered (and given) one follow-up per
-    # email, i.e. two "just following up on my note" messages to one human.
-    existing = db.query_one(
-        "SELECT f.id FROM emails f JOIN emails o ON f.original_email_id = o.id "
-        "WHERE f.status <> 'trashed' AND (o.id = ? OR (? IS NOT NULL "
-        "AND o.contact_id = ?)) ORDER BY f.created_at DESC LIMIT 1",
-        (email_id, original.get("contact_id"), original.get("contact_id")))
-    if existing:
-        raise HTTPException(409, "A follow-up to this person has already been "
-                                 "drafted — find it in Drafts.")
-    # A follow-up is written on the premise of silence ("no reply yet"). The
-    # reply can easily sit on a sibling email, so ask about the *person*, the
-    # way get_follow_up_candidates does — the row-level has_response flag says
-    # nothing about whether they have already written back.
-    #
-    # Only a reply the current checker verified may block this. An unverified
-    # legacy flag (the old checker counted bounces, auto-replies and our own
-    # messages) is not evidence, and letting it 409 switched follow-ups off for
-    # most of the database.
-    if original.get("contact_id") and db.query_one(
-            "SELECT 1 FROM emails WHERE contact_id=? AND has_response=1 "
-            "AND response_verified_at IS NOT NULL LIMIT 1",
-            (original["contact_id"],)):
-        raise HTTPException(
-            409, "This person already replied (on one of your emails to them), so "
-                 "a \"no reply yet\" follow-up would be wrong. Reply in Gmail "
-                 "instead.")
+    plan = _follow_up_plan(email.get("contact_id"), manual=True)
+    if plan["refusal"]:
+        raise HTTPException(409, plan["refusal"])
+    contact = db.get_contact(email["contact_id"])
+    if not contact:
+        raise HTTPException(404, "Contact for this email no longer exists")
     can, err = rate_limiter.can_generate_email()
     if not can:
         raise HTTPException(429, err)
     rate_limiter.record_email_generation()
-    contact = db.get_contact(original["contact_id"])
-    if not contact:
-        raise HTTPException(404, "Contact for this email no longer exists")
-    company = db.get_company(contact["company_id"]) if contact.get("company_id") else None
-    composed = composer.compose_follow_up(contact, company, original)
-    follow_up = db.create_email(
-        contact_id=contact["id"],
-        company_id=contact.get("company_id"),
-        email_type="follow_up",
-        resume_id=original.get("resume_id"),
-        subject=composed["subject"],
-        body=composed["body"],
-        status="draft",
-        original_email_id=original["id"],
-        is_follow_up=True,
-        used_template_fallback=composed["used_template_fallback"],
-        fallback_reason=composed["fallback_reason"],
-    )
-    db.log_event("email", follow_up["id"], "follow_up_generated",
-                 contact.get("name") or contact.get("email") or "")
+    # Thread onto the first-contact email even when the click landed on an
+    # earlier follow-up: that is the message the whole conversation hangs off,
+    # and the send path reads its Gmail ids to build the References header.
+    follow_up = _create_follow_up(_thread_root(email), contact, plan)
+    if follow_up is None:
+        # Something landed while this was being written — a reply, a bounce, or
+        # the batch job drafting the same rung. Refusing is the right answer,
+        # and it costs the user nothing but a click.
+        raise HTTPException(409, _follow_up_plan(email["contact_id"], manual=True)
+                            ["refusal"] or "A follow-up to this person was just "
+                            "drafted — find it in Drafts.")
     return db.get_email(follow_up["id"])
+
+
+def _draft_follow_ups_job(job_id: str, candidates: List[Dict[str, Any]]):
+    """Draft one follow-up per due contact. Never sends anything."""
+    drafted = skipped = 0
+    cancelled = False
+    notes: List[Dict[str, Any]] = []
+    try:
+        for i, candidate in enumerate(candidates):
+            job = db.get_job(job_id)
+            if not job or job["status"] == "cancelled":
+                cancelled = True
+                break
+            db.update_job(job_id, progress_current=i,
+                          stage=f"Drafting for {candidate.get('contact_name') or 'contact'}")
+            # Re-asked per contact rather than trusted from the due list: this
+            # job can run for minutes, and a reply, bounce or hand-written
+            # draft landing halfway through has to stop the rest.
+            plan = _follow_up_plan(candidate.get("contact_id"), manual=False)
+            if plan["refusal"]:
+                skipped += 1
+                notes.append({"contact_id": candidate.get("contact_id"),
+                              "name": candidate.get("contact_name"),
+                              "error": plan["refusal"]})
+                continue
+            can, err = rate_limiter.can_generate_email()
+            if not can:
+                # Two very different refusals share one message. The daily cap
+                # means come back tomorrow; the per-minute burst window means
+                # wait a moment. Treating them alike abandoned the batch on the
+                # speed bump — a 25-contact due list drafted 10 and reported 15
+                # "rate limited", and in template mode (which is instant) that
+                # is the normal case, not the edge one. generation.py already
+                # waits these out; this is the same shape.
+                wait = rate_limiter.generation_retry_after()
+                if wait is not None:
+                    db.update_job(
+                        job_id, progress_current=i,
+                        stage="Pausing — per-minute generation limit reached")
+                    if _wait_for_generation_slot(job_id, wait):
+                        cancelled = True
+                        break
+                    can, err = rate_limiter.can_generate_email()
+            if not can:
+                for remaining in candidates[i:]:
+                    skipped += 1
+                    notes.append({"contact_id": remaining.get("contact_id"),
+                                  "name": remaining.get("contact_name"),
+                                  "error": err})
+                break
+            contact = db.get_contact(candidate["contact_id"])
+            original = db.get_email(candidate["id"])
+            if not contact or not original:
+                skipped += 1
+                notes.append({"contact_id": candidate.get("contact_id"),
+                              "name": candidate.get("contact_name"),
+                              "error": "contact or original email no longer exists"})
+                continue
+            rate_limiter.record_email_generation()
+            try:
+                if _create_follow_up(_thread_root(original), contact, plan):
+                    drafted += 1
+                else:
+                    skipped += 1
+                    notes.append({"contact_id": candidate.get("contact_id"),
+                                  "name": candidate.get("contact_name"),
+                                  "error": "a follow-up to this person was "
+                                           "drafted while this run was working"})
+            except Exception as e:
+                skipped += 1
+                notes.append({"contact_id": candidate.get("contact_id"),
+                              "name": candidate.get("contact_name"),
+                              "error": str(e)})
+        db.update_job(job_id, progress_current=(drafted + skipped if cancelled
+                                                else len(candidates)))
+        # Deliberately NOT only_if_running. That compare-and-swap is against
+        # status='running', so on the one path where the tally matters most —
+        # the user pressed Stop — the UPDATE matched nothing and `result`
+        # stayed NULL. The Emails page handles 'cancelled' and 'done'
+        # identically and reads `j.result || {}`, so it announced "0 follow-ups
+        # drafted" while the real ones sat in Drafts, selectable by "Select
+        # all". The send job has always distinguished cancelled this way.
+        db.finish_job(job_id, "cancelled" if cancelled else "done",
+                      {"drafted": drafted, "skipped": skipped, "notes": notes})
+    except Exception as e:
+        db.finish_job(job_id, "failed", error=str(e),
+                      result={"drafted": drafted, "skipped": skipped, "notes": notes})
+
+
+@app.post("/api/follow-ups/draft-all")
+async def draft_all_follow_ups(days: Optional[int] = Query(None, ge=1, le=90)):
+    """Draft the next rung for every contact currently due. Sends nothing —
+    every message still has to be read and sent by hand."""
+    running = [j for j in db.list_jobs("follow_up", limit=5) if j["status"] == "running"]
+    if running:
+        raise HTTPException(409, "Follow-ups are already being drafted.")
+    candidates = db.get_follow_up_candidates(days=days)
+    if not candidates:
+        raise HTTPException(409, "No contacts are due for a follow-up right now.")
+    job = db.create_job("follow_up", {"count": len(candidates)})
+    db.update_job(job["id"], progress_total=len(candidates))
+    threading.Thread(target=_draft_follow_ups_job, args=(job["id"], candidates),
+                     daemon=True).start()
+    return _parse_job(db.get_job(job["id"]))
+
+
+@app.post("/api/follow-ups/draft-all/{job_id}/cancel")
+async def cancel_draft_follow_ups(job_id: str):
+    """Stop drafting. Follow-ups already written stay in Drafts — the loop
+    checks between contacts, so nothing is left half-composed."""
+    job = db.get_job(job_id)
+    if not job or job["type"] != "follow_up":
+        raise HTTPException(404, "Follow-up drafting job not found")
+    if job["status"] != "running":
+        raise HTTPException(409, "That run already finished")
+    db.update_job(job_id, status="cancelled")
+    return {"success": True}
 
 
 # ---------- sending ----------
