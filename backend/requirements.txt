@@ -8,6 +8,11 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 pydantic>=2.9
 
+# MX lookups for send-time deliverability. Without it contact_verify falls
+# back to a plain A-record resolve, which cannot see MX at all — so the check
+# silently stops being the check its name promises.
+dnspython>=2.6
+
 # --- scraping ---
 beautifulsoup4>=4.12
 lxml>=5.0

@@ -103,6 +103,16 @@ describe('addressWarning', () => {
     expect(w.title).toContain('Jane Doe')
   })
 
+  it('flags a bounced address above everything else', () => {
+    /* Deleting this branch left all 64 frontend tests green. */
+    expect(addressWarning({ contact_bounced_at: '2026-07-01T09:00:00' }).label).toBe('bounced')
+    expect(addressWarning({ bounced_at: '2026-07-01T09:00:00' }).label).toBe('bounced')
+    // outranks the other two: a dead address is the more urgent fact
+    expect(addressWarning({
+      contact_bounced_at: '2026-07-01T09:00:00', contact_email_kind: 'generic',
+    }).label).toBe('bounced')
+  })
+
   it('stays quiet when the address is fine or unclassified', () => {
     expect(addressWarning({ contact_email_kind: 'personal' })).toBeNull()
     expect(addressWarning({ contact_email_kind: 'unknown' })).toBeNull()

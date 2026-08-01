@@ -833,6 +833,14 @@ async def update_contact(contact_id: str, payload: ContactUpdate,
     old_email = (existing.get("email") or "").strip()
     address_changed = "email" in updates and new_email.lower() != old_email.lower()
 
+    # A bounce belongs to an address, not to a person. Moving the contact to a
+    # different mailbox must clear it, or the send error keeps naming an
+    # address that has never bounced and telling the user to do the thing they
+    # just did.
+    if updates.pop("clear_bounce", None) or address_changed:
+        updates["bounced_at"] = None
+        updates["bounce_detail"] = None
+
     if address_changed and _contact_has_been_emailed(contact_id) and not force:
         # Nothing here freezes a *future* email. `emails.recipient_email`
         # preserves who past ones went to, but a follow-up is composed fresh
@@ -1624,19 +1632,6 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                 failed += 1
                 continue
             recipient = str(email.get("contact_email") or "").strip().lower()
-            # The postmaster has already rejected this address. Re-sending
-            # cannot succeed, and repeated hard bounces are what turn a Gmail
-            # account into a spam-foldered one — the cost lands on the
-            # deliverable addresses, not this one.
-            bounced_contact = (db.get_contact(email["contact_id"])
-                               if email.get("contact_id") else None)
-            if email.get("bounced_at") or (bounced_contact or {}).get("bounced_at"):
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": False,
-                    "error": f"{recipient} bounced previously — mail to it is "
-                             f"undeliverable. Find another address for this person."})
-                failed += 1
-                continue
             if not email.get("is_follow_up") and recipient in first_contact_recipients:
                 results.append({
                     "email_id": email_id, "success": False, "retryable": False,
@@ -1649,13 +1644,6 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                     "email_id": email_id, "success": False, "retryable": False,
                     "error": "a follow-up to this recipient already went out in "
                              "this batch"})
-                failed += 1
-                continue
-            if not _domain_accepts_mail(recipient, mx_cache):
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": False,
-                    "error": f"{recipient} has no mail server — the domain does "
-                             f"not accept email, so this would bounce."})
                 failed += 1
                 continue
             if _send_attempt_pending(email):
@@ -1725,6 +1713,29 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                     if ctx["thread_id"] and not original.get("gmail_thread_id"):
                         db.update_email(original["id"],
                                         {"gmail_thread_id": ctx["thread_id"]})
+            # Both deliverability gates sit *below* the pending-attempt
+            # reconciliation on purpose. Above it, a message already sitting in
+            # Gmail Sent — whose contact later bounced, or whose DNS went dark
+            # — was refused before the Sent folder was ever consulted, leaving
+            # the row a draft with no message id: invisible to reply tracking
+            # and refused identically on every retry.
+            bounced_contact = (db.get_contact(email["contact_id"])
+                               if email.get("contact_id") else None)
+            if email.get("bounced_at") or (bounced_contact or {}).get("bounced_at"):
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": False,
+                    "error": f"{recipient} bounced previously — mail to it is "
+                             f"undeliverable. Add a different address for this "
+                             f"person and it will send."})
+                failed += 1
+                continue
+            if not _domain_accepts_mail(recipient, mx_cache):
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": False,
+                    "error": f"{recipient} has no mail server — the domain does "
+                             f"not accept email, so this would bounce."})
+                failed += 1
+                continue
             if i > 0:
                 import time as _t
                 _t.sleep(email_sender.send_delay)

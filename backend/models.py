@@ -155,6 +155,11 @@ class ContactUpdate(BaseModel):
     company_id: Optional[str] = None
     status: Optional[str] = None
     notes: Optional[str] = None
+    # The only way back from a bounce. Detection can be wrong — a mail system
+    # that rejected one message may accept the next — and without this the flag
+    # was write-only: one false positive retired a contact permanently, with
+    # no route, repair or UI able to undo it.
+    clear_bounce: Optional[bool] = None
 
     @field_validator("email")
     @classmethod

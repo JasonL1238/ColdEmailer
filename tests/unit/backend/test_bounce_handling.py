@@ -30,15 +30,35 @@ def db():
 def _gmail(messages, headers_by_id):
     """A Gmail stub: one thread holding `messages`, headers per message id."""
     service = MagicMock()
-    service.users().threads().get().execute.return_value = {"messages": messages}
+
+    def _thread(userId=None, id=None, format=None):
+        assert id == "t1", f"asked Gmail for thread {id!r}, not the thread id"
+        result = MagicMock()
+        result.execute.return_value = {"messages": messages}
+        return result
+
+    service.users().threads().get.side_effect = _thread
 
     def _get(userId=None, id=None, format=None, metadataHeaders=None):
-        result = MagicMock()
-        result.execute.return_value = {
+        # Model the real API, not just the happy path. Gmail returns no
+        # `payload` for format="minimal", and only the headers actually asked
+        # for — so a stub that ignores these arguments lets a change to either
+        # pass every test while detecting nothing at all against real Gmail.
+        headers = headers_by_id.get(id, {})
+        if format == "minimal":
+            return _result({"threadId": "t1"})
+        if format == "metadata":
+            wanted = {h.lower() for h in (metadataHeaders or [])}
+            headers = {k: v for k, v in headers.items() if k.lower() in wanted}
+        return _result({
             "threadId": "t1",
             "payload": {"headers": [{"name": k, "value": v}
-                                    for k, v in headers_by_id.get(id, {}).items()]},
-        }
+                                    for k, v in headers.items()]},
+        })
+
+    def _result(value):
+        result = MagicMock()
+        result.execute.return_value = value
         return result
 
     service.users().messages().get.side_effect = _get
@@ -51,13 +71,24 @@ def _msg(mid, when="1700000000000", labels=None):
 
 class TestClassifyingOneMessage:
     @pytest.mark.parametrize("headers,expected", [
+        # Machine provenance — any one of these is proof on its own.
         ({"From": "Mail Delivery Subsystem <mailer-daemon@googlemail.com>",
           "Subject": "Delivery Status Notification (Failure)"}, BOUNCE),
         ({"From": "postmaster@acme.com", "Subject": "Undeliverable: Hi"}, BOUNCE),
-        ({"From": "Jane <jane@acme.com>",
-          "Subject": "Address not found"}, BOUNCE),
-        ({"From": "Jane <jane@acme.com>",
-          "Subject": "Your message couldn't be delivered"}, BOUNCE),
+        # A daemon whose subject says nothing bounce-shaped. The sender signal
+        # must be load-bearing by itself.
+        ({"From": "MAILER-DAEMON@acme.com", "Subject": "Re: Coffee chat"}, BOUNCE),
+        ({"From": "Some Relay <relay@acme.com>",
+          "Return-Path": "<MAILER-DAEMON@acme.com>",
+          "Subject": "Notification"}, BOUNCE),
+        ({"From": "bounce-handler@acme.com", "Subject": "Notice",
+          "Content-Type": 'multipart/report; report-type=delivery-status; boundary="x"'},
+         BOUNCE),
+        ({"From": "relay@acme.com", "Subject": "Notice",
+          "X-Failed-Recipients": "jane@acme.com"}, BOUNCE),
+        ({"From": "relay@acme.com", "Subject": "Undeliverable: Hi",
+          "Auto-Submitted": "auto-replied"}, BOUNCE),
+        # Auto-replies: the mailbox is alive.
         ({"From": "Jane <jane@acme.com>",
           "Subject": "Automatic reply: Out of office"}, AUTO),
         ({"From": "noreply@acme.com", "Subject": "Ticket #4"}, AUTO),
@@ -69,6 +100,36 @@ class TestClassifyingOneMessage:
         follow-up, a postmaster failure means it never will be."""
         service = _gmail([], {"m1": headers})
         assert ResponseChecker(service)._classify("m1") == expected
+
+    @pytest.mark.parametrize("sender,subject", [
+        ("Priya Raman <priya@nuro.ai>",
+         "Re: Delivery failure rates in your last-mile fleet"),
+        ("Jen Wu <jen@lab.mit.edu>", "Re: Returned mail study — happy to chat"),
+        ("Recruiting <hiring@acme.com>",
+         "Re: Address not found on your careers page"),
+        ("Alex Chen <alex@doordash.com>",
+         "Re: Your note — recipient not found issue we fixed"),
+        ("Ravi <ravi@acme.com>",
+         "Re: Delivery has failed twice — let's talk process"),
+        ("Erin Doyle <erin@postmasterlabs.com>", "Re: Coffee chat"),
+    ])
+    def test_a_human_using_bounce_words_is_not_a_bounce(self, sender, subject):
+        """Subject text is written by whoever is replying, and this app quotes
+        the target company's own talking points into its subject lines — so a
+        logistics company answering about delivery failures was classified as
+        a bounce. That discarded their reply, removed them from follow-ups and
+        refused every future send to them, irreversibly.
+        """
+        service = _gmail([], {"m1": {"From": sender, "Subject": subject}})
+        assert ResponseChecker(service)._classify("m1") == REPLY
+
+    def test_our_own_mail_wins_over_a_bounce_shaped_subject(self):
+        """The own-address guard used to sit *after* the bounce test, so any
+        subject match bypassed it."""
+        service = _gmail([], {"m1": {"From": "me@example.com",
+                                     "Subject": "Undeliverable: Hi"}})
+        checker = ResponseChecker(service, own_address="me@example.com")
+        assert checker._classify("m1") == OWN
 
     def test_our_own_message_is_neither(self):
         service = _gmail([], {"m1": {"From": "me@example.com", "Subject": "Hi"}})
@@ -284,10 +345,52 @@ class TestDeliverabilityIsCheckedOptimistically:
         assert main._domain_accepts_mail("x@live.com", {"live.com": True}) is True
 
     def test_an_unknown_result_proceeds(self):
-        """domain_has_mx returns None when it cannot check at all. Treating
-        that as undeliverable would block real sends on a DNS blip; Gmail is
-        the better judge in that case."""
         assert main._domain_accepts_mail("x@maybe.com", {"maybe.com": None}) is True
+
+    def test_a_resolver_timeout_really_does_produce_unknown(self, monkeypatch):
+        """Pre-seeding None into the cache asserts a value the resolver has to
+        be able to produce. It could not: every failure path returned False, so
+        a flapping VPN made gmail.com "has no mail server" and refused whole
+        batches as permanently failed."""
+        import dns.resolver
+
+        import contact_verify
+
+        def _timeout(self, *a, **kw):
+            raise dns.resolver.LifetimeTimeout(timeout=2.0)
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", _timeout)
+        assert contact_verify.domain_has_mx("gmail.com") is None
+        assert main._domain_accepts_mail("jane@gmail.com", {}) is True
+
+    def test_a_nonexistent_domain_is_still_a_definite_no(self, monkeypatch):
+        import dns.resolver
+
+        import contact_verify
+
+        def _nxdomain(self, *a, **kw):
+            raise dns.resolver.NXDOMAIN()
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", _nxdomain)
+        assert contact_verify.domain_has_mx("no-such-zztest.invalid") is False
+        assert main._domain_accepts_mail("x@no-such-zztest.invalid", {}) is False
+
+    def test_a_null_mx_domain_is_refused(self, monkeypatch):
+        """RFC 7505: an MX of "." is an explicit declaration that the domain
+        accepts no mail. Treating the record as "has MX" let it through."""
+        import contact_verify
+        import dns.resolver
+
+        class _Rec:
+            exchange = "."
+
+        def _null_mx(self, name, rdtype, *a, **kw):
+            if rdtype == "MX":
+                return [_Rec()]
+            raise dns.resolver.NoAnswer()
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", _null_mx)
+        assert contact_verify.domain_has_mx("example.com") is False
 
     def test_the_lookup_is_cached_per_domain(self, monkeypatch):
         calls = []
@@ -310,3 +413,130 @@ class TestDeliverabilityIsCheckedOptimistically:
         """Recipient validation is email_sender's job and already happens; this
         check must not become a second, weaker gate on empty input."""
         assert main._domain_accepts_mail("", {}) is True
+
+
+class TestABounceCanBeUndone:
+    """Detection can be wrong, and the flag was write-only: no route, repair or
+    UI could clear it, so one false positive retired a contact for good while
+    the send error told the user to do the very thing that does not help."""
+
+    def _bounced(self, db, monkeypatch):
+        monkeypatch.setattr(main, "db", db)
+        company = db.create_company("Acme")
+        contact = db.create_contact(company_id=company["id"], name="Jane Doe",
+                                    email="jane@acme.com")
+        db.update_contact(contact["id"], {"bounced_at": now_iso(),
+                                          "bounce_detail": "Undeliverable"})
+        return contact
+
+    def _put(self, contact_id, **updates):
+        from models import ContactUpdate
+        import asyncio
+        return asyncio.run(
+            main.update_contact(contact_id, ContactUpdate(**updates), force=True))
+
+    def test_moving_to_a_new_address_clears_it(self, db, monkeypatch):
+        """A bounce belongs to an address, not a person."""
+        contact = self._bounced(db, monkeypatch)
+        row = self._put(contact["id"], email="jane.doe@acme.com")
+        assert row["bounced_at"] is None
+        assert row["bounce_detail"] is None
+
+    def test_an_explicit_clear_works_without_moving_the_address(self, db, monkeypatch):
+        contact = self._bounced(db, monkeypatch)
+        row = self._put(contact["id"], clear_bounce=True)
+        assert row["bounced_at"] is None
+        assert row["email"] == "jane@acme.com"
+
+    def test_an_unrelated_edit_leaves_it_alone(self, db, monkeypatch):
+        contact = self._bounced(db, monkeypatch)
+        row = self._put(contact["id"], role="Head of Engineering")
+        assert row["bounced_at"] is not None
+
+    def test_after_clearing_the_contact_can_be_mailed_again(self, db, monkeypatch):
+        contact = self._bounced(db, monkeypatch)
+        monkeypatch.setattr(main, "_domain_accepts_mail", lambda addr, cache: True)
+        sender = MagicMock()
+        sender.send_delay = 0
+        sender.send_email.return_value = {"success": True, "gmail_message_id": "m",
+                                          "gmail_thread_id": "t"}
+        monkeypatch.setattr(main, "email_sender", sender)
+        self._put(contact["id"], email="jane.doe@acme.com")
+        draft = db.create_email(contact_id=contact["id"], subject="Hi",
+                                body="A body long enough here.", status="draft")
+        job = db.create_job("send", payload={})
+        main._send_lock.acquire()
+        main._send_batch_job(job["id"], [draft["id"]], None, False, "me@example.com")
+        sender.send_email.assert_called_once()
+
+
+class TestTheEmailLevelBounceAlsoBlocksASend:
+    def test_a_bounced_email_row_is_refused_even_if_the_contact_is_clean(
+            self, db, monkeypatch):
+        """The refusal reads `email.bounced_at OR contact.bounced_at`; dropping
+        the first half left the whole suite green."""
+        monkeypatch.setattr(main, "db", db)
+        monkeypatch.setattr(main, "_domain_accepts_mail", lambda addr, cache: True)
+        sender = MagicMock()
+        sender.send_delay = 0
+        monkeypatch.setattr(main, "email_sender", sender)
+        company = db.create_company("Acme")
+        contact = db.create_contact(company_id=company["id"], name="Jane Doe",
+                                    email="jane@acme.com")
+        draft = db.create_email(contact_id=contact["id"], company_id=company["id"],
+                                subject="Hi", body="A body long enough here.",
+                                status="draft")
+        db.update_email(draft["id"], {"bounced_at": now_iso()})
+        assert db.get_contact(contact["id"])["bounced_at"] is None
+        job = db.create_job("send", payload={})
+        main._send_lock.acquire()
+        main._send_batch_job(job["id"], [draft["id"]], None, False, "me@example.com")
+        sender.send_email.assert_not_called()
+
+
+class TestTheGatesRunAfterReconciliation:
+    def test_an_in_flight_message_is_reconciled_before_being_refused(
+            self, db, monkeypatch):
+        """A row handed to Gmail with no answer back may already be in the
+        recipient's inbox. Refusing it above the Sent-folder lookup left it a
+        draft with no message id — invisible to reply tracking, and refused
+        identically on every retry."""
+        monkeypatch.setattr(main, "db", db)
+        monkeypatch.setattr(main, "_domain_accepts_mail", lambda addr, cache: False)
+        sender = MagicMock()
+        sender.send_delay = 0
+        sender.find_delivered_message.return_value = {
+            "gmail_message_id": "found-1", "gmail_thread_id": "t"}
+        monkeypatch.setattr(main, "email_sender", sender)
+
+        company = db.create_company("Acme")
+        contact = db.create_contact(company_id=company["id"], name="Jane Doe",
+                                    email="jane@acme.com")
+        db.update_contact(contact["id"], {"bounced_at": now_iso()})
+        draft = db.create_email(contact_id=contact["id"], company_id=company["id"],
+                                subject="Hi", body="A body long enough here.",
+                                status="draft")
+        db.update_email(draft["id"], {"send_attempted_at": now_iso()})
+
+        job = db.create_job("send", payload={})
+        main._send_lock.acquire()
+        main._send_batch_job(job["id"], [draft["id"]], None, False, "me@example.com")
+
+        sender.find_delivered_message.assert_called_once()
+        row = db.get_email(draft["id"])
+        assert row["status"] == "sent"
+        assert row["gmail_message_id"] == "found-1"
+        sender.send_email.assert_not_called()
+
+
+class TestTheUIIsToldAboutTheBounce:
+    def test_list_emails_exposes_the_contact_flag(self, db):
+        """The chip cannot fire without it, and deleting the projection left
+        the suite green."""
+        company = db.create_company("Acme")
+        contact = db.create_contact(company_id=company["id"], name="Jane Doe",
+                                    email="jane@acme.com")
+        db.update_contact(contact["id"], {"bounced_at": now_iso()})
+        db.create_email(contact_id=contact["id"], company_id=company["id"],
+                        subject="Hi", body="A body long enough here.")
+        assert db.list_emails()[0]["contact_bounced_at"] is not None

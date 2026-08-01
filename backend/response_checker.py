@@ -11,7 +11,14 @@ from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 # The postmaster told us the message could not be delivered.
-_BOUNCE_SENDER_RE = re.compile(r"mailer-daemon|postmaster", re.I)
+#
+# Provenance, not wording. Subject text is written by whoever is replying, and
+# this app's own subject lines quote the target company's talking points — so a
+# logistics company answering "Re: Delivery failure rates in your fleet" was
+# being classified as a bounce, which discarded their reply, removed them from
+# follow-ups and permanently refused every future send to them. A delivery
+# status notification is structurally identifiable; its subject is not.
+_BOUNCE_SENDER_RE = re.compile(r"\bmailer-daemon\b|\bpostmaster@", re.I)
 _BOUNCE_SUBJECT_RE = re.compile(
     r"delivery status notification|delivery (?:has )?failed|delivery failure|"
     r"undeliverable|failure notice|returned mail|delivery incomplete|"
@@ -21,10 +28,20 @@ _BOUNCE_SUBJECT_RE = re.compile(
 
 # A machine answered on the human's behalf. Not a reply, but the mailbox is
 # alive — an out-of-office is if anything a reason to follow up later.
+#
+# This list used to carry bounce wording too ("delivery status", "delivery
+# failure", "undeliverable", "failure notice"). Those are not things an
+# auto-responder says, and keeping them here silently discarded genuine replies
+# from anyone whose subject touched delivery — which, for a tool that quotes a
+# logistics company's own talking points back at them, is the common case.
+# Bounce wording now lives only in _BOUNCE_SUBJECT_RE, where it is
+# corroborating evidence rather than a verdict.
 _AUTO_SENDER_RE = re.compile(
-    r"mailer-daemon|postmaster|no-?reply|donotreply|auto-?responder", re.I)
+    # Anchored to the mailbox, not the whole header: a bare "postmaster" also
+    # matched a person at postmasterlabs.com.
+    r"\bmailer-daemon\b|postmaster@|no-?reply@|donotreply@|auto-?responder@",
+    re.I)
 _AUTO_SUBJECT_RE = re.compile(
-    r"delivery status|delivery failure|undeliverable|failure notice|"
     r"out of office|automatic reply|auto-?reply|autoreply|away from",
     re.I)
 
@@ -46,26 +63,44 @@ class ResponseChecker:
         try:
             msg = self.service.users().messages().get(
                 userId="me", id=message_id, format="metadata",
-                metadataHeaders=["From", "Subject", "Auto-Submitted"],
+                metadataHeaders=["From", "Subject", "Auto-Submitted",
+                                 "Content-Type", "X-Failed-Recipients",
+                                 "Return-Path"],
             ).execute()
             headers = {h["name"].lower(): h.get("value", "")
                        for h in msg.get("payload", {}).get("headers", [])}
             sender = headers.get("from", "")
             subject = headers.get("subject", "")
-            # Bounce first: a postmaster message also matches the auto-reply
-            # patterns, and collapsing the two is what discarded the fact that
-            # the address is dead.
-            if _BOUNCE_SENDER_RE.search(sender) or _BOUNCE_SUBJECT_RE.search(subject):
-                return BOUNCE
-            if _AUTO_SENDER_RE.search(sender):
-                return AUTO
-            # Belt and braces alongside the SENT-label filter: a message from
-            # our own address is our follow-up, not the recipient answering.
+            auto_submitted = headers.get("auto-submitted", "").lower()
+
+            # Our own mail first. The bounce test used to run ahead of this,
+            # so a subject match bypassed the guard entirely.
             if self.own_address and self.own_address in sender.lower():
                 return OWN
+
+            # A bounce needs machine provenance. Any ONE of these is proof the
+            # message came from a mail system rather than a person:
+            #   * the daemon itself in From or Return-Path
+            #   * an RFC 3464 delivery-status report
+            #   * X-Failed-Recipients, which only a reporting MTA sets
+            # A bounce-shaped subject is then corroborating evidence, never
+            # evidence on its own.
+            from_daemon = bool(
+                _BOUNCE_SENDER_RE.search(sender)
+                or _BOUNCE_SENDER_RE.search(headers.get("return-path", "")))
+            is_report = "report-type=delivery-status" in (
+                headers.get("content-type", "").lower().replace(" ", ""))
+            failed_recipients = bool(headers.get("x-failed-recipients"))
+            machine_sent = auto_submitted.startswith("auto-replied") or \
+                auto_submitted.startswith("auto-generated")
+            if from_daemon or is_report or failed_recipients or (
+                    machine_sent and _BOUNCE_SUBJECT_RE.search(subject)):
+                return BOUNCE
+
+            if _AUTO_SENDER_RE.search(sender):
+                return AUTO
             if _AUTO_SUBJECT_RE.search(subject):
                 return AUTO
-            auto_submitted = headers.get("auto-submitted", "").lower()
             if auto_submitted and auto_submitted != "no":
                 return AUTO
             return REPLY

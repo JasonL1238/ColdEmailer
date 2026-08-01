@@ -6,7 +6,7 @@
 cd tests && ../backend/venv/bin/python -m pytest
 ```
 
-727 tests. `conftest.py` points `COLD_DB_PATH` at a throwaway database and stubs
+747 tests. `conftest.py` points `COLD_DB_PATH` at a throwaway database and stubs
 the Gmail credential paths, so the suite never touches real data or sends mail.
 
 | File | Covers |
@@ -35,7 +35,7 @@ the Gmail credential paths, so the suite never touches real data or sends mail.
 cd frontend && npm test
 ```
 
-64 tests over the API client's request shapes and the screens where a wrong
+65 tests over the API client's request shapes and the screens where a wrong
 render would cause a real mistake: the compose modal, the company drawer, and
 the email list's delivered / attachment-claim / reply-verification / send-safety
 states.

@@ -1172,8 +1172,18 @@ class Database:
                  -- postmaster has already rejected cannot succeed, and each
                  -- retry costs sending reputation that the deliverable
                  -- addresses depend on.
-                 AND (ct.bounced_at IS NULL OR ct.id IS NULL)
-                 AND e.bounced_at IS NULL
+                 --
+                 -- Both tests are contact-level. A row-level `e.bounced_at IS
+                 -- NULL` is exactly what the docstring above warns against: it
+                 -- deletes the bounced email from the group, and MAX() then
+                 -- hands back a superseded older one, so the contact
+                 -- reappears as "gone quiet" attached to stale mail.
+                 AND ct.bounced_at IS NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM emails b
+                     WHERE b.contact_id = e.contact_id
+                       AND b.bounced_at IS NOT NULL
+                 )
                GROUP BY COALESCE(e.contact_id, e.id)
                HAVING _latest_sent_at < ?
                ORDER BY _latest_sent_at ASC""",

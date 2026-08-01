@@ -114,41 +114,69 @@ def email_matches_person(email: str, name: Optional[str],
 
 
 def domain_has_mx(domain: str, timeout: float = 2.0) -> Optional[bool]:
-    """Best-effort MX / A lookup. None when DNS cannot be checked."""
+    """True / False / None for "can this domain receive mail?".
+
+    None means the question could not be answered — resolver missing, timeout,
+    SERVFAIL, network down. That distinction is the whole point: callers gate
+    real sends on this, and an earlier version returned False for every one of
+    those cases, so a flapping VPN made gmail.com "has no mail server" and
+    refused an entire batch as permanently failed.
+
+    False is reserved for positive evidence of the opposite: the domain does
+    not exist, or it publishes RFC 7505 null MX ("."), which is an explicit
+    declaration that it accepts no mail.
+    """
     domain = (domain or "").strip().lower().rstrip(".")
     if not domain or "." not in domain:
         return False
     try:
         import dns.resolver  # type: ignore
-        resolver = dns.resolver.Resolver()
-        resolver.lifetime = timeout
-        try:
-            answers = resolver.resolve(domain, "MX")
-            if answers:
-                return True
-        except Exception:
-            pass
-        try:
-            answers = resolver.resolve(domain, "A")
-            return bool(answers)
-        except Exception:
-            return False
     except ImportError:
-        # Avoid socket.setdefaulttimeout — it races other threads.
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            try:
-                infos = socket.getaddrinfo(
-                    domain, 25, proto=socket.IPPROTO_TCP)
-                return bool(infos)
-            finally:
-                sock.close()
-        except OSError:
-            try:
-                return bool(socket.getaddrinfo(domain, 443))
-            except OSError:
-                return False
+        return _domain_resolves(domain, timeout)
+
+    resolver = dns.resolver.Resolver()
+    resolver.lifetime = timeout
+    try:
+        answers = resolver.resolve(domain, "MX")
+        targets = [str(getattr(r, "exchange", "")).strip() for r in answers]
+        # A single "." target is RFC 7505: this domain accepts no mail at all.
+        if targets and all(t in (".", "") for t in targets):
+            return False
+        if answers:
+            return True
+    except dns.resolver.NXDOMAIN:
+        return False
+    except dns.resolver.NoAnswer:
+        pass                      # no MX; a bare A record still accepts mail
+    except Exception:
+        return None               # timeout / SERVFAIL / no route — unknown
+    try:
+        return bool(resolver.resolve(domain, "A"))
+    except dns.resolver.NXDOMAIN:
+        return False
+    except dns.resolver.NoAnswer:
+        return False
+    except Exception:
+        return None
+
+
+def _domain_resolves(domain: str, timeout: float) -> Optional[bool]:
+    """Fallback when dnspython is absent: an A/AAAA lookup, not an MX one.
+
+    getaddrinfo only resolves — it never opens a connection — so this is cheap,
+    but it cannot see MX records and cannot tell a timeout from NXDOMAIN
+    beyond the gaierror code. Anything other than a definite "no such host" is
+    reported as unknown rather than as undeliverable.
+    """
+    try:
+        return bool(socket.getaddrinfo(domain, None, proto=socket.IPPROTO_TCP))
+    except socket.gaierror as exc:
+        name = getattr(exc, "errno", None)
+        if name in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", None)):
+            return False
+        return None
+    except OSError:
+        return None
 
 
 def verify_email(email: str, name: Optional[str] = None,
