@@ -165,7 +165,7 @@ _ADDED_COLUMNS = {
     # at a very different price — and the resulting draft looks identical.
     "emails": {"send_attempted_at": "TEXT", "send_attempt_error": "TEXT",
                "response_verified_at": "TEXT", "recipient_email": "TEXT",
-               "llm_model": "TEXT"},
+               "llm_model": "TEXT", "bounced_at": "TEXT"},
     # Why the search matched this company, per the model that suggested it.
     # Kept apart from `summary` on purpose: summary is scraped evidence and is
     # quoted into emails, this is an unverified guess and must not be.
@@ -189,6 +189,13 @@ _ADDED_COLUMNS = {
         "email_verified": "INTEGER DEFAULT 0",
         "linkedin_verified": "INTEGER DEFAULT 0",
         "person_verified": "INTEGER DEFAULT 0",
+        # When the postmaster told us this address is undeliverable. A bounce
+        # used to be classified merely as "not a reply", which is exactly the
+        # condition that makes a contact a follow-up candidate — so a dead
+        # address was chased on a schedule, and every retry damaged the
+        # sending reputation that decides whether the good emails arrive.
+        "bounced_at": "TEXT",
+        "bounce_detail": "TEXT",
     },
 }
 
@@ -925,7 +932,8 @@ class Database:
             "company_id", "name", "email", "linkedin_url", "role", "status",
             "notes", "source", "source_url", "evidence", "affinity",
             "seniority_rank", "email_kind", "email_verified",
-            "linkedin_verified", "person_verified",
+            "linkedin_verified", "person_verified", "bounced_at",
+            "bounce_detail",
         }
         updates = {k: v for k, v in updates.items() if k in allowed}
         if "linkedin_url" in updates:
@@ -1059,6 +1067,7 @@ class Database:
                    COALESCE(e.recipient_email, ct.email) AS contact_email,
                       ct.role AS contact_role,
                       ct.email_kind AS contact_email_kind,
+                      ct.bounced_at AS contact_bounced_at,
                       c.name AS company_name,
                       {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
                       {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
@@ -1079,6 +1088,7 @@ class Database:
             "resume_id", "used_template_fallback", "fallback_reason", "llm_model",
             "custom_instructions", "is_follow_up", "original_email_id",
             "send_attempted_at", "send_attempt_error", "recipient_email",
+            "bounced_at",
         }
         updates = {k: v for k, v in updates.items() if k in allowed}
         for bool_key in ("has_response", "is_follow_up", "used_template_fallback"):
@@ -1095,6 +1105,7 @@ class Database:
             SELECT e.*, ct.name AS contact_name,
                    COALESCE(e.recipient_email, ct.email) AS contact_email,
                    ct.role AS contact_role, ct.email_kind AS contact_email_kind,
+                   ct.bounced_at AS contact_bounced_at,
                    c.name AS company_name,
                    {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
                    {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
@@ -1156,6 +1167,13 @@ class Database:
                      WHERE r.contact_id = e.contact_id AND r.has_response = 1
                        AND r.response_verified_at IS NOT NULL
                  )
+                 -- A bounce reads as "no reply", which is exactly what makes a
+                 -- contact due for a follow-up. Chasing an address the
+                 -- postmaster has already rejected cannot succeed, and each
+                 -- retry costs sending reputation that the deliverable
+                 -- addresses depend on.
+                 AND (ct.bounced_at IS NULL OR ct.id IS NULL)
+                 AND e.bounced_at IS NULL
                GROUP BY COALESCE(e.contact_id, e.id)
                HAVING _latest_sent_at < ?
                ORDER BY _latest_sent_at ASC""",

@@ -130,6 +130,14 @@ class _FakeChecker:
         self.checked.append(gmail_message_id)
         return self.verdicts.get(gmail_message_id, (False, None))
 
+    def check_thread(self, gmail_message_id, gmail_thread_id=None):
+        """The shape main consumes. Scripted verdicts stay (has_reply, when)
+        so the existing cases read the same; bounce is opt-in per message."""
+        has_reply, when = self.check_response(gmail_message_id, gmail_thread_id)
+        bounced_at = getattr(self, "bounces", {}).get(gmail_message_id)
+        return {"has_reply": has_reply, "replied_at": when,
+                "bounced": bounced_at is not None, "bounced_at": bounced_at}
+
 
 class _FakeGmail:
     service = object()

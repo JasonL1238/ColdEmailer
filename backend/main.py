@@ -1267,6 +1267,27 @@ async def get_email(email_id: str):
     return email
 
 
+def _domain_accepts_mail(recipient: str, cache: dict) -> bool:
+    """False only when DNS says the domain has no mail server at all.
+
+    Deliberately optimistic. `domain_has_mx` returns None when it cannot
+    check — no resolver, timeout, network down — and treating that as
+    undeliverable would block real sends on a transient DNS blip. Only a
+    definite negative stops a send; anything unknown proceeds and lets Gmail
+    be the judge.
+    """
+    domain = (recipient or "").rsplit("@", 1)[-1].strip().lower()
+    if not domain:
+        return True
+    if domain not in cache:
+        from contact_verify import domain_has_mx
+        try:
+            cache[domain] = domain_has_mx(domain)
+        except Exception:
+            cache[domain] = None
+    return cache[domain] is not False
+
+
 def _contact_has_been_emailed(contact_id: Optional[str]) -> bool:
     """True once anything has actually gone out to this contact.
 
@@ -1576,6 +1597,10 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
     # drafts for the same person (a cancelled generation racing its retry) are
     # both picked up by "Select all", and nothing else dedupes at send time.
     first_contact_recipients = set()
+    # One DNS answer per domain per batch. A batch is routinely 20 emails to
+    # 3 companies, and the lookup is the only network call here that is not
+    # the send itself.
+    mx_cache: dict = {}
     # Same rule for follow-ups: two follow-ups to one person are two copies of
     # "I wanted to follow up on my note" three seconds apart.
     follow_up_recipients = set()
@@ -1599,6 +1624,19 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                 failed += 1
                 continue
             recipient = str(email.get("contact_email") or "").strip().lower()
+            # The postmaster has already rejected this address. Re-sending
+            # cannot succeed, and repeated hard bounces are what turn a Gmail
+            # account into a spam-foldered one — the cost lands on the
+            # deliverable addresses, not this one.
+            bounced_contact = (db.get_contact(email["contact_id"])
+                               if email.get("contact_id") else None)
+            if email.get("bounced_at") or (bounced_contact or {}).get("bounced_at"):
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": False,
+                    "error": f"{recipient} bounced previously — mail to it is "
+                             f"undeliverable. Find another address for this person."})
+                failed += 1
+                continue
             if not email.get("is_follow_up") and recipient in first_contact_recipients:
                 results.append({
                     "email_id": email_id, "success": False, "retryable": False,
@@ -1611,6 +1649,13 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                     "email_id": email_id, "success": False, "retryable": False,
                     "error": "a follow-up to this recipient already went out in "
                              "this batch"})
+                failed += 1
+                continue
+            if not _domain_accepts_mail(recipient, mx_cache):
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": False,
+                    "error": f"{recipient} has no mail server — the domain does "
+                             f"not accept email, so this would bounce."})
                 failed += 1
                 continue
             if _send_attempt_pending(email):
@@ -1866,10 +1911,28 @@ def check_replies(recheck: bool = Query(False)):
         raise HTTPException(401, f"Gmail authentication failed: {e}")
     checker = ResponseChecker(email_sender.service,
                               own_address=db.get_profile().get("email"))
-    new_replies = cleared = failed_checks = confirmed = 0
+    new_replies = cleared = failed_checks = confirmed = bounced = 0
     for email in sent_emails:
-        has_reply, when = checker.check_response(
+        verdict = checker.check_thread(
             email["gmail_message_id"], email.get("gmail_thread_id"))
+        has_reply, when = verdict["has_reply"], verdict["replied_at"]
+
+        # Record the bounce before anything else. It used to be discarded as
+        # "not a reply" — which is the exact condition that makes a contact a
+        # follow-up candidate, so a dead address was chased on a schedule.
+        if verdict["bounced"] and not email.get("bounced_at"):
+            bounced += 1
+            at = (verdict["bounced_at"].isoformat(timespec="seconds")
+                  if verdict["bounced_at"] else now_iso())
+            db.update_email(email["id"], {"bounced_at": at})
+            if email.get("contact_id"):
+                db.update_contact(email["contact_id"], {
+                    "bounced_at": at,
+                    "bounce_detail": f"Undeliverable as of {at[:10]}",
+                })
+            db.log_event("email", email["id"], "bounced",
+                         f"→ {email.get('contact_email')}")
+
         if has_reply is None:
             # Check failed (network error, rate limit, ...): unknown, not
             # 'no reply' — never clear an existing reply record for it.
@@ -1912,7 +1975,7 @@ def check_replies(recheck: bool = Query(False)):
     return {"success": True, "checked": len(sent_emails),
             "new_replies": new_replies, "cleared": cleared,
             "failed_checks": failed_checks, "confirmed": confirmed,
-            "unverified_remaining": remaining}
+            "bounced": bounced, "unverified_remaining": remaining}
 
 
 # ---------- dashboard / tracking ----------

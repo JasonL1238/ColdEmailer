@@ -44,6 +44,10 @@ class _FakeSender:
 def send_env(monkeypatch):
     sender = _FakeSender()
     monkeypatch.setattr(main, "email_sender", sender)
+    # No DNS in unit tests. Fixture addresses use the reserved .invalid TLD,
+    # which correctly has no mail server, so the real deliverability check
+    # would refuse every one of them.
+    monkeypatch.setattr(main, "_domain_accepts_mail", lambda addr, cache: True)
     main._send_lock.acquire()
     yield sender
     if main._send_lock.locked():
@@ -89,6 +93,7 @@ class TestTheSendPathActuallyStampsTheRecipient:
     def test_a_failed_send_stamps_nothing(self, monkeypatch):
         sender = _FakeSender(result={"success": False, "error": "nope"})
         monkeypatch.setattr(main, "email_sender", sender)
+        monkeypatch.setattr(main, "_domain_accepts_mail", lambda addr, cache: True)
         main._send_lock.acquire()
         try:
             _co, _ct, draft = _contact_with_draft()

@@ -48,6 +48,12 @@ export const fallbackExplanation = (reason) =>
    still carry it are legacy ones, which is exactly where a silent chip would
    read as an all-clear. */
 export const addressWarning = (e) => {
+  if (e.bounced_at || e.contact_bounced_at) {
+    return {
+      label: 'bounced',
+      title: 'The mail server rejected this address as undeliverable. Sending again cannot work, and repeated hard bounces cost the sending reputation your deliverable addresses rely on.',
+    }
+  }
   if (e.contact_email_kind === 'generic') {
     return { label: 'role inbox', title: 'A shared company inbox, not a person. These reply far less often.' }
   }
