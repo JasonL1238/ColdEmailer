@@ -72,6 +72,11 @@ OPENROUTER_MODEL_FALLBACK_ORDER = [
 # The lock guards the dict, not the call: two threads can still both discover
 # the same dead model before either records it. Serialising the network call
 # to prevent that would cost more than the duplicate probe it saves.
+#
+# There is no explicit revive. _is_dead drops an expired entry itself, and it
+# gates the retry, so a model can only ever answer after that removal has
+# already happened — a revive-on-success call would be unreachable, and a test
+# for it could only pass by contrivance.
 DEAD_MODEL_TTL_SECONDS = 15 * 60
 _dead_models: dict = {}
 _dead_lock = threading.Lock()
@@ -80,12 +85,6 @@ _dead_lock = threading.Lock()
 def _mark_dead(model: str) -> None:
     with _dead_lock:
         _dead_models[model] = time.monotonic()
-
-
-def _revive(model: str) -> None:
-    """A model that just answered is not dead, whatever it said last time."""
-    with _dead_lock:
-        _dead_models.pop(model, None)
 
 
 def _is_dead(model: str) -> bool:
@@ -116,45 +115,82 @@ def _http_status(exc: Exception) -> Optional[int]:
     return None
 
 
+def _is_unknown_model(exc: Exception) -> bool:
+    """True only when the provider said it does not know this model.
+
+    Kept separate from _classify because remembering a model as dead is a
+    fifteen-minute, process-wide decision and must rest on more than a 403
+    that happens to quote the model name.
+    """
+    text = str(exc).lower()
+    return (_http_status(exc) == 404
+            or type(exc).__name__ == "NotFound"
+            or "model_not_found" in text
+            or "no endpoints found" in text
+            or "unknown model" in text
+            or ("model" in text and ("not found" in text
+                                     or "does not exist" in text)))
+
+
 def _classify(exc: Exception) -> str:
     """Map a provider exception onto one of the REASON_* values."""
     name = type(exc).__name__
     text = str(exc).lower()
     code = _http_status(exc)
 
-    # Unknown model first: providers report it as 400, 403 or 404 depending on
-    # vendor, and it must never be read as a broken key — that would abandon
-    # the rest of the ladder over one entitlement gap.
+    # A key problem outranks everything: it is true of every model, so reading
+    # it as "this one model is unknown" walks the whole ladder and, worse,
+    # blacklists each entry on the way past.
+    if any(w in text for w in (
+            "invalid api key", "invalid_api_key", "incorrect api key",
+            "api key not valid", "api key expired", "api key has been revoked",
+            "revoked", "unauthorized", "unauthenticated", "no_credentials",
+            "account_deactivated", "has not been used in project")):
+        return REASON_AUTH
+
+    # An explicitly unknown model. Only these phrasings — and a 404 — are
+    # certain enough to remember the model as dead.
     if (code == 404 or name == "NotFound"
             or "model_not_found" in text
             or "no endpoints found" in text          # OpenRouter's wording
+            or "unknown model" in text
             or ("model" in text and ("not found" in text
-                                     or "does not exist" in text))
-            # "Permission denied on resource model X" is that one model being
-            # off-limits to this key, not the key being bad.
-            or (code == 403 and "model" in text)):
+                                     or "does not exist" in text))):
         return REASON_NOT_FOUND
 
-    # Auth before quota, deliberately. Google's "API has not been used in
-    # project… the request requires a quota project" 403 contains the word
-    # quota, and a quota-first check tells the user to wait for a reset that
-    # will never come.
+    # A 403 that specifically names the model as off-limits: try the next
+    # model, but do NOT remember this one as dead (see _is_unknown_model).
+    # Matching a bare "model" here was enough for one moderation 403 — which
+    # echoes the requested model slug in its metadata — to walk the whole
+    # ladder and blacklist every entry, so the next fifteen minutes of drafts
+    # fell back to the template with "No usable AI model" and zero network
+    # calls.
+    if code == 403 and any(w in text for w in (
+            "permission denied on resource", "access to model",
+            "do not have access", "does not have access",
+            "not authorized to use model", "model not accessible")):
+        return REASON_NOT_FOUND
+
+    # Google's "API has not been used in project… the request requires a quota
+    # project" 403 contains the word quota, so auth is tested before quota.
     if (code in (401, 403)
             or name in ("PermissionDenied", "Unauthenticated")
-            or any(w in text for w in (
-                "invalid api key", "invalid_api_key", "incorrect api key",
-                "api key not valid", "unauthorized", "unauthenticated",
-                "no_credentials", "account_deactivated", "permission_denied",
-                "has not been used in project", "api key expired"))):
+            or "permission_denied" in text):
         return REASON_AUTH
 
-    # Bare "429" substring matching used to fire on ordinary prose: "you
-    # requested 4297 tokens" was reported to the user as an exhausted quota.
+    # Out of credits is a spending problem, not a broken request. OpenRouter
+    # reports it as a 402 whose body reads "You requested up to 4297 tokens,
+    # but can only afford 100" — which is also why bare "429" substring
+    # matching used to be accidentally right about it.
+    if (code == 402 or "insufficient credits" in text
+            or "can only afford" in text or "requires more credits" in text
+            or "insufficient_quota" in text or "billing" in text):
+        return REASON_QUOTA
+
     if (code == 429 or name == "ResourceExhausted"
             or "rate limit" in text or "ratelimit" in text
             or "quota exceeded" in text or "exceeded your current quota" in text
-            or "resource_exhausted" in text or "too many requests" in text
-            or "insufficient_quota" in text):
+            or "resource_exhausted" in text or "too many requests" in text):
         return REASON_QUOTA
 
     if any(w in text for w in ("timeout", "timed out", "connection",
@@ -348,7 +384,6 @@ def complete_with_reason(
                     prompt=prompt, system=system, model=model, api_key=key,
                     base_url=base_url, max_tokens=max_tokens)
             if out:
-                _revive(model)
                 _last.model = model
                 if configured and model != configured:
                     # Say it out loud. The substitute can be a different vendor
@@ -360,11 +395,16 @@ def complete_with_reason(
         except Exception as exc:
             last_reason = _classify(exc)
             if last_reason == REASON_NOT_FOUND:
-                # This model, not the ladder. Skip it for a while — an
-                # entitlement gap disappears the moment billing is enabled.
-                _mark_dead(model)
-                print(f"[LLM] {model} is not available to this {provider} key; "
-                      f"skipping it for {DEAD_MODEL_TTL_SECONDS // 60} minutes.")
+                # Skip this model either way, but only *remember* it as dead
+                # when the provider said outright that it does not know the
+                # model. Inferring it from a 403 was enough for a single
+                # moderation refusal to blacklist the entire ladder.
+                if _is_unknown_model(exc):
+                    _mark_dead(model)
+                    print(f"[LLM] {provider} does not serve {model}; "
+                          f"skipping it for {DEAD_MODEL_TTL_SECONDS // 60} minutes.")
+                else:
+                    print(f"[LLM] {model} refused this request, trying next model.")
             elif last_reason == REASON_AUTH:
                 # A bad key fails identically for every model — stop early.
                 # Only a genuine key problem reaches here; a 403 naming a

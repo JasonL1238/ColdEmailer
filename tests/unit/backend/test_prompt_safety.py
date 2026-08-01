@@ -138,7 +138,6 @@ class TestTheBodyNeverNarratesTheAttachment:
 
     def _follow_up_prompt(self, composer, monkeypatch, original):
         captured = {}
-        monkeypatch.setattr("email_composer.get_cloud_llm_provider", lambda: "test")
         monkeypatch.setattr(composer.resumes, "resolve_attachment_path",
                             lambda rid: "/tmp/zz-resume.pdf")
 
@@ -235,7 +234,6 @@ class TestTheSignatureActuallyGetsAttached:
         composer.db.update_profile({"full_name": "Ada Lovelace", "school": "Cambridge",
                                     "phone": "555-0100",
                                     "website": "https://ada.example"})
-        monkeypatch.setattr("email_composer.get_cloud_llm_provider", lambda: "test")
         monkeypatch.setattr(
             "email_composer.llm_complete",
             lambda prompt, system=None, max_tokens=0: (
@@ -252,7 +250,6 @@ class TestTheSignatureActuallyGetsAttached:
     def test_an_ai_body_that_signs_off_is_not_doubled(self, composer, monkeypatch):
         composer.db.update_profile({"full_name": "Ada Lovelace", "school": "Cambridge",
                                     "phone": "555-0100"})
-        monkeypatch.setattr("email_composer.get_cloud_llm_provider", lambda: "test")
         monkeypatch.setattr(
             "email_composer.llm_complete",
             lambda prompt, system=None, max_tokens=0: (

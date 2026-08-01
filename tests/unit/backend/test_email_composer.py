@@ -100,7 +100,6 @@ class TestTemplateFallback:
 
     def test_custom_type_refuses_when_no_llm_is_configured(self, composer, monkeypatch):
         # No provider => the LLM branch is skipped entirely (and no network call).
-        monkeypatch.setattr("email_composer.get_cloud_llm_provider", lambda: None)
         with pytest.raises(TemplateUnavailable):
             composer.compose({"name": "Jane", "company_name": "Acme"}, None,
                              email_type="custom", custom_instructions="Be brief.")

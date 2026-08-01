@@ -14,12 +14,12 @@ from resume_service import ResumeService
 
 try:
     from llm_client import (REASON_EMPTY, complete as llm_complete,
-                            get_cloud_llm_provider, last_failure_reason,
+                            last_failure_reason, last_model_used,
                             reset_failure_reason)
 except ImportError:
     llm_complete = None
-    get_cloud_llm_provider = lambda: None
     last_failure_reason = lambda: None
+    last_model_used = lambda: None
     reset_failure_reason = lambda: None
     REASON_EMPTY = "llm_empty"
 
@@ -433,7 +433,8 @@ Body:
                 if signature and not self._already_signed(body, signature):
                     body = body.rstrip() + "\n" + signature
                 return {"subject": parsed["subject"], "body": body,
-                        "used_template_fallback": False, "fallback_reason": None}
+                        "used_template_fallback": False, "fallback_reason": None,
+                        "llm_model": self._model_used()}
 
         if email_type in _NEEDS_AI:
             # The plain template cannot follow custom instructions — it would
@@ -464,6 +465,10 @@ Body:
         reset_failure_reason()
         out = llm_complete(prompt=prompt, system=None, max_tokens=max_tokens)
         return out, (None if out else last_failure_reason())
+
+    @staticmethod
+    def _model_used():
+        return last_model_used()
 
     def compose_follow_up(self, contact: Dict, company: Optional[Dict],
                           original: Dict) -> Dict:
@@ -510,7 +515,8 @@ Body:
                 if signature and not self._already_signed(body, signature):
                     body = body.rstrip() + "\n" + signature
                 return {"subject": parsed["subject"], "body": body,
-                        "used_template_fallback": False, "fallback_reason": None}
+                        "used_template_fallback": False, "fallback_reason": None,
+                        "llm_model": self._model_used()}
 
         body = (f"Hi {first},\n\nI wanted to follow up on my email from {sent_date} about "
                 f"{company_name}. I'm still very interested and would welcome the chance to "

@@ -256,6 +256,9 @@ class GenerationService:
                 status="draft",
                 used_template_fallback=composed["used_template_fallback"],
                 fallback_reason=composed["fallback_reason"],
+                # Which model actually wrote it. The ladder substitutes
+                # silently, sometimes across vendors at very different prices.
+                llm_model=composed.get("llm_model"),
                 custom_instructions=payload.get("custom_instructions"),
             )
             if contact.get("status") in (None, "", "new"):

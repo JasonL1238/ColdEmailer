@@ -1649,11 +1649,12 @@ _EXTRA_ROLE_LOCALS = frozenset({
     "updates", "feedback", "bugs", "postmaster", "mailer-daemon", "subscribe",
     "unsubscribe", "invoices", "invoice", "payments", "orders", "shop",
     "service", "services", "customerservice", "customersupport", "care",
+    "auto-reply", "autoreply", "bounces", "dpo", "helpdesk", "it", "reply",
 })
 
 
 def _looks_like_role_local(email: str) -> bool:
-    """True when every token of the local part is a role word.
+    """True when the local part is made of role words.
 
     Deliberately token-based rather than "is the name blank": jane.doe@ splits
     into two tokens that are not role words, so a real person with no name
@@ -1661,13 +1662,25 @@ def _looks_like_role_local(email: str) -> bool:
     """
     import re as _re
 
+    from contact_verify import GENERIC_LOCALS
+
     local = (email or "").strip().lower().split("@", 1)[0].split("+", 1)[0]
     if not local:
         return False
+    # Whole local first. Splitting on [._+-] means a hyphenated entry can never
+    # match token-by-token, which silently made no-reply@, do-not-reply@ and
+    # mailer-daemon@ read as people — complete with a "this address does not
+    # look like this contact" warning on an autoresponder.
+    if local in _EXTRA_ROLE_LOCALS:
+        return True
     parts = [p for p in _re.split(r"[._+-]+", local) if p]
     if not parts:
         return False
-    return all(p in _EXTRA_ROLE_LOCALS or len(p) <= 1 for p in parts)
+    # Both vocabularies. Consulting only the extra set left mixed locals —
+    # careers.internships@, hr.legal@ — falling between this function and
+    # contact_verify.is_generic_inbox, matching neither.
+    known = _EXTRA_ROLE_LOCALS | GENERIC_LOCALS
+    return all(p in known or len(p) <= 1 for p in parts)
 
 
 def repair_contact_email_kinds(db: "Database") -> int:

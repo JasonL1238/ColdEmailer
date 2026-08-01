@@ -866,11 +866,13 @@ async def update_contact(contact_id: str, payload: ContactUpdate,
         # list cried "address doesn't match" at perfectly matching addresses.
         verdict = verify_email(addr, new_name, check_mx=False)
         updates["email_kind"] = verdict["email_kind"] if addr else "none"
-        if address_changed:
-            # These described the previous mailbox and were never checked
-            # against this one.
-            updates["email_verified"] = 0
-            updates["person_verified"] = 0
+        # Cleared on a rename too, not only on an address change. Both flags
+        # assert a *pairing* — "this mailbox was confirmed to be this person".
+        # Leaving them after a rename produced a row that simultaneously reads
+        # "address does not match this person" and "verified as this person",
+        # and the UI shows the green Person/Verified chip off the second one.
+        updates["email_verified"] = 0
+        updates["person_verified"] = 0
     elif "email" in updates:
         # Same address echoed back by the client. Rewriting the classification
         # from an unchanged value can only lose information.

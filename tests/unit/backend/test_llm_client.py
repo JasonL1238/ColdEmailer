@@ -395,17 +395,70 @@ class TestDeadModelsExpire:
             lambda: real_monotonic() + llm_client.DEAD_MODEL_TTL_SECONDS + 1)
         assert llm_client._is_dead("gemini-2.5-flash") is False
 
-    def test_a_model_that_answers_is_revived_immediately(self, monkeypatch):
-        monkeypatch.setenv("EMAIL_LLM_PROVIDER", "gemini")
-        monkeypatch.setenv("GOOGLE_AI_API_KEY", "test-key")
+
+class TestOneRefusalDoesNotBlacklistTheLadder:
+    """A 403 that merely quotes the model name used to walk the whole ladder
+    marking every entry dead, so the next fifteen minutes of drafts fell back
+    to the template with "No usable AI model" and made zero network calls."""
+
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_LLM_PROVIDER", "openrouter")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
         monkeypatch.delenv("EMAIL_LLM_MODEL", raising=False)
-        target = GEMINI_MODEL_FALLBACK_ORDER[0]
-        llm_client._mark_dead(target)
-        monkeypatch.setattr(llm_client, "_gemini_complete",
-                            lambda **kw: ("ok", False))
-        monkeypatch.setattr(llm_client, "_is_dead", lambda m: False)
+
+    def test_a_moderation_403_quoting_the_model_marks_nothing_dead(self, monkeypatch):
+        self._env(monkeypatch)
+        exc = _OpenAIBoom(
+            "Your request was flagged. metadata: {'model_slug': "
+            "'anthropic/claude-sonnet-4'}", code="moderation", status_code=403)
+        monkeypatch.setattr(llm_client, "_openai_complete",
+                            lambda **kw: (_ for _ in ()).throw(exc))
         complete_with_reason("hi")
-        assert llm_client._is_dead(target) is False
+        assert llm_client._dead_models == {}, "one refusal disabled the ladder"
+
+    def test_the_next_request_still_reaches_the_provider(self, monkeypatch):
+        self._env(monkeypatch)
+        exc = _OpenAIBoom("flagged, model_slug anthropic/claude-sonnet-4",
+                          code="moderation", status_code=403)
+        monkeypatch.setattr(llm_client, "_openai_complete",
+                            lambda **kw: (_ for _ in ()).throw(exc))
+        complete_with_reason("bad prompt")
+        calls = []
+        monkeypatch.setattr(llm_client, "_openai_complete",
+                            lambda **kw: (calls.append(kw["model"]) or "the email"))
+        text, reason = complete_with_reason("an innocent prompt")
+        assert text == "the email"
+        assert calls, "the ladder was still blacklisted from the previous call"
+
+    def test_a_genuinely_unknown_model_is_still_remembered(self, monkeypatch):
+        self._env(monkeypatch)
+        exc = _OpenAIBoom("No endpoints found for imaginary/model.",
+                          code="model_not_found", status_code=404)
+        monkeypatch.setattr(llm_client, "_openai_complete",
+                            lambda **kw: (_ for _ in ()).throw(exc))
+        complete_with_reason("hi")
+        assert llm_client._dead_models, "a real unknown model must be skipped"
+
+    def test_a_revoked_key_beats_a_message_that_names_a_model(self, monkeypatch):
+        """Reading this as "unknown model" walked every entry and told the user
+        to fix their model list instead of their key."""
+        exc = _OpenAIBoom(
+            "Your API key has been revoked. Requested model: gpt-4o-mini.",
+            code="invalid_api_key", status_code=403)
+        assert _classify(exc) == REASON_AUTH
+
+
+class TestOutOfCredits:
+    def test_a_402_is_a_spending_problem_not_a_broken_request(self):
+        """OpenRouter's out-of-credits body is "You requested up to 4297
+        tokens, but can only afford 100" — which is why bare "429" substring
+        matching was accidentally right about it, and why removing that match
+        regressed the most common paid-tier failure to "AI unavailable"."""
+        exc = _OpenAIBoom(
+            "This request requires more credits, or fewer max_tokens. You "
+            "requested up to 4297 tokens, but can only afford 100.",
+            code="insufficient_credits", status_code=402)
+        assert _classify(exc) == REASON_QUOTA
 
 
 class TestWhichModelActuallyWrote:

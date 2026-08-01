@@ -125,7 +125,6 @@ def test_per_minute_cap_waits_for_the_window_instead_of_dropping_the_batch(gen_e
 
 def test_custom_type_without_ai_skips_instead_of_writing_the_wrong_email(gen_env,
                                                                         monkeypatch):
-    monkeypatch.setattr("email_composer.get_cloud_llm_provider", lambda: None)
     db, limiter, service = gen_env
     ids = _contacts(db, 2)
 
