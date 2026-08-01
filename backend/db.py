@@ -222,18 +222,32 @@ _HAS_FOLLOW_UP_SQL = (
 # distinction a cadence turns on — a sent follow-up advances to the next rung,
 # an unsent one means there is nothing to do until the user sends or trashes it.
 #
-# Both count by `is_follow_up` + contact rather than by joining
-# `original_email_id`, so deleting the email a follow-up answered cannot make
-# the follow-up itself vanish from the count and re-arm a rung already used.
+# Both count by contact rather than by joining `original_email_id` back to a
+# specific row, so deleting the email a follow-up answered cannot make the
+# follow-up itself vanish from the count and re-arm a rung already used.
+#
+# IS_FOLLOW_UP_SQL is the one definition of "this row is a follow-up", shared
+# by every place that counts them. Three call sites used to disagree — the due
+# list counted `is_follow_up`, the plan gate counted `is_follow_up OR
+# original_email_id`, and the UI annotation counted `is_follow_up` — so a
+# legacy row with one field and not the other made the due list offer a
+# contact, the button render enabled, and the click 409 forever.
+IS_FOLLOW_UP_SQL = "(%s.is_follow_up = 1 OR %s.original_email_id IS NOT NULL)"
+_F_IS_FOLLOW_UP = IS_FOLLOW_UP_SQL % ("f", "f")
 _FOLLOW_UPS_SENT_SQL = (
-    "(SELECT COUNT(*) FROM emails f WHERE f.is_follow_up = 1 AND f.status = 'sent' "
+    f"(SELECT COUNT(*) FROM emails f WHERE {_F_IS_FOLLOW_UP} AND f.status = 'sent' "
     "AND e.contact_id IS NOT NULL AND f.contact_id = e.contact_id)"
 )
 _FOLLOW_UP_PENDING_SQL = (
-    "EXISTS (SELECT 1 FROM emails f WHERE f.is_follow_up = 1 "
+    f"EXISTS (SELECT 1 FROM emails f WHERE {_F_IS_FOLLOW_UP} "
     "AND f.status NOT IN ('sent', 'trashed') "
     "AND e.contact_id IS NOT NULL AND f.contact_id = e.contact_id)"
 )
+
+
+def row_is_follow_up(row: Dict[str, Any]) -> bool:
+    """The Python twin of IS_FOLLOW_UP_SQL. Same question, same answer."""
+    return bool(row.get("is_follow_up") or row.get("original_email_id"))
 
 
 # The cadence: how many days of silence before each successive follow-up, and
@@ -1308,7 +1322,7 @@ class Database:
         now = datetime.now()
         out: List[Dict[str, Any]] = []
         for group in groups.values():
-            sent_follow_ups = sum(1 for r in group if r.get("is_follow_up"))
+            sent_follow_ups = sum(1 for r in group if row_is_follow_up(r))
             step = sent_follow_ups + 1
             if step > len(steps):
                 continue                       # cadence finished for this person
@@ -1324,7 +1338,7 @@ class Database:
             # already flagged as answered is the wrong premise for "no reply
             # yet" even when the flag was never verified.
             anchors = [r for r in group
-                       if not r.get("is_follow_up") and not r.get("has_response")]
+                       if not row_is_follow_up(r) and not r.get("has_response")]
             if not anchors:
                 continue
             candidate = dict(max(anchors, key=lambda r: r["sent_at"]))
@@ -1546,11 +1560,19 @@ def migrate_legacy_data(db: Database, backend_dir: str) -> Dict[str, int]:
                 status = status_map.get(e.get("status"), "draft")
                 if e.get("gmail_message_id") or e.get("sent_at"):
                     status = "sent"
+                # The first release of this app tracked follow-ups by
+                # original_email_id alone — is_follow_up did not exist yet — so
+                # a file written then imports delivered follow-ups with the
+                # flag unset. Cross-fill on the way in rather than teaching
+                # every reader to cope: a half-marked row made the due list
+                # offer a contact whom the send gate then refused forever.
+                is_follow_up = bool(e.get("is_follow_up")
+                                    or e.get("original_email_id"))
                 db.create_email(
                     id=email_id,
                     contact_id=contact["id"],
                     company_id=company_id,
-                    email_type="follow_up" if e.get("is_follow_up") else "application",
+                    email_type="follow_up" if is_follow_up else "application",
                     subject=e.get("subject") or "",
                     body=e.get("body") or "",
                     status=status,
@@ -1560,7 +1582,7 @@ def migrate_legacy_data(db: Database, backend_dir: str) -> Dict[str, int]:
                     has_response=e.get("has_response"),
                     response_at=e.get("response_date"),
                     original_email_id=e.get("original_email_id"),
-                    is_follow_up=e.get("is_follow_up"),
+                    is_follow_up=is_follow_up,
                     used_template_fallback=e.get("used_template_fallback"),
                     fallback_reason=e.get("fallback_reason"),
                 )

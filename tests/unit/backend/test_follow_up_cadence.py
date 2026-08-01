@@ -18,6 +18,8 @@ The rules a cadence has to keep, and which each test below pins:
 import asyncio
 import os
 import tempfile
+import threading
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -192,6 +194,97 @@ def test_a_delivered_follow_up_with_no_date_still_spends_its_rung(db):
     assert db.get_follow_up_candidates() == []
 
 
+def test_only_a_delivered_follow_up_with_no_date_retires_a_contact(db):
+    """Negative cases for each conjunct of that guard. Written because the
+    positive case above satisfies all of them at once, so widening the clause
+    to any undated row — which silently retires every contact who happens to
+    have a draft — passed the whole suite."""
+    db.update_follow_up_cadence({"enabled": True, "steps": [7]})
+
+    def _fresh(email, **kw):
+        contact = db.create_contact(email=email)
+        db.create_email(contact_id=contact["id"], status="sent",
+                        subject="First", body="hi", sent_at=_days_ago(30))
+        if kw:
+            db.create_email(contact_id=contact["id"], **kw)
+        return contact["id"]
+
+    due = lambda: {c["contact_id"] for c in db.get_follow_up_candidates()}
+
+    # an ordinary unsent draft has no date either, and means nothing here
+    plain_draft = _fresh("draft@x.com", status="draft", subject="Another")
+    # a trashed follow-up with no date was never delivered
+    trashed = _fresh("trash@x.com", status="trashed", is_follow_up=True,
+                     subject="Re: First")
+    # a legacy row flagged only by original_email_id is still a delivered rung
+    legacy = _fresh("legacy@x.com", status="sent", subject="Re: First",
+                    original_email_id="gone", sent_at=None)
+    # and an undated *first-contact* row must not retire anyone
+    undated_first = _fresh("undated@x.com", status="sent", subject="Second",
+                           sent_at=None)
+
+    assert plain_draft in due()
+    assert undated_first in due()
+    assert legacy not in due()
+    # the trashed one is retired, but by the trashed-follow-up rule, not this
+    assert trashed not in due()
+
+
+def test_one_definition_of_a_follow_up_serves_every_counter(db):
+    """The app's first release tracked follow-ups by original_email_id alone —
+    is_follow_up did not exist — so a file written then imports delivered
+    follow-ups with the flag unset. Three counters used to disagree about such
+    a row: the due list offered the contact, the emails list rendered an
+    enabled "Draft follow-up" button, and the click 409'd. A button that can
+    never succeed, on a banner that can never reach zero."""
+    db.update_follow_up_cadence({"enabled": True, "steps": [7]})
+    contact = db.create_contact(email="legacyshape@example.com")
+    original = db.create_email(contact_id=contact["id"], status="sent",
+                               subject="First", body="hi", sent_at=_days_ago(60))
+    db.create_email(contact_id=contact["id"], status="sent", subject="Re: First",
+                    body="nudge", sent_at=_days_ago(30),
+                    original_email_id=original["id"])   # no is_follow_up flag
+
+    assert db.get_follow_up_candidates() == []
+    assert db.get_email(original["id"])["follow_ups_sent"] == 1
+
+    # With a rung still owed, the same row must not be mistaken for a
+    # first-contact email either: the candidate anchors the new follow-up and
+    # supplies the Gmail ids the References header is built from, so returning
+    # the legacy follow-up here threads rung 2 onto the wrong message.
+    db.update_follow_up_cadence({"enabled": True, "steps": [7, 7]})
+    due = db.get_follow_up_candidates()
+    assert [c["id"] for c in due] == [original["id"]]
+    assert due[0]["next_follow_up_step"] == 2
+
+
+def test_the_legacy_import_marks_a_follow_up_by_either_signal(tmp_path):
+    """Normalised on the way in rather than teaching every reader to cope."""
+    import json as _json
+    from db import Database, migrate_legacy_data
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "generated_emails.json").write_text(_json.dumps({
+        "e-first": {
+            "contact_email": "old@example.com", "contact_name": "Old Contact",
+            "company": "ZZ Legacy Co", "subject": "First", "body": "hi",
+            "status": "sent", "sent_at": "2020-01-01T00:00:00",
+            "gmail_message_id": "gm1"},
+        "e-follow": {
+            "contact_email": "old@example.com", "contact_name": "Old Contact",
+            "company": "ZZ Legacy Co", "subject": "Re: First", "body": "nudge",
+            "status": "sent", "sent_at": "2020-02-01T00:00:00",
+            "gmail_message_id": "gm2",
+            "original_email_id": "e-first"},       # the only follow-up signal
+    }))
+    db = Database(str(tmp_path / "test.db"))
+    migrate_legacy_data(db, str(tmp_path))
+
+    row = db.get_email("e-follow")
+    assert row["is_follow_up"] == 1
+    assert row["email_type"] == "follow_up"
+
+
 def test_a_verified_reply_anywhere_stops_the_sequence(db):
     db.update_follow_up_cadence({"enabled": True, "steps": [7, 7, 7]})
     contact, original = _contact_with_first_email(db, days_ago=60)
@@ -333,35 +426,77 @@ def test_the_manual_button_counts_an_undated_delivered_rung(api):
     assert composer.calls == []
 
 
-def test_the_gate_is_re_asked_under_a_lock_before_the_row_is_written(api):
+def test_two_real_threads_cannot_both_draft_the_same_rung(api):
     """Composing a follow-up is an LLM round trip lasting seconds, and it sits
-    between the gate and the INSERT. The batch job could be inside that call
-    for a contact while the user clicked Draft follow-up on the same person in
-    another tab: both gates passed, both wrote, and one human ended up with two
-    identical rung-1 drafts — both caught by "Select all", both delivered."""
+    between the gate and the INSERT. The batch job can be inside that call for
+    a contact while the user clicks Draft follow-up on the same person in
+    another tab: both gates pass, both write, and one human ends up with two
+    identical rung-1 drafts — both caught by "Select all", both delivered.
+
+    Two real threads, released together, is the only arrangement that tests the
+    *lock*. The single-threaded version of this test — a composer that writes
+    the competing row itself, before the lock is ever taken — pinned only the
+    recheck, and replacing `with _follow_up_lock:` by a no-op passed all 788
+    tests while two genuine threads produced two drafts."""
     composer, contact = api
     main.db.update_follow_up_cadence({"enabled": True, "steps": [7]})
     original = main.db.create_email(contact_id=contact["id"], status="sent",
                                     subject="ZZTEST race", body="hi",
                                     sent_at=_days_ago(30))
+    ready = threading.Barrier(2, timeout=10)
 
-    # Stand in for the racing writer: a composer that drafts a follow-up for
-    # this contact *while* the caller is mid-compose, exactly as the other
-    # thread would have.
-    class _RacingComposer(_StubComposer):
-        def compose_follow_up(self, contact_arg, company, original_arg, **kwargs):
-            main.db.create_email(contact_id=contact["id"], status="draft",
-                                 is_follow_up=True, follow_up_step=1,
-                                 original_email_id=original["id"],
-                                 subject="Re: ZZTEST race", body="the other one")
-            return super().compose_follow_up(contact_arg, company, original_arg,
-                                             **kwargs)
+    class _SlowComposer(_StubComposer):
+        def compose_follow_up(self, *a, **kw):
+            # Both callers are now past the outer gate and about to contend for
+            # the lock — exactly the window the lock exists to close.
+            ready.wait()
+            return super().compose_follow_up(*a, **kw)
 
-    main.composer = _RacingComposer()
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(main.generate_follow_up(original["id"]))
-    assert exc.value.status_code == 409
-    assert len(_follow_ups_for({contact["id"]})) == 1
+    main.composer = _SlowComposer()
+    outcomes = []
+
+    def _draft():
+        try:
+            outcomes.append(("ok", asyncio.run(main.generate_follow_up(original["id"]))))
+        except HTTPException as e:
+            outcomes.append(("refused", e.status_code))
+        except Exception as e:                       # barrier timeout, etc.
+            outcomes.append(("error", repr(e)))
+
+    threads = [threading.Thread(target=_draft) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert len(_follow_ups_for({contact["id"]})) == 1, outcomes
+    assert sorted(o[0] for o in outcomes) == ["ok", "refused"], outcomes
+    assert next(o[1] for o in outcomes if o[0] == "refused") == 409
+
+
+def test_a_rung_that_moved_mid_compose_is_not_filed_under_the_new_number(api):
+    """The batch job can sit in the per-minute pause for a minute, and a rung
+    sent in that window advances everyone. Writing the already-composed text
+    under the *new* step number files rung-1 wording as rung 2: the recipient
+    reads "I wanted to follow up on my note" a second time, and the cadence
+    believes rung 2 is spent."""
+    composer, contact = api
+    main.db.update_follow_up_cadence({"enabled": True, "steps": [7, 7]})
+    original = main.db.create_email(contact_id=contact["id"], status="sent",
+                                    subject="ZZTEST moved", body="hi",
+                                    sent_at=_days_ago(30))
+    plan = main._follow_up_plan(contact["id"], manual=True)
+    assert plan["step"] == 1
+
+    # Rung 1 goes out while this caller holds a step-1 plan.
+    main.db.create_email(contact_id=contact["id"], status="sent", is_follow_up=True,
+                         follow_up_step=1, original_email_id=original["id"],
+                         subject="Re: ZZTEST moved", body="rung one",
+                         sent_at=_days_ago(1))
+
+    assert main._create_follow_up(original, contact, plan) is None
+    # only the rung that really went out; nothing new was filed
+    assert [e["body"] for e in _follow_ups_for({contact["id"]})] == ["rung one"]
 
 
 def test_the_manual_button_refuses_a_bounced_address(api):
@@ -682,8 +817,9 @@ def test_the_prompt_tells_the_model_which_rung_it_is_writing(monkeypatch):
     assert "do NOT repeat it" in prompt
 
 
+@pytest.mark.parametrize("step", [1, 2, 3, 4])
 @pytest.mark.parametrize("field", ["subject", "body", "name", "company", "previous"])
-def test_no_field_can_smuggle_instructions_into_the_follow_up_prompt(monkeypatch, field):
+def test_no_field_can_smuggle_instructions_into_the_follow_up_prompt(monkeypatch, field, step):
     """Every string reaching this prompt comes from scraped text or the user's
     own editing, so each is fenced as data.
 
@@ -717,10 +853,48 @@ def test_no_field_can_smuggle_instructions_into_the_follow_up_prompt(monkeypatch
     else:
         previous["body"] = payload
 
-    _composer().compose_follow_up(contact, None, original, step=2, total_steps=3,
+    # Every rung, because the rungs interpolate different things: only rung 1's
+    # angle carries {company}, and it is the only rung a default [7] cadence
+    # ever sends — so a company-name injection was reachable by default and
+    # invisible to a step-2-only test.
+    _composer().compose_follow_up(contact, None, original, step=step, total_steps=4,
                                   previous=previous)
 
     assert "Ignore previous instructions" not in seen["prompt"]
+
+
+def test_the_prompt_only_calls_the_previous_message_a_follow_up_when_it_is_one(monkeypatch):
+    """`previous` is simply the newest thing we sent them, which can be a
+    second first-contact email. Describing that as "the most recent follow-up,
+    also unanswered" told the model something false about its own history with
+    this person, and invited it to write as if a nudge had already gone out."""
+    import email_composer
+    seen = {}
+
+    def _fake(prompt=None, system=None, max_tokens=None):
+        seen["prompt"] = prompt
+        return "Subject: Re: Hi\nBody:\nText."
+
+    monkeypatch.setattr(email_composer, "llm_complete", _fake)
+    monkeypatch.setattr(email_composer, "reset_failure_reason", lambda: None)
+    composer = _composer()
+    original = {"id": "root", "subject": "Hi", "body": "the first note",
+                "sent_at": "2026-01-01T09:00:00"}
+
+    composer.compose_follow_up(
+        {"name": "Jane", "company_name": "Acme"}, None, original,
+        step=1, total_steps=2,
+        previous={"id": "other-first-contact", "body": "a different opener",
+                  "sent_at": "2026-02-01T09:00:00"})
+    assert "MOST RECENT FOLLOW-UP" not in seen["prompt"]
+    assert "MOST RECENT MESSAGE WE SENT THEM" in seen["prompt"]
+
+    composer.compose_follow_up(
+        {"name": "Jane", "company_name": "Acme"}, None, original,
+        step=2, total_steps=2,
+        previous={"id": "fu1", "is_follow_up": 1, "body": "the first nudge",
+                  "sent_at": "2026-02-01T09:00:00"})
+    assert "MOST RECENT FOLLOW-UP" in seen["prompt"]
 
 
 def test_regenerating_a_follow_up_rewrites_the_rung_it_actually_is(api):
@@ -780,6 +954,27 @@ def test_the_annotation_columns_separate_sent_from_pending(db):
     assert listed["follow_ups_sent"] == 1 and listed["follow_up_pending"] == 0
     assert trashed["id"]
 
+    # A second delivered rung really counts as two. Walking only 0 -> 1 let a
+    # count capped at 1 pass, which on a 3-step cadence renders "2 of 3"
+    # forever and never reaches "done".
+    db.create_email(contact_id=contact["id"], status="sent", is_follow_up=True,
+                    original_email_id=original["id"], sent_at=_days_ago(1))
+    assert db.get_email(original["id"])["follow_ups_sent"] == 2
+
+    # 'approved' is unsent too — the send dialog's staging state must not read
+    # as "nothing pending" and offer a duplicate.
+    approved = db.create_email(contact_id=contact["id"], status="approved",
+                               is_follow_up=True, original_email_id=original["id"])
+    assert db.get_email(original["id"])["follow_up_pending"] == 1
+    db.update_email(approved["id"], {"status": "trashed"})
+
+    # Deleting the email a follow-up answered must not re-arm a spent rung —
+    # the count is per contact, not a join back to a specific row.
+    db.delete_email(original["id"])
+    survivor = db.create_email(contact_id=contact["id"], status="sent",
+                               subject="Later", sent_at=_days_ago(1))
+    assert db.get_email(survivor["id"])["follow_ups_sent"] == 2
+
 
 def test_a_per_minute_limit_pauses_the_batch_instead_of_abandoning_it(api, monkeypatch):
     """Two very different refusals share one message. "500 today" means come
@@ -795,18 +990,20 @@ def test_a_per_minute_limit_pauses_the_batch_instead_of_abandoning_it(api, monke
                              subject=f"ZZTEST burst {c['id'][:6]}", body="hi",
                              sent_at=_days_ago(30))
     try:
-        calls = {"n": 0}
+        # Reopens on the CLOCK, not on a call count. A counter-based stub is
+        # satisfied by merely re-asking, so an implementation that never waits
+        # passes it — replacing the whole body of _wait_for_generation_slot
+        # with `return False` left all 788 tests green.
+        reopens_at = [time.monotonic() + 0.3]
 
         class _BurstLimiter(_NoLimits):
             def can_generate_email(self):
-                calls["n"] += 1
-                # refuse once, then allow — the per-minute window reopening
-                if calls["n"] == 1:
+                if time.monotonic() < reopens_at[0]:
                     return False, "Rate limit: max 10 generations per minute."
                 return True, None
 
             def generation_retry_after(self):
-                return 0.01          # a burst window, not the daily cap
+                return max(0.0, reopens_at[0] - time.monotonic()) + 0.01
 
         monkeypatch.setattr(main, "rate_limiter", _BurstLimiter())
         candidates = _due_for(ids)
@@ -817,6 +1014,55 @@ def test_a_per_minute_limit_pauses_the_batch_instead_of_abandoning_it(api, monke
         assert len(_follow_ups_for(ids)) == 2
     finally:
         main.db.delete_contact(other["id"])
+
+
+def test_the_pause_keeps_waiting_while_other_work_takes_the_freed_slot(api, monkeypatch):
+    """generation_retry_after only ages out the *oldest* timestamp, so it frees
+    exactly one slot — and the manual button, Rewrite, or a generate-emails job
+    can take it. Retrying once then found the window shut again and abandoned
+    the whole tail, which is the failure the pause exists to prevent."""
+    composer, contact = api
+    main.db.update_follow_up_cadence({"enabled": True, "steps": [7]})
+    main.db.create_email(contact_id=contact["id"], status="sent",
+                         subject="ZZTEST contended", body="hi", sent_at=_days_ago(30))
+    refusals = {"left": 3}          # the window stays shut for three reopenings
+
+    class _ContendedLimiter(_NoLimits):
+        def can_generate_email(self):
+            if refusals["left"] > 0:
+                return False, "Rate limit: max 10 generations per minute."
+            return True, None
+
+        def generation_retry_after(self):
+            refusals["left"] -= 1
+            return 0.01
+
+    monkeypatch.setattr(main, "rate_limiter", _ContendedLimiter())
+    candidates = _due_for({contact["id"]})
+    main._draft_follow_ups_job(main.db.create_job("follow_up", {})["id"], candidates)
+
+    assert len(_follow_ups_for({contact["id"]})) == 1
+
+
+def test_the_pause_returns_immediately_when_the_run_is_cancelled(api):
+    """The wait has to notice Stop. Sleeping through it means a cancelled run
+    keeps a thread and a job row alive for the whole window."""
+    job = main.db.create_job("follow_up", {})
+    started = time.monotonic()
+
+    def _cancel_soon():
+        time.sleep(0.05)
+        main.db.update_job(job["id"], status="cancelled")
+
+    threading.Thread(target=_cancel_soon, daemon=True).start()
+    assert main._wait_for_generation_slot(job["id"], 5.0) is True
+    assert time.monotonic() - started < 2.0
+
+    # ...and it really does wait when nothing cancels it
+    other = main.db.create_job("follow_up", {})
+    started = time.monotonic()
+    assert main._wait_for_generation_slot(other["id"], 0.3) is False
+    assert time.monotonic() - started >= 0.25
 
 
 def test_a_daily_limit_still_stops_the_batch_and_names_everyone_skipped(api, monkeypatch):

@@ -1475,6 +1475,13 @@ async def regenerate_email(email_id: str):
 
 # ---------- follow-ups ----------
 
+# How long one contact may spend waiting for the per-minute generation window.
+# Long enough to ride out several contended reopenings, short enough that a
+# permanently full window ends the run with a report rather than a job that
+# looks alive forever.
+_GENERATION_WAIT_BUDGET_SECONDS = 300.0
+
+
 def _wait_for_generation_slot(job_id: str, seconds: float) -> bool:
     """Sleep out a per-minute window in small steps so Stop still works.
     Returns True when the job was cancelled while waiting."""
@@ -1646,6 +1653,15 @@ def _create_follow_up(original: Dict, contact: Dict, plan: Dict) -> Dict:
         fresh = _follow_up_plan(contact["id"], manual=plan.get("manual", False))
         if fresh["refusal"]:
             return None
+        if fresh["step"] != plan["step"] or fresh["total"] != plan["total"]:
+            # The rung moved while this was being written — the batch job can
+            # sit in the per-minute pause for a minute, and a rung sent in that
+            # window advances everyone. Storing `composed` now would file
+            # rung-1 wording under follow_up_step=2: the recipient reads "I
+            # wanted to follow up on my note" for the second time, and the
+            # cadence believes rung 2 is spent. Refusing costs one compose;
+            # both callers already report it and the contact stays due.
+            return None
         follow_up = db.create_email(
             contact_id=contact["id"],
             company_id=contact.get("company_id"),
@@ -1758,15 +1774,29 @@ def _draft_follow_ups_job(job_id: str, candidates: List[Dict[str, Any]]):
                 # "rate limited", and in template mode (which is instant) that
                 # is the normal case, not the edge one. generation.py already
                 # waits these out; this is the same shape.
-                wait = rate_limiter.generation_retry_after()
-                if wait is not None:
+                # Looped, not a single retry. generation_retry_after only ages
+                # out the *oldest* timestamp in the window, i.e. it frees one
+                # slot — and anything else generating in the meantime (the
+                # manual button, Rewrite, a generate-emails job) takes it. One
+                # retry then found the window shut again and abandoned the
+                # whole tail, which is the failure this pause exists to
+                # prevent. Bounded so a permanently contended window cannot
+                # keep the job alive forever.
+                waited = 0.0
+                while not can and waited < _GENERATION_WAIT_BUDGET_SECONDS:
+                    wait = rate_limiter.generation_retry_after()
+                    if wait is None:
+                        break               # waiting genuinely cannot help
                     db.update_job(
                         job_id, progress_current=i,
                         stage="Pausing — per-minute generation limit reached")
                     if _wait_for_generation_slot(job_id, wait):
                         cancelled = True
                         break
+                    waited += wait
                     can, err = rate_limiter.can_generate_email()
+                if cancelled:
+                    break
             if not can:
                 for remaining in candidates[i:]:
                     skipped += 1

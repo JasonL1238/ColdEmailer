@@ -73,14 +73,21 @@ class RateLimiter:
     # ---------- checks ----------
 
     def can_generate_email(self) -> tuple[bool, str]:
+        # Daily cap first, deliberately. `generation_retry_after` tests it
+        # first too, so checking the burst window first here meant that when
+        # both were blown — the normal end state of a template-mode session,
+        # which is instant and fills the burst window on its way to the daily
+        # cap — the caller got "try again in a moment" while retry_after
+        # correctly said waiting cannot help. Batch runs propagate this string
+        # to the user for every contact they skip.
+        if self.generated_today() >= self.daily_limits['generations_per_day']:
+            return False, (f"Daily limit reached: {self.daily_limits['generations_per_day']} "
+                           f"email generations per day.")
         now = datetime.now()
         recent = [t for t in self.email_generations if (now - t).total_seconds() < 60]
         if len(recent) >= self.daily_limits['generations_per_minute']:
             return False, (f"Rate limit: max {self.daily_limits['generations_per_minute']} "
                            f"generations per minute. Try again in a moment.")
-        if self.generated_today() >= self.daily_limits['generations_per_day']:
-            return False, (f"Daily limit reached: {self.daily_limits['generations_per_day']} "
-                           f"email generations per day.")
         return True, ""
 
     def generation_retry_after(self) -> Optional[float]:

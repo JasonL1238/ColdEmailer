@@ -534,7 +534,12 @@ Body:
             angle = self._LAST_ANGLE
         else:
             angle = self._FOLLOW_UP_ANGLES.get(step) or self._FOLLOW_UP_ANGLES[3]
-        angle = angle.format(company=company_name)
+        # Fenced like every other scraped value. Discovery writes company names
+        # straight out of LLM JSON and DDG result titles, and this one lands
+        # inside the RULES block — so an unfenced name was an instruction in
+        # the most obeyed part of the prompt, on the only rung a default
+        # one-step cadence ever sends.
+        angle = angle.format(company=_as_data(company_name, 120))
         # A follow-up's subject stays on the original thread — Gmail groups by
         # References, but a recipient scanning their inbox reads the subject.
         subject = original.get("subject") or "my earlier note"
@@ -549,8 +554,17 @@ Body:
         if llm_complete:
             ordinal = {1: "first", 2: "second", 3: "third", 4: "fourth"}.get(step, f"{step}th")
             prior = ""
-            if previous.get("id") and previous.get("id") != original.get("id"):
+            # Only label it a follow-up if it is one. `previous` is simply the
+            # newest thing we sent them, which can be a *second first-contact*
+            # email — describing that as "the most recent follow-up, also
+            # unanswered" told the model something false about its own history
+            # with this person.
+            if (previous.get("id") and previous.get("id") != original.get("id")
+                    and previous.get("is_follow_up")):
                 prior = (f"\nMOST RECENT FOLLOW-UP (sent {sent_date}, also unanswered):\n"
+                         f"{_as_data(previous.get('body'), 900)}\n")
+            elif previous.get("id") and previous.get("id") != original.get("id"):
+                prior = (f"\nMOST RECENT MESSAGE WE SENT THEM (sent {sent_date}):\n"
                          f"{_as_data(previous.get('body'), 900)}\n")
             prompt = f"""Write the {ordinal} follow-up ({step} of {total_steps}) to a cold email that got no reply.
 
