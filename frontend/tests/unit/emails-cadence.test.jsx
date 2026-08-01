@@ -81,6 +81,20 @@ describe('followUpState', () => {
       .toEqual({ kind: 'pending' })
   })
 
+  it('offers nothing on a bounced address, whichever field carries it', () => {
+    /* The send path and both drafting routes all refuse a bounced address, so
+       an enabled button here can only ever produce the same 409. The component
+       already reads these fields for the address warning; this branch was the
+       one place it did not. */
+    expect(followUpState({ contact_bounced_at: '2026-07-01T09:00:00' }, TWO_STEP))
+      .toEqual({ kind: 'bounced' })
+    expect(followUpState({ bounced_at: '2026-07-01T09:00:00' }, TWO_STEP))
+      .toEqual({ kind: 'bounced' })
+    // it outranks a rung being owed
+    expect(followUpState({ bounced_at: '2026-07-01T09:00:00', follow_ups_sent: 0 },
+      TWO_STEP).kind).toBe('bounced')
+  })
+
   it('goes quiet when the user has switched follow-ups off', () => {
     expect(followUpState({}, { enabled: false, steps: [7] })).toEqual({ kind: 'off' })
     expect(followUpState({}, { enabled: true, steps: [] })).toEqual({ kind: 'off' })
@@ -127,6 +141,14 @@ describe('Emails — the follow-up control across the cadence', () => {
       .find((b) => /follow.up/i.test(b.textContent))
     expect(button).toBeTruthy()
     expect(button.textContent).toContain('2 of 2')
+  })
+
+  it('shows a chip instead of a dead button on a bounced address', async () => {
+    emails = [sentEmail({ contact_bounced_at: '2026-07-01T09:00:00' })]
+    await open()
+    expect([...detail().querySelectorAll('button')]
+      .some((b) => /^Draft follow-up/i.test(b.textContent.trim()))).toBe(false)
+    expect(detail().textContent).toMatch(/address bounced/i)
   })
 
   it('stops offering once the cadence is spent, and says how many went', async () => {

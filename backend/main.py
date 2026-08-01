@@ -894,6 +894,16 @@ async def update_contact(contact_id: str, payload: ContactUpdate,
         updates.pop("email", None)
 
     db.update_contact(contact_id, updates)
+    if updates.get("bounced_at", "keep") is None:
+        # The email-level flags too, not just the contact's. Nothing else in
+        # the app ever writes NULL to emails.bounced_at, so a row that bounced
+        # before recipient_email existed — and therefore cannot say which
+        # address it was about — went on refusing every future send and every
+        # follow-up, repeating an instruction the user had already followed.
+        db.execute(
+            "UPDATE emails SET bounced_at=NULL WHERE contact_id=? "
+            "AND (recipient_email IS NULL OR lower(recipient_email)=?)",
+            (contact_id, old_email.lower()))
     return db.get_contact(contact_id)
 
 
@@ -1482,6 +1492,35 @@ async def regenerate_email(email_id: str):
 _GENERATION_WAIT_BUDGET_SECONDS = 300.0
 
 
+def _bounced_for_current_address(email: Dict, contact: Optional[Dict]) -> bool:
+    """True when the address this message would go to is the one that bounced.
+
+    A bounce is a fact about an *address*, not about a person. Both bounce
+    gates used to ask "has anything to this contact ever bounced", and nothing
+    in the app ever clears `emails.bounced_at` — so fixing the address, which
+    is exactly what the refusal tells the user to do, left the contact
+    permanently retired: the button kept repeating the same instruction, and
+    the due list kept them out even after a fresh first-contact email to the
+    new address was delivered.
+    """
+    current = str((contact or {}).get("email") or "").strip().lower()
+    if (contact or {}).get("bounced_at"):
+        return True
+    if not current:
+        # No contact row to compare against: fall back to the row's own flag,
+        # which is the conservative answer.
+        return bool(email.get("bounced_at"))
+    # A row with no recipient_email predates that column and cannot say *which*
+    # address died, so it is read as being about the current one — refusing is
+    # the safe answer when the question is "will this bounce". Changing the
+    # contact's address clears those rows explicitly (see update_contact),
+    # which is the user asserting the problem is fixed.
+    return bool(db.query_one(
+        "SELECT 1 FROM emails WHERE contact_id=? AND bounced_at IS NOT NULL "
+        "AND lower(COALESCE(recipient_email, ?)) = ? LIMIT 1",
+        (email.get("contact_id"), current, current)))
+
+
 def _wait_for_generation_slot(job_id: str, seconds: float) -> bool:
     """Sleep out a per-minute window in small steps so Stop still works.
     Returns True when the job was cancelled while waiting."""
@@ -1568,9 +1607,7 @@ def _follow_up_plan(contact_id: Optional[str], *, manual: bool) -> Dict[str, Any
     # did not, so the one route a user actually clicks was the one that would
     # cheerfully draft mail to a dead mailbox.
     contact_row = db.get_contact(contact_id) or {}
-    if contact_row.get("bounced_at") or db.query_one(
-            "SELECT 1 FROM emails WHERE contact_id=? AND bounced_at IS NOT NULL "
-            "LIMIT 1", (contact_id,)):
+    if _bounced_for_current_address({"contact_id": contact_id}, contact_row):
         plan["refusal"] = (
             "Mail to this address bounced, so a follow-up would bounce too. Add "
             "a different address for this person first.")
@@ -1586,6 +1623,15 @@ def _follow_up_plan(contact_id: Optional[str], *, manual: bool) -> Dict[str, Any
     # how the user says "not this one", so it retires the contact from the
     # automatic due list — but it must not veto them clicking Draft follow-up
     # themselves, which is a fresh, explicit request.
+    # Trashing a follow-up retires the contact from the automatic list. The
+    # decision is stamped on the contact as well as implied by the trashed row,
+    # because "Delete forever" erases the row — and with it the only record
+    # that the user said no.
+    if not manual and contact_row.get("follow_ups_declined_at"):
+        plan["refusal"] = ("You trashed a follow-up to this person, so they are "
+                           "out of the automatic list. Draft one by hand if you "
+                           "change your mind.")
+        return plan
     spent = "('sent', 'trashed')" if manual else "('sent')"
     if db.query_one(
             f"SELECT 1 FROM emails WHERE contact_id=? "
@@ -1677,6 +1723,10 @@ def _create_follow_up(original: Dict, contact: Dict, plan: Dict) -> Dict:
             fallback_reason=composed["fallback_reason"],
             llm_model=composed.get("llm_model"),
         )
+    if plan.get("manual"):
+        # Asking for one by hand is changing your mind about the trashed one.
+        db.execute("UPDATE contacts SET follow_ups_declined_at=NULL WHERE id=?",
+                   (contact["id"],))
     db.log_event("email", follow_up["id"], "follow_up_generated",
                  f"{contact.get('name') or contact.get('email') or ''} "
                  f"(step {fresh['step']} of {fresh['total']})".strip())
@@ -2062,9 +2112,27 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
             # — was refused before the Sent folder was ever consulted, leaving
             # the row a draft with no message id: invisible to reply tracking
             # and refused identically on every retry.
-            bounced_contact = (db.get_contact(email["contact_id"])
-                               if email.get("contact_id") else None)
-            if email.get("bounced_at") or (bounced_contact or {}).get("bounced_at"):
+            contact_row = (db.get_contact(email["contact_id"])
+                           if email.get("contact_id") else None)
+            # A follow-up is written on the premise of silence, and drafting
+            # happens days before sending — the batch job runs Monday, the
+            # reply check confirms an answer Tuesday, and "Select all" on
+            # Tuesday afternoon still had every reason to send it. Both
+            # drafting routes refuse in this state; this is the last gate
+            # before real mail, and it was the only one that did not ask.
+            if email.get("is_follow_up") and email.get("contact_id") and db.query_one(
+                    "SELECT 1 FROM emails WHERE contact_id=? AND has_response=1 "
+                    "AND response_verified_at IS NOT NULL LIMIT 1",
+                    (email["contact_id"],)):
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": False,
+                    "error": f"{recipient} replied since this follow-up was "
+                             f"drafted, so it would ask someone who already "
+                             f"answered whether they are still interested. "
+                             f"Reply in Gmail instead."})
+                failed += 1
+                continue
+            if _bounced_for_current_address(email, contact_row):
                 results.append({
                     "email_id": email_id, "success": False, "retryable": False,
                     "error": f"{recipient} bounced previously — mail to it is "
@@ -2095,6 +2163,16 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                                                              "awaiting confirmation"})
             result = email_sender.send_email(email, from_email, resume_path)
             results.append(result)
+            # Record the recipient on *anything but a definite refusal*. This
+            # used to sit inside the success branch, so a first copy whose
+            # delivery Gmail never confirmed — which may well have been queued
+            # and delivered — left the guard unarmed, and the duplicate draft
+            # behind it went out for real.
+            if recipient and (result.get("success") or result.get("delivery_unknown")):
+                if email.get("is_follow_up"):
+                    follow_up_recipients.add(recipient)
+                else:
+                    first_contact_recipients.add(recipient)
             if result.get("success"):
                 sent += 1
                 rate_limiter.record_email_sent()
@@ -2111,11 +2189,6 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                 db.update_contact(email["contact_id"], {"status": "sent"})
                 db.log_event("email", email_id, "sent",
                              f"→ {email.get('contact_email')}")
-                if recipient:
-                    if email.get("is_follow_up"):
-                        follow_up_recipients.add(recipient)
-                    else:
-                        first_contact_recipients.add(recipient)
             else:
                 failed += 1
                 if result.get("delivery_unknown"):

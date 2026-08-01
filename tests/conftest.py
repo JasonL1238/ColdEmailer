@@ -17,6 +17,11 @@ os.environ['PYTHONPATH'] = f"{backend_path}:{project_root}:{os.environ.get('PYTH
 # lock on — the user's real coldemailer.db.
 _tmp_data = tempfile.mkdtemp(prefix="coldemailer-tests-")
 os.environ['COLD_DB_PATH'] = os.path.join(_tmp_data, "test.db")
+# Resumes live on disk, not in the database, and resume_service used to derive
+# its directory from __file__ alone. The legacy-import guard is a *setting*, so
+# a fresh temp DB has none — every suite run re-imported the user's real PDFs
+# and wrote new content-hashed copies into their real backend/data/resumes.
+os.environ['COLD_RESUME_DIR'] = os.path.join(_tmp_data, "resumes")
 # Keep Gmail/OAuth paths pointed at nonexistent files so nothing can
 # accidentally authenticate or send during a test run.
 os.environ.setdefault('CREDENTIALS_JSON_PATH', os.path.join(_tmp_data, "no-credentials.json"))

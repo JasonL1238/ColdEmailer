@@ -154,7 +154,16 @@ class _FakeSender:
         self.lookups = []
 
     def send_email(self, email, from_email, resume_path=None):
-        self.calls.append({"email_id": email["id"], "resume_path": resume_path})
+        self.calls.append({
+            "email_id": email["id"], "resume_path": resume_path,
+            # Captured so the threading block is observable. Without these the
+            # whole `if is_follow_up and original_email_id:` stanza could be
+            # deleted and every test stayed green — a follow-up would then
+            # arrive as a brand-new thread with no quoted context.
+            "reply_to_message_id": email.get("reply_to_message_id"),
+            "reply_to_thread_id": email.get("reply_to_thread_id"),
+            "subject": email.get("subject"),
+        })
         if self.result is not None:
             return {**self.result, "email_id": email["id"]}
         return {"success": True, "email_id": email["id"],
@@ -727,6 +736,112 @@ def test_one_batch_never_sends_two_follow_ups_to_one_person(send_env, monkeypatc
     skipped = next(r for r in result["results"] if not r["success"])
     assert "follow-up to this recipient already went out" in skipped["error"]
     assert main.db.get_email(ids[1])["status"] == "draft"
+
+
+def test_a_follow_up_is_refused_once_that_person_has_replied(send_env, monkeypatch):
+    """Drafting and sending are days apart: the batch job runs Monday, the
+    reply check confirms an answer Tuesday, and "Select all" on Tuesday
+    afternoon still had every reason to send. Both drafting routes refuse in
+    this state; this is the last gate before real mail, and it was the only one
+    that never asked. The email would thread into the very conversation they
+    answered, asking whether they are still interested."""
+    monkeypatch.setattr(main, "rate_limiter", _CappedLimiter(10))
+    contact = main.db.create_contact(name="ZZ Replied Send",
+                                     email="zzrepliedsend@example.com")
+    original = main.db.create_email(contact_id=contact["id"], status="sent",
+                                    subject="Quick question", body="hi",
+                                    sent_at="2026-07-01T09:00:00",
+                                    gmail_message_id="gm-orig",
+                                    has_response=True,
+                                    response_at="2026-07-03T09:00:00",
+                                    response_verified_at="2026-07-03T09:05:00")
+    follow_up = main.db.create_email(contact_id=contact["id"], status="draft",
+                                     email_type="follow_up", is_follow_up=True,
+                                     follow_up_step=1,
+                                     original_email_id=original["id"],
+                                     subject="Re: Quick question",
+                                     body="still interested?")
+
+    result = _run_batch([follow_up["id"]])
+
+    assert send_env.calls == []
+    assert result["sent"] == 0 and result["failed"] == 1
+    assert "replied since this follow-up was drafted" in result["results"][0]["error"]
+    assert main.db.get_email(follow_up["id"])["status"] == "draft"
+
+
+def test_a_first_contact_email_is_not_blocked_by_an_old_reply(send_env, monkeypatch):
+    """The reply gate is about follow-ups. A fresh first-contact email to
+    someone who answered a different pitch months ago is legitimate."""
+    monkeypatch.setattr(main, "rate_limiter", _CappedLimiter(10))
+    contact = main.db.create_contact(name="ZZ Old Reply", email="zzoldreply@example.com")
+    main.db.create_email(contact_id=contact["id"], status="sent", subject="Older",
+                         body="hi", sent_at="2026-01-01T09:00:00", has_response=True,
+                         response_at="2026-01-02T09:00:00",
+                         response_verified_at="2026-01-02T09:05:00")
+    fresh = main.db.create_email(contact_id=contact["id"], status="draft",
+                                 subject="New role", body="hello")
+
+    result = _run_batch([fresh["id"]])
+
+    assert result["sent"] == 1
+    assert [c["email_id"] for c in send_env.calls] == [fresh["id"]]
+
+
+def test_a_follow_up_is_threaded_onto_the_original_conversation(send_env, monkeypatch):
+    """Deleting the whole threading block left 810 tests green, and a follow-up
+    with a "Re:" subject, no In-Reply-To and no thread id starts a brand-new
+    conversation with no quoted context — which is a spam pattern to filters
+    and to the recipient alike."""
+    monkeypatch.setattr(main, "rate_limiter", _CappedLimiter(10))
+    contact = main.db.create_contact(name="ZZ Thread", email="zzthread@example.com")
+    original = main.db.create_email(contact_id=contact["id"], status="sent",
+                                    subject="Intro", body="hi",
+                                    sent_at="2026-07-01T09:00:00",
+                                    gmail_message_id="gm-thread")
+    follow_up = main.db.create_email(contact_id=contact["id"], status="draft",
+                                     email_type="follow_up", is_follow_up=True,
+                                     follow_up_step=1,
+                                     original_email_id=original["id"],
+                                     subject="Re: Intro", body="following up")
+
+    _run_batch([follow_up["id"]])
+
+    call = next(c for c in send_env.calls if c["email_id"] == follow_up["id"])
+    # the RFC Message-ID header read back from Gmail, not the API id
+    assert call["reply_to_message_id"] == "<gm-thread@mail.gmail.com>"
+    assert call["reply_to_thread_id"] == "t"
+    # and the thread id is backfilled onto the original, which had none
+    assert main.db.get_email(original["id"])["gmail_thread_id"] == "t"
+
+
+def test_an_unconfirmed_first_copy_still_blocks_the_duplicate(send_env, monkeypatch):
+    """The in-batch guard recorded the recipient only on success. A first copy
+    whose delivery Gmail never confirmed may well have been queued and
+    delivered — leaving the guard unarmed while a duplicate went out for
+    real."""
+    monkeypatch.setattr(main, "rate_limiter", _CappedLimiter(10))
+    monkeypatch.setattr(send_env, "result", {
+        "success": False, "delivery_unknown": True,
+        "error": "read timeout after handing the message to Gmail"})
+    contact = main.db.create_contact(name="ZZ Unconf", email="zzunconf@example.com")
+    original = main.db.create_email(contact_id=contact["id"], status="sent",
+                                    subject="Note", body="hi",
+                                    sent_at="2026-07-01T09:00:00")
+    ids = [main.db.create_email(contact_id=contact["id"], status="draft",
+                                email_type="follow_up", is_follow_up=True,
+                                original_email_id=original["id"],
+                                subject=f"Re: Note {n}", body="following up")["id"]
+           for n in (1, 2)]
+
+    result = _run_batch(ids)
+
+    # exactly one attempt reached the sender; the second was refused by the guard
+    assert len(send_env.calls) == 1
+    assert result["sent"] == 0 and result["failed"] == 2
+    second = next(r for r in result["results"]
+                  if r.get("email_id") == ids[1] and not r["success"])
+    assert "follow-up to this recipient already went out" in second["error"]
 
 
 # ---------- follow-ups are per person ----------

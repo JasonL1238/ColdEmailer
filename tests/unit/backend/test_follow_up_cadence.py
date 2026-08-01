@@ -27,6 +27,7 @@ from fastapi import HTTPException
 
 import main
 from db import Database, normalize_follow_up_cadence
+from models import ContactUpdate
 
 
 @pytest.fixture
@@ -313,6 +314,77 @@ def test_a_bounce_stops_the_sequence_at_every_rung(db):
     assert db.get_follow_up_candidates() == []
 
 
+def test_fixing_a_bounced_address_brings_the_contact_back(db):
+    """A bounce is a fact about an *address*, not about a person. Nothing in
+    the app ever clears emails.bounced_at, so an unscoped test meant that doing
+    exactly what the refusal instructs — adding a different address — left the
+    contact retired forever, and the same message repeated on every click."""
+    db.update_follow_up_cadence({"enabled": True, "steps": [7]})
+    contact = db.create_contact(name="ZZ Moved", email="old@example.com")
+    db.create_email(contact_id=contact["id"], status="sent", subject="First",
+                    body="hi", sent_at=_days_ago(30), recipient_email="old@example.com",
+                    bounced_at=_days_ago(29))
+    db.update_contact(contact["id"], {"bounced_at": _days_ago(29)})
+    assert db.get_follow_up_candidates() == []
+
+    # the address is fixed and a fresh first-contact email is delivered
+    db.update_contact(contact["id"], {"email": "new@example.com", "bounced_at": None})
+    db.create_email(contact_id=contact["id"], status="sent", subject="Second",
+                    body="hi", sent_at=_days_ago(20),
+                    recipient_email="new@example.com")
+
+    due = db.get_follow_up_candidates()
+    assert [c["contact_id"] for c in due] == [contact["id"]]
+    # ...and the retired address still speaks for itself
+    db.update_contact(contact["id"], {"email": "old@example.com"})
+    assert db.get_follow_up_candidates() == []
+
+
+def test_trashing_a_follow_up_survives_deleting_it(db):
+    """Trashing is one of the feature's documented stops, and it used to live
+    only in the trashed row. "Delete forever" erased it, so emptying the Trash
+    silently returned the contact to the queue at rung 1 and the next batch
+    drafted them again."""
+    db.update_follow_up_cadence({"enabled": True, "steps": [7, 7]})
+    contact = db.create_contact(name="ZZ Declined", email="declined@example.com")
+    original = db.create_email(contact_id=contact["id"], status="sent",
+                               subject="First", body="hi", sent_at=_days_ago(30))
+    follow_up = db.create_email(contact_id=contact["id"], status="draft",
+                                is_follow_up=True, follow_up_step=1,
+                                original_email_id=original["id"],
+                                subject="Re: First", body="nudge")
+
+    db.update_email(follow_up["id"], {"status": "trashed"})
+    assert db.get_follow_up_candidates() == []
+    assert db.get_contact(contact["id"])["follow_ups_declined_at"]
+
+    db.delete_email(follow_up["id"])
+    assert db.get_follow_up_candidates() == []
+
+    # restoring one to Drafts is the user changing their mind
+    restored = db.create_email(contact_id=contact["id"], status="trashed",
+                               is_follow_up=True, original_email_id=original["id"],
+                               subject="Re: First", body="nudge")
+    db.update_email(restored["id"], {"status": "draft"})
+    assert db.get_contact(contact["id"])["follow_ups_declined_at"] is None
+
+
+def test_trashing_a_first_contact_draft_does_not_decline_follow_ups(db):
+    """Only trashing a *follow-up* is the opt-out. Binning an ordinary draft is
+    an everyday action and must not retire the person."""
+    db.update_follow_up_cadence({"enabled": True, "steps": [7]})
+    contact = db.create_contact(name="ZZ Ordinary", email="ordinary@example.com")
+    db.create_email(contact_id=contact["id"], status="sent", subject="First",
+                    body="hi", sent_at=_days_ago(30))
+    junk = db.create_email(contact_id=contact["id"], status="draft",
+                           subject="Wrong company", body="oops")
+
+    db.update_email(junk["id"], {"status": "trashed"})
+
+    assert db.get_contact(contact["id"])["follow_ups_declined_at"] is None
+    assert [c["contact_id"] for c in db.get_follow_up_candidates()] == [contact["id"]]
+
+
 def test_an_unverified_reply_flag_still_counts_as_a_touch(db):
     """The legacy checker's flags are not evidence of a reply, so they must not
     suppress the cadence — but the email behind one was really sent, so the
@@ -530,6 +602,81 @@ def test_an_email_level_bounce_refuses_the_manual_button_too(api):
     assert exc.value.status_code == 409
     assert "bounced" in exc.value.detail
     assert composer.calls == []
+
+
+def test_fixing_the_address_reopens_the_manual_button_and_the_batch(api):
+    """The refusal tells the user to add a different address. Doing exactly
+    that used to change nothing: the contact-level flag cleared, the email-level
+    one never did, and both the button and the batch kept refusing with the
+    same instruction."""
+    composer, contact = api
+    main.db.update_follow_up_cadence({"enabled": True, "steps": [7]})
+    original = main.db.create_email(contact_id=contact["id"], status="sent",
+                                    subject="ZZTEST reopen", body="hi",
+                                    sent_at=_days_ago(30),
+                                    recipient_email=contact["email"],
+                                    bounced_at=_days_ago(29))
+    main.db.update_contact(contact["id"], {"bounced_at": _days_ago(29)})
+    with pytest.raises(HTTPException):
+        asyncio.run(main.generate_follow_up(original["id"]))
+
+    asyncio.run(main.update_contact(
+        contact["id"], ContactUpdate(email="zztestreopened@example.com"),
+        force=True))
+
+    assert main._follow_up_plan(contact["id"], manual=True)["refusal"] is None
+    assert main._follow_up_plan(contact["id"], manual=False)["refusal"] is None
+    # the retired address's flag is cleared, so nothing keeps refusing
+    assert main.db.get_email(original["id"])["bounced_at"] is None
+
+
+def test_a_bounce_on_a_retired_address_does_not_speak_for_the_live_one(api):
+    """A bounce belongs to an address, not to a person. The row records who it
+    actually went to, so a bounce on a mailbox this contact no longer uses must
+    not refuse mail to the one they do — however the address came to change
+    (a bounce discovered after the move, an import, a hand edit)."""
+    composer, contact = api
+    main.db.update_follow_up_cadence({"enabled": True, "steps": [7]})
+    main.db.create_email(contact_id=contact["id"], status="sent",
+                         subject="ZZTEST retired", body="hi",
+                         sent_at=_days_ago(60),
+                         recipient_email="zztestretired@example.com",
+                         bounced_at=_days_ago(59))
+    main.db.create_email(contact_id=contact["id"], status="sent",
+                         subject="ZZTEST live", body="hi", sent_at=_days_ago(30),
+                         recipient_email=contact["email"])
+
+    plan = main._follow_up_plan(contact["id"], manual=True)
+    assert plan["refusal"] is None and plan["step"] == 1
+    assert contact["id"] in {c["contact_id"]
+                             for c in main.db.get_follow_up_candidates()}
+
+    # ...and a bounce on the address they *do* use still refuses
+    main.db.create_email(contact_id=contact["id"], status="sent",
+                         subject="ZZTEST current", body="hi",
+                         sent_at=_days_ago(20), recipient_email=contact["email"],
+                         bounced_at=_days_ago(19))
+    assert "bounced" in main._follow_up_plan(contact["id"], manual=True)["refusal"]
+
+
+def test_the_batch_route_honours_a_trashed_follow_up_after_it_is_deleted(api):
+    """The stamp lives on the contact precisely so "Delete forever" cannot
+    erase the user's decision. The batch gate has to read it."""
+    composer, contact = api
+    main.db.update_follow_up_cadence({"enabled": True, "steps": [7, 7]})
+    original = main.db.create_email(contact_id=contact["id"], status="sent",
+                                    subject="ZZTEST declined", body="hi",
+                                    sent_at=_days_ago(30))
+    first = asyncio.run(main.generate_follow_up(original["id"]))
+    main.db.update_email(first["id"], {"status": "trashed"})
+    main.db.delete_email(first["id"])
+
+    assert "trashed a follow-up" in main._follow_up_plan(
+        contact["id"], manual=False)["refusal"]
+    # ...while an explicit click is still allowed, and clears the opt-out
+    again = asyncio.run(main.generate_follow_up(original["id"]))
+    assert again["is_follow_up"] == 1
+    assert main.db.get_contact(contact["id"])["follow_ups_declined_at"] is None
 
 
 def test_a_trashed_draft_does_not_veto_asking_again_by_hand(api):

@@ -190,7 +190,10 @@ function FollowUpCadence() {
     // Clamped on entry, not on save: an out-of-range gap decides when real
     // email goes out, so it must never be possible to look at a saved value
     // and a different stored one.
-    steps[i] = Math.max(1, Math.min(90, Number(value) || 1))
+    // Rounded as well as clamped. A number input accepts "7.5"; the summary
+    // then promised a 7.5-day gap and the save 422'd on List[int], leaving the
+    // editor showing a value that was never stored.
+    steps[i] = Math.max(1, Math.min(90, Math.round(Number(value)) || 1))
     return { ...d, steps }
   })
 

@@ -35,7 +35,7 @@ Opens the app at **http://localhost:5173** (API docs at http://localhost:8000/do
 
 Add free-text instructions to any type ("mention I saw their Show HN post"). Review drafts side by side, edit subject and body inline, rewrite with AI, approve, then send in a batch.
 
-**Tracking** — The dashboard shows the funnel (companies → contacts → drafts → sent → replied), a 30-day sent/reply chart, per-type reply rates, and a live activity feed. "Check replies" scans your Gmail threads for genuine responses, ignoring bounces, out-of-office auto-replies, and your own follow-ups in the same thread. Anything quiet for 7+ days surfaces as a follow-up suggestion with one-click drafting; follow-ups are threaded onto the original conversation.
+**Tracking** — The dashboard shows the funnel (companies → contacts → drafts → sent → replied), a 30-day sent/reply chart, per-type reply rates, and a live activity feed. "Check replies" scans your Gmail threads for genuine responses, ignoring bounces, out-of-office auto-replies, and your own follow-ups in the same thread. Contacts who go quiet surface for follow-up on the cadence you set in Settings — up to four nudges, each measured from the last message that person actually received. Draft one at a time or the whole due list at once; nothing sends itself. A reply, a bounce, or trashing the draft ends the sequence, and follow-ups are threaded onto the original conversation.
 
 ## Guardrails
 

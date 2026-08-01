@@ -85,6 +85,10 @@ export const followUpState = (email, cadence) => {
   // "switched off". Reading the two the same way blanked the follow-up control
   // on every sent email until the settings request resolved — and left it
   // blank for good against a backend too old to send the field.
+  // A dead address outranks everything: the send path and both drafting
+  // routes refuse it, so an enabled button here is one that can only ever
+  // produce the same 409.
+  if (email.bounced_at || email.contact_bounced_at) return { kind: 'bounced' }
   const c = cadence || DEFAULT_CADENCE
   const steps = (c.enabled && c.steps?.length) ? c.steps.length : 0
   if (!steps) return { kind: 'off' }
@@ -622,7 +626,11 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
                       <MessageSquare size={11} /> reply unverified
                     </Chip>
                   )}
-                  {fuState.kind === 'pending' ? (
+                  {fuState.kind === 'bounced' ? (
+                    <Chip tone="amber" title="The mail server rejected this address. Add a different address for this person and follow-ups resume.">
+                      <CornerUpLeft size={11} /> no follow-up — address bounced
+                    </Chip>
+                  ) : fuState.kind === 'pending' ? (
                     // Clicking again just creates a duplicate follow-up to the
                     // same person, so say one exists instead of offering another.
                     <Chip tone="sky"><CornerUpLeft size={11} /> follow-up drafted</Chip>

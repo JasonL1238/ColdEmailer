@@ -201,6 +201,12 @@ _ADDED_COLUMNS = {
         # sending reputation that decides whether the good emails arrive.
         "bounced_at": "TEXT",
         "bounce_detail": "TEXT",
+        # When the user trashed a follow-up to this person — their way of
+        # saying "not this one". Kept on the contact rather than inferred from
+        # the trashed row, because "Delete forever" erases that row and used to
+        # put the contact straight back in the automatic queue at rung 1.
+        # Cleared when a trashed follow-up is restored to Drafts.
+        "follow_ups_declined_at": "TEXT",
     },
 }
 
@@ -1144,6 +1150,10 @@ class Database:
             "response_verified_at": kwargs.get("response_verified_at"),
             "original_email_id": kwargs.get("original_email_id"),
             "bounced_at": kwargs.get("bounced_at"),
+            # Silently dropped before, so anything constructing a row directly
+            # (the legacy import, tests) lost who it actually went to — the one
+            # fact that stops a later contact edit rewriting outreach history.
+            "recipient_email": kwargs.get("recipient_email"),
             "is_follow_up": 1 if kwargs.get("is_follow_up") else 0,
             "follow_up_step": int(kwargs.get("follow_up_step") or 0),
             "used_template_fallback": 1 if kwargs.get("used_template_fallback") else 0,
@@ -1197,7 +1207,30 @@ class Database:
         for bool_key in ("has_response", "is_follow_up", "used_template_fallback"):
             if bool_key in updates:
                 updates[bool_key] = 1 if updates[bool_key] else 0
+        if "status" in updates:
+            self._record_follow_up_opt_out(email_id, updates["status"])
         self._update("emails", email_id, updates)
+
+    def _record_follow_up_opt_out(self, email_id: str, new_status: str):
+        """Trashing a follow-up means "not this person"; restoring it undoes
+        that. Recorded on the contact because "Delete forever" removes the
+        trashed row, and with it the only trace of the user's decision."""
+        if new_status not in ("trashed", "draft", "approved"):
+            return
+        row = self.query_one(
+            "SELECT contact_id, is_follow_up, original_email_id, status "
+            "FROM emails WHERE id=?", (email_id,))
+        if not row or not row["contact_id"] or not row_is_follow_up(row):
+            return
+        if new_status == "trashed":
+            if row["status"] != "trashed":
+                self.execute(
+                    "UPDATE contacts SET follow_ups_declined_at=? WHERE id=?",
+                    (now_iso(), row["contact_id"]))
+        elif row["status"] == "trashed":
+            self.execute(
+                "UPDATE contacts SET follow_ups_declined_at=NULL WHERE id=?",
+                (row["contact_id"],))
 
     def delete_email(self, email_id: str) -> bool:
         cur = self.execute("DELETE FROM emails WHERE id=?", (email_id,))
@@ -1297,10 +1330,17 @@ class Database:
                        AND r.response_verified_at IS NOT NULL
                  )
                  AND ct.bounced_at IS NULL
+                 -- Scoped to the address currently on the contact. A bounce is
+                 -- a fact about an address, not about a person, and nothing
+                 -- ever clears emails.bounced_at — so an unscoped test meant
+                 -- that fixing the address (exactly what the app tells the
+                 -- user to do) still left them retired forever.
                  AND NOT EXISTS (
                      SELECT 1 FROM emails b
                      WHERE b.contact_id = e.contact_id
                        AND b.bounced_at IS NOT NULL
+                       AND lower(COALESCE(b.recipient_email, ct.email, ''))
+                           = lower(COALESCE(ct.email, ''))
                  )
                  AND NOT EXISTS (
                      SELECT 1 FROM emails f
@@ -1310,6 +1350,11 @@ class Database:
                        AND e.contact_id IS NOT NULL
                        AND f.contact_id = e.contact_id
                  )
+                 -- Trashing a follow-up is how the user says "not this
+                 -- person". That opt-out used to live only in the trashed row,
+                 -- so emptying the Trash silently put them back in the queue
+                 -- at rung 1 and the next batch drafted them again.
+                 AND ct.follow_ups_declined_at IS NULL
                ORDER BY e.sent_at ASC""")
 
         groups: Dict[str, List[Dict[str, Any]]] = {}

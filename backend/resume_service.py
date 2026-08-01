@@ -9,7 +9,13 @@ from typing import Dict, List, Optional
 from db import Database
 
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-RESUME_DIR = os.path.join(_BACKEND_DIR, "data", "resumes")
+# Overridable for the same reason COLD_DB_PATH is. Without it the test suite
+# was not the inert thing it is documented to be: every run against a fresh
+# temp database re-ran the legacy resume import (its guard is a *setting*, and
+# a temp DB has none) and wrote fresh copies of the user's real PDFs into their
+# real backend/data/resumes.
+RESUME_DIR = os.getenv("COLD_RESUME_DIR") or os.path.join(
+    _BACKEND_DIR, "data", "resumes")
 
 MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB
 
