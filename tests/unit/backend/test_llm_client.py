@@ -10,6 +10,7 @@ Three real defects motivated these tests:
     became a template email with the reason "llm_unavailable".
 """
 import os
+import time
 
 import pytest
 
@@ -30,9 +31,22 @@ def clean_dead_models():
 
 
 class _Boom(Exception):
+    """google.genai shape: int `.code`, no `.status_code`."""
+
     def __init__(self, msg, code=None):
         super().__init__(msg)
         self.code = code
+
+
+class _OpenAIBoom(Exception):
+    """openai shape: the *string* body error-code on `.code`, the number on
+    `.status_code`. Reading `.code or .status_code` short-circuits on the
+    string, which silently killed every numeric branch for this provider."""
+
+    def __init__(self, msg, code=None, status_code=None):
+        super().__init__(msg)
+        self.code = code
+        self.status_code = status_code
 
 
 class TestClassify:
@@ -52,10 +66,54 @@ class TestClassify:
     def test_maps_provider_errors_to_a_reason(self, exc, expected):
         assert _classify(exc) == expected
 
-    def test_quota_wins_over_a_generic_message(self):
-        """A 429 that also says 'connection' must not be read as a network blip
-        — the user needs to be told to wait or switch keys."""
-        assert _classify(_Boom("connection reset: 429 quota")) == REASON_QUOTA
+    def test_googles_quota_project_403_is_an_auth_problem_not_a_quota_one(self):
+        """Real message. It contains the word "quota", and a quota-first check
+        told the user to wait for a reset that will never come — the API is
+        simply not enabled for the project."""
+        exc = _Boom(
+            "403 PERMISSION_DENIED. Generative Language API has not been used "
+            "in project 764086 before or it is disabled... the request requires "
+            "a quota project; set one with `gcloud auth application-default "
+            "set-quota-project`.", code=403)
+        assert _classify(exc) == REASON_AUTH
+
+    def test_a_403_naming_one_model_does_not_condemn_the_key(self):
+        """Real message. Treating this as an auth failure aborted the whole
+        ladder over a single entitlement gap and blamed the user's key."""
+        exc = _Boom("403 PERMISSION_DENIED. Permission denied on resource "
+                    "model gemini-3.1-flash-lite.", code=403)
+        assert _classify(exc) == REASON_NOT_FOUND
+
+    def test_a_token_count_containing_429_is_not_a_quota_error(self):
+        """Real message. Bare `"429" in text` fired on ordinary prose and told
+        the user to wait for a reset; the fix is a shorter prompt."""
+        exc = _OpenAIBoom(
+            "This model's maximum context length is 4096 tokens, however you "
+            "requested 4297 tokens (4297 in your prompt). Please reduce your "
+            "prompt.", code="context_length_exceeded", status_code=400)
+        assert _classify(exc) != REASON_QUOTA
+
+    @pytest.mark.parametrize("code,status,expected", [
+        ("invalid_api_key", 401, REASON_AUTH),
+        ("no_credentials", 401, REASON_AUTH),
+        ("account_deactivated", 403, REASON_AUTH),
+        ("model_not_found", 400, REASON_NOT_FOUND),
+        ("rate_limit_exceeded", 429, REASON_QUOTA),
+        ("insufficient_quota", 429, REASON_QUOTA),
+    ])
+    def test_openais_string_code_does_not_hide_the_http_status(
+            self, code, status, expected):
+        """`.code or .status_code` returned the string every time, so `== 401`
+        and friends were dead code and hard auth failures fell through to the
+        catch-all this whole mechanism exists to eliminate."""
+        assert _classify(_OpenAIBoom(code, code=code, status_code=status)) == expected
+
+    def test_openrouters_unknown_model_wording_is_recognised(self):
+        """Matching neither "not found" nor "does not exist" meant the model
+        was never marked dead and was re-tried on every single generation."""
+        exc = _OpenAIBoom("No endpoints found for meta-llama/imaginary-405b.",
+                          code="model_not_found", status_code=404)
+        assert _classify(exc) == REASON_NOT_FOUND
 
 
 class TestLadder:
@@ -238,6 +296,147 @@ class TestTheReasonSeamSurvivesStubbing:
         assert last_failure_reason() == REASON_QUOTA
         reset_failure_reason()
         assert last_failure_reason() is None
+
+
+class TestTheGeminiCallItself:
+    """The migrated function, which every other test stubs away.
+
+    Mutation-testing the first version of this suite showed that deleting the
+    system-instruction line entirely, and hardcoding was_truncated=False, both
+    survived — the riskiest part of the SDK migration rested on one manual
+    check.
+    """
+
+    def test_the_system_prompt_survives_into_the_request_config(self):
+        """google-generativeai concatenated `system` onto the prompt string;
+        google-genai carries it on the config object instead. If that
+        assignment is dropped the model silently loses its instructions and
+        the emails just get quietly worse."""
+        from google.genai import types
+        config = types.GenerateContentConfig(max_output_tokens=64,
+                                             temperature=0.7)
+        config.system_instruction = "You are a careful editor."
+        assert config.model_dump()["system_instruction"] == "You are a careful editor."
+
+    def test_a_typo_in_a_config_field_raises_rather_than_being_ignored(self):
+        from google.genai import types
+        with pytest.raises(Exception):
+            types.GenerateContentConfig(max_output_takens=64)
+
+    class _Resp:
+        def __init__(self, text, finish):
+            self.text = text
+            self.candidates = [type("C", (), {"finish_reason": finish})()]
+
+    class _Finish:
+        def __init__(self, name):
+            self.name = name
+
+    def _call(self, monkeypatch, resp):
+        captured = {}
+
+        class _Models:
+            def generate_content(self, **kwargs):
+                captured.update(kwargs)
+                return resp
+
+        class _Client:
+            def __init__(self, api_key=None):
+                self.models = _Models()
+
+        import google.genai as genai_mod
+        monkeypatch.setattr(genai_mod, "Client", _Client)
+        out = llm_client._gemini_complete(
+            prompt="write it", system="be brief", model="gemini-2.5-flash",
+            api_key="k", max_tokens=64)
+        return out, captured
+
+    def test_passes_the_prompt_and_system_through(self, monkeypatch):
+        resp = self._Resp("the email", self._Finish("STOP"))
+        (text, truncated), captured = self._call(monkeypatch, resp)
+        assert text == "the email"
+        assert truncated is False
+        assert captured["contents"] == "write it"
+        assert captured["model"] == "gemini-2.5-flash"
+        assert captured["config"].system_instruction == "be brief"
+        assert captured["config"].max_output_tokens == 64
+
+    def test_detects_truncation_from_the_finish_reason(self, monkeypatch):
+        resp = self._Resp("half an em", self._Finish("MAX_TOKENS"))
+        (text, truncated), _ = self._call(monkeypatch, resp)
+        assert truncated is True
+
+    def test_a_blocked_candidate_yields_empty_rather_than_raising(self, monkeypatch):
+        """google-generativeai's .text raised on a safety block; google-genai
+        returns None. Treating that as a crash would fail the whole job."""
+        resp = self._Resp(None, self._Finish("SAFETY"))
+        (text, truncated), _ = self._call(monkeypatch, resp)
+        assert text == ""
+        assert truncated is False
+
+    def test_survives_a_response_with_no_candidates(self, monkeypatch):
+        resp = type("R", (), {"text": "ok", "candidates": []})()
+        (text, truncated), _ = self._call(monkeypatch, resp)
+        assert text == "ok"
+        assert truncated is False
+
+
+class TestDeadModelsExpire:
+    def test_a_model_comes_back_after_the_window(self, monkeypatch):
+        """A 403 on a model this key is not entitled to stops being true the
+        moment billing is enabled; a permanent mark needed a restart to clear."""
+        llm_client._mark_dead("gemini-2.5-flash")
+        assert llm_client._is_dead("gemini-2.5-flash") is True
+        # Capture the real clock first: llm_client.time IS the time module, so
+        # patching through it would also rebind the call inside the lambda.
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            llm_client.time, "monotonic",
+            lambda: real_monotonic() + llm_client.DEAD_MODEL_TTL_SECONDS + 1)
+        assert llm_client._is_dead("gemini-2.5-flash") is False
+
+    def test_a_model_that_answers_is_revived_immediately(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_LLM_PROVIDER", "gemini")
+        monkeypatch.setenv("GOOGLE_AI_API_KEY", "test-key")
+        monkeypatch.delenv("EMAIL_LLM_MODEL", raising=False)
+        target = GEMINI_MODEL_FALLBACK_ORDER[0]
+        llm_client._mark_dead(target)
+        monkeypatch.setattr(llm_client, "_gemini_complete",
+                            lambda **kw: ("ok", False))
+        monkeypatch.setattr(llm_client, "_is_dead", lambda m: False)
+        complete_with_reason("hi")
+        assert llm_client._is_dead(target) is False
+
+
+class TestWhichModelActuallyWrote:
+    def test_records_the_substitute(self, monkeypatch):
+        """The ladder can silently swap vendors — a Gemini name configured
+        against an OpenRouter provider yields an Anthropic model at a very
+        different price, and the draft looks identical."""
+        monkeypatch.setenv("EMAIL_LLM_PROVIDER", "gemini")
+        monkeypatch.setenv("GOOGLE_AI_API_KEY", "test-key")
+        monkeypatch.setenv("EMAIL_LLM_MODEL", "gemini-2.0-flash")
+        tried = []
+
+        def fake(prompt, system, model, api_key, max_tokens):
+            tried.append(model)
+            if model == "gemini-2.0-flash":
+                raise _Boom("quota", code=429)
+            return "the email", False
+
+        monkeypatch.setattr(llm_client, "_gemini_complete", fake)
+        text, reason = complete_with_reason("hi")
+        assert text == "the email"
+        assert llm_client.last_model_used() == tried[-1]
+        assert llm_client.last_model_used() != "gemini-2.0-flash"
+
+    def test_a_failed_call_records_no_model(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_LLM_PROVIDER", "gemini")
+        monkeypatch.setenv("GOOGLE_AI_API_KEY", "test-key")
+        monkeypatch.setattr(llm_client, "_gemini_complete",
+                            lambda **kw: (_ for _ in ()).throw(_Boom("quota", code=429)))
+        complete_with_reason("hi")
+        assert llm_client.last_model_used() is None
 
 
 class TestTheSuiteCannotReachALiveProvider:

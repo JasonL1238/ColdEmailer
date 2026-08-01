@@ -111,9 +111,13 @@ class TestRepairContactEmailKinds:
 
     @pytest.mark.parametrize("junk", ["n/a", "none", "   ", "tbd"])
     def test_an_unparseable_address_is_never_reselected(self, db, junk):
-        """`email <> ''` alone let junk through: it can never be classified, so
-        every startup re-examined it forever. The LIKE '%_@_%' filter is what
-        stops that, and only an updated_at check can tell the two apart."""
+        """`email <> ''` alone let junk like 'n/a' through. Nothing can classify
+        it, so it was re-examined on every startup forever.
+
+        Both the LIKE '%_@_%' filter and the `if kind == "unknown": continue`
+        guard keep it from being written; this pins the outcome the user cares
+        about — the row is never touched, however often the repair runs — not
+        which of the two did the work."""
         company = db.create_company("Acme")
         c = db.create_contact(company_id=company["id"], name="Jane", email=junk)
         db.update_contact(c["id"], {"email_kind": "unknown"})

@@ -12,6 +12,7 @@ Every provider gets the same three things:
 """
 import os
 import threading
+import time
 from typing import List, Optional, Tuple
 
 # Why a call gave up. These are the values that reach `emails.fallback_reason`
@@ -61,35 +62,101 @@ OPENROUTER_MODEL_FALLBACK_ORDER = [
     "anthropic/claude-3.5-haiku",
 ]
 
-# Models the provider has told us it does not serve. Retrying them within the
-# same process is pure latency.
-_dead_models: set = set()
+# Models the provider has told us it does not serve, and when it said so.
+#
+# Time-limited on purpose: "unknown model" is not always permanent — a 403 on
+# a model this key is not entitled to becomes wrong the moment billing is
+# enabled, and a provider blip should not disable a model until the next
+# restart. The entry costs one wasted call per window, not one per generation.
+#
+# The lock guards the dict, not the call: two threads can still both discover
+# the same dead model before either records it. Serialising the network call
+# to prevent that would cost more than the duplicate probe it saves.
+DEAD_MODEL_TTL_SECONDS = 15 * 60
+_dead_models: dict = {}
 _dead_lock = threading.Lock()
 
 
 def _mark_dead(model: str) -> None:
     with _dead_lock:
-        _dead_models.add(model)
+        _dead_models[model] = time.monotonic()
+
+
+def _revive(model: str) -> None:
+    """A model that just answered is not dead, whatever it said last time."""
+    with _dead_lock:
+        _dead_models.pop(model, None)
 
 
 def _is_dead(model: str) -> bool:
     with _dead_lock:
-        return model in _dead_models
+        marked_at = _dead_models.get(model)
+        if marked_at is None:
+            return False
+        if time.monotonic() - marked_at >= DEAD_MODEL_TTL_SECONDS:
+            del _dead_models[model]
+            return False
+        return True
+
+
+def _http_status(exc: Exception) -> Optional[int]:
+    """The numeric HTTP status, whichever attribute the SDK hides it behind.
+
+    openai puts the *string* body error-code on `.code` ('invalid_api_key',
+    'model_not_found') and the number on `.status_code`; google.genai puts the
+    number on `.code` and has no `.status_code`. Reading `.code or
+    .status_code` therefore short-circuits on openai's string and every
+    numeric comparison downstream silently becomes dead code — which is how a
+    401 'no_credentials' ended up classified as a generic failure.
+    """
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    return None
 
 
 def _classify(exc: Exception) -> str:
     """Map a provider exception onto one of the REASON_* values."""
     name = type(exc).__name__
     text = str(exc).lower()
-    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    if name == "ResourceExhausted" or code == 429 or "quota" in text \
-            or "429" in text or "rate limit" in text:
-        return REASON_QUOTA
-    if code in (401, 403) or "api key" in text or "unauthorized" in text \
-            or "permission" in text or "invalid_api_key" in text:
-        return REASON_AUTH
-    if code == 404 or "not found" in text or "does not exist" in text:
+    code = _http_status(exc)
+
+    # Unknown model first: providers report it as 400, 403 or 404 depending on
+    # vendor, and it must never be read as a broken key — that would abandon
+    # the rest of the ladder over one entitlement gap.
+    if (code == 404 or name == "NotFound"
+            or "model_not_found" in text
+            or "no endpoints found" in text          # OpenRouter's wording
+            or ("model" in text and ("not found" in text
+                                     or "does not exist" in text))
+            # "Permission denied on resource model X" is that one model being
+            # off-limits to this key, not the key being bad.
+            or (code == 403 and "model" in text)):
         return REASON_NOT_FOUND
+
+    # Auth before quota, deliberately. Google's "API has not been used in
+    # project… the request requires a quota project" 403 contains the word
+    # quota, and a quota-first check tells the user to wait for a reset that
+    # will never come.
+    if (code in (401, 403)
+            or name in ("PermissionDenied", "Unauthenticated")
+            or any(w in text for w in (
+                "invalid api key", "invalid_api_key", "incorrect api key",
+                "api key not valid", "unauthorized", "unauthenticated",
+                "no_credentials", "account_deactivated", "permission_denied",
+                "has not been used in project", "api key expired"))):
+        return REASON_AUTH
+
+    # Bare "429" substring matching used to fire on ordinary prose: "you
+    # requested 4297 tokens" was reported to the user as an exhausted quota.
+    if (code == 429 or name == "ResourceExhausted"
+            or "rate limit" in text or "ratelimit" in text
+            or "quota exceeded" in text or "exceeded your current quota" in text
+            or "resource_exhausted" in text or "too many requests" in text
+            or "insufficient_quota" in text):
+        return REASON_QUOTA
+
     if any(w in text for w in ("timeout", "timed out", "connection",
                                "network", "unreachable", "dns")):
         return REASON_NETWORK
@@ -231,7 +298,14 @@ def complete_with_reason(
     Returns (text, None) on success, or (None, REASON_*) explaining why every
     model in the ladder gave up. The reason is what lets a draft say "AI quota
     exhausted" rather than the unfalsifiable "AI unavailable".
+
+    On success the model that actually answered is recorded for the caller via
+    last_model_used(): the ladder can silently substitute a different model —
+    and, when EMAIL_LLM_MODEL names one vendor's model while
+    EMAIL_LLM_PROVIDER names another, a different vendor at a different price —
+    so which one wrote a given draft must not be guesswork.
     """
+    _last.model = None
     provider = get_cloud_llm_provider()
     if not provider:
         return None, REASON_NO_PROVIDER
@@ -274,17 +348,29 @@ def complete_with_reason(
                     prompt=prompt, system=system, model=model, api_key=key,
                     base_url=base_url, max_tokens=max_tokens)
             if out:
+                _revive(model)
+                _last.model = model
+                if configured and model != configured:
+                    # Say it out loud. The substitute can be a different vendor
+                    # at a very different price, and the draft looks identical.
+                    print(f"[LLM] {configured} unavailable; wrote this with {model}.")
                 return out, None
             last_reason = REASON_EMPTY
             print(f"[LLM] {model} returned nothing, trying next model.")
         except Exception as exc:
             last_reason = _classify(exc)
             if last_reason == REASON_NOT_FOUND:
-                # The ladder is stale. Do not pay for this again this process.
+                # This model, not the ladder. Skip it for a while — an
+                # entitlement gap disappears the moment billing is enabled.
                 _mark_dead(model)
-                print(f"[LLM] {model} is not served by {provider}; skipping it from now on.")
+                print(f"[LLM] {model} is not available to this {provider} key; "
+                      f"skipping it for {DEAD_MODEL_TTL_SECONDS // 60} minutes.")
             elif last_reason == REASON_AUTH:
                 # A bad key fails identically for every model — stop early.
+                # Only a genuine key problem reaches here; a 403 naming a
+                # single model is classified as NOT_FOUND above, because
+                # abandoning the ladder over one entitlement gap left users
+                # with no AI at all and a message blaming their key.
                 print(f"[LLM] {provider} rejected the API key.")
                 return None, REASON_AUTH
             elif last_reason == REASON_QUOTA:
@@ -312,10 +398,16 @@ _last = threading.local()
 
 def reset_failure_reason() -> None:
     _last.reason = None
+    _last.model = None
 
 
 def last_failure_reason() -> Optional[str]:
     return getattr(_last, "reason", None)
+
+
+def last_model_used() -> Optional[str]:
+    """Which model actually produced the most recent text on this thread."""
+    return getattr(_last, "model", None)
 
 
 def complete(

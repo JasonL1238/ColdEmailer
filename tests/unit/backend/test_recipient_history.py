@@ -51,8 +51,12 @@ class TestTheRecipientIsFrozenAtSend:
         assert row["contact_email"] == "careers@acme.com"
 
     def test_the_list_view_agrees_with_the_detail_view(self, db, sent):
+        """Compare the two views to each other, not each to a literal: a test
+        that checks only the list would pass while the two disagreed."""
         db.update_contact(sent["contact"]["id"], {"email": "jane.doe@acme.com"})
         listed = [e for e in db.list_emails() if e["id"] == sent["email"]["id"]][0]
+        detail = db.get_email(sent["email"]["id"])
+        assert listed["contact_email"] == detail["contact_email"]
         assert listed["contact_email"] == "careers@acme.com"
 
     def test_a_follow_up_candidate_keeps_the_original_address(self, db, sent):

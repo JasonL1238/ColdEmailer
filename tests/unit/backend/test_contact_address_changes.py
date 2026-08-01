@@ -98,7 +98,32 @@ class TestEditingTheAddressReclassifiesIt:
         assert row["email_verified"] == 0
         assert row["person_verified"] == 0
 
-    def test_an_edit_that_leaves_the_address_alone_changes_nothing(self, db):
+    def test_echoing_the_same_address_back_changes_nothing(self, db):
+        """The shape a real client sends: the whole contact, address included.
+
+        Triggering on `"email" in updates` rather than on the address actually
+        changing meant every edit re-derived the classification from an
+        unchanged value — and, with the conservative name_from_email branch
+        forced on, downgraded a correct 'personal' row to 'named_unmatched'
+        and cleared its verification. The drafts list then cried "address
+        doesn't match" at a perfectly matching address, which destroys the
+        signal that warning exists to carry.
+        """
+        company = db.create_company("Acme")
+        contact = db.create_contact(company_id=company["id"], name="Jane Doe",
+                                    email="jane.doe@acme.com")
+        db.update_contact(contact["id"], {"email_kind": "personal",
+                                          "email_verified": 1,
+                                          "person_verified": 1})
+        row = self._put(contact["id"], name="Jane Doe",
+                        email="jane.doe@acme.com",
+                        role="Head of Engineering")
+        assert row["role"] == "Head of Engineering"
+        assert row["email_kind"] == "personal"
+        assert row["email_verified"] == 1
+        assert row["person_verified"] == 1
+
+    def test_an_unrelated_edit_changes_nothing(self, db):
         company = db.create_company("Acme")
         contact = db.create_contact(company_id=company["id"], name="Jane Doe",
                                     email="jane.doe@acme.com")
@@ -107,3 +132,26 @@ class TestEditingTheAddressReclassifiesIt:
         row = self._put(contact["id"], role="Head of Engineering")
         assert row["email_kind"] == "personal"
         assert row["email_verified"] == 1
+
+    def test_renaming_the_contact_reclassifies_too(self, db):
+        """The mirror-image staleness. Renaming the person on jane.doe@ to
+        "Bob Smith" kept 'personal' and email_verified=1, which together
+        assert that jane.doe@ is Bob's mailbox and keep the mismatch warning
+        silent — the same "silence reads as an all-clear" failure."""
+        company = db.create_company("Acme")
+        contact = db.create_contact(company_id=company["id"], name="Jane Doe",
+                                    email="jane.doe@acme.com")
+        db.update_contact(contact["id"], {"email_kind": "personal",
+                                          "email_verified": 1})
+        row = self._put(contact["id"], name="Bob Smith")
+        assert row["email_kind"] == "named_unmatched"
+
+    def test_a_correct_pair_is_still_called_personal(self, db):
+        """Forcing the conservative branch here made verify_email structurally
+        unable to return 'personal', so no edit could ever produce one."""
+        company = db.create_company("Acme")
+        contact = db.create_contact(company_id=company["id"], name="Someone Else",
+                                    email="jane.doe@acme.com")
+        row = self._put(contact["id"], name="Jane Doe",
+                        email="jane.doe@acme.com")
+        assert row["email_kind"] == "personal"

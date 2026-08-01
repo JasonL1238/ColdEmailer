@@ -159,8 +159,13 @@ _ADDED_COLUMNS = {
     # onto contacts.email — so editing or re-researching a contact silently
     # rewrote the history of who had already been written to, and a follow-up
     # saying "following up on my note" could go to someone who never got one.
+    # `llm_model` is which model actually wrote this draft. The ladder can
+    # substitute silently — and when EMAIL_LLM_MODEL names one vendor's model
+    # while EMAIL_LLM_PROVIDER names another, it substitutes a different vendor
+    # at a very different price — and the resulting draft looks identical.
     "emails": {"send_attempted_at": "TEXT", "send_attempt_error": "TEXT",
-               "response_verified_at": "TEXT", "recipient_email": "TEXT"},
+               "response_verified_at": "TEXT", "recipient_email": "TEXT",
+               "llm_model": "TEXT"},
     # Why the search matched this company, per the model that suggested it.
     # Kept apart from `summary` on purpose: summary is scraped evidence and is
     # quoted into emails, this is an unverified guess and must not be.
@@ -1034,6 +1039,7 @@ class Database:
             "is_follow_up": 1 if kwargs.get("is_follow_up") else 0,
             "used_template_fallback": 1 if kwargs.get("used_template_fallback") else 0,
             "fallback_reason": kwargs.get("fallback_reason"),
+            "llm_model": kwargs.get("llm_model"),
             "custom_instructions": kwargs.get("custom_instructions"),
         }
         self._insert("emails", data)
@@ -1070,7 +1076,7 @@ class Database:
             "subject", "body", "status", "sent_at", "gmail_message_id",
             "gmail_thread_id", "has_response", "response_at",
             "response_verified_at", "email_type",
-            "resume_id", "used_template_fallback", "fallback_reason",
+            "resume_id", "used_template_fallback", "fallback_reason", "llm_model",
             "custom_instructions", "is_follow_up", "original_email_id",
             "send_attempted_at", "send_attempt_error", "recipient_email",
         }
@@ -1630,6 +1636,40 @@ def repair_speculative_company_summaries(db: "Database") -> int:
     return len(rows)
 
 
+# Role mailboxes contact_verify.GENERIC_LOCALS does not list. Kept local to
+# this repair rather than widened globally: GENERIC_LOCALS drives rejection at
+# ingest, and quietly turning more addresses into hard rejections is a bigger
+# behaviour change than labelling existing rows. contact_ingest documents the
+# same gap and defends against it by refusing any mailbox it cannot tie to a
+# person.
+_EXTRA_ROLE_LOCALS = frozenset({
+    "legal", "privacy", "compliance", "security", "abuse", "webmaster",
+    "hiring", "internships", "internship", "noreply", "no-reply", "donotreply",
+    "do-not-reply", "newsletter", "newsletters", "notifications", "notify",
+    "updates", "feedback", "bugs", "postmaster", "mailer-daemon", "subscribe",
+    "unsubscribe", "invoices", "invoice", "payments", "orders", "shop",
+    "service", "services", "customerservice", "customersupport", "care",
+})
+
+
+def _looks_like_role_local(email: str) -> bool:
+    """True when every token of the local part is a role word.
+
+    Deliberately token-based rather than "is the name blank": jane.doe@ splits
+    into two tokens that are not role words, so a real person with no name
+    recorded is not mistaken for a company inbox.
+    """
+    import re as _re
+
+    local = (email or "").strip().lower().split("@", 1)[0].split("+", 1)[0]
+    if not local:
+        return False
+    parts = [p for p in _re.split(r"[._+-]+", local) if p]
+    if not parts:
+        return False
+    return all(p in _EXTRA_ROLE_LOCALS or len(p) <= 1 for p in parts)
+
+
 def repair_contact_email_kinds(db: "Database") -> int:
     """Classify contacts that predate `email_kind`.
 
@@ -1660,7 +1700,7 @@ def repair_contact_email_kinds(db: "Database") -> int:
     startup and offline. It never sets `email_verified`, which means "MX was
     actually confirmed" and cannot be inferred from an address.
     """
-    from contact_verify import is_generic_inbox, verify_email
+    from contact_verify import verify_email
 
     rows = db.query(
         # `email <> ''` alone lets through junk like 'n/a' that can never be
@@ -1674,13 +1714,14 @@ def repair_contact_email_kinds(db: "Database") -> int:
         verdict = verify_email(row["email"], row["name"], check_mx=False,
                                name_from_email=True)
         kind = verdict["email_kind"]
-        # A local outside GENERIC_LOCALS (legal@, hiring@, noreply@) with no
-        # usable name lands on 'named_unmatched'. contact_ingest rejects that
-        # case outright rather than let it pass as a person; with nothing to
-        # associate the mailbox with, treat it as the role inbox it is.
-        if kind == "named_unmatched" and not (row["name"] or "").strip():
-            kind = "generic"
-        elif kind == "named_unmatched" and is_generic_inbox(row["email"]):
+        # A local outside GENERIC_LOCALS (legal@, hiring@, noreply@) lands on
+        # 'named_unmatched', i.e. reads as a person. Keying this off a blank
+        # name instead was an over-claim in the other direction: a real
+        # person's jane.doe@ that simply had no name attached yet got filed as
+        # a company inbox — which is not only wrong in the UI but arms the
+        # address-overwrite branch in _enrich_company_async, since that branch
+        # triggers on email_kind == 'generic'.
+        if kind == "named_unmatched" and _looks_like_role_local(row["email"]):
             kind = "generic"
         if kind == "unknown":
             continue

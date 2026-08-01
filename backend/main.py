@@ -364,7 +364,11 @@ async def get_company(company_id: str):
         raise HTTPException(404, "Company not found")
     company["contacts"] = db.list_contacts(company_id=company_id)
     company["emails"] = db.query(
-        """SELECT e.*, ct.name AS contact_name, ct.email AS contact_email
+        # COALESCE, like every other recipient lookup: without it this drawer
+        # names a different recipient for the same sent email than the Emails
+        # screen does, because it re-resolves a mutable join.
+        """SELECT e.*, ct.name AS contact_name,
+                  COALESCE(e.recipient_email, ct.email) AS contact_email
            FROM emails e JOIN contacts ct ON e.contact_id = ct.id
            WHERE ct.company_id=? ORDER BY e.created_at DESC""",
         (company_id,),
@@ -466,8 +470,13 @@ def _enrich_company_async(company_id: str, mode: str = "full"):
                     if addr:
                         same_mailbox = existing_email.lower() == addr.lower()
                         if not existing_email:
-                            richer["email"] = addr
-                            same_mailbox = True
+                            # Filling a blank is normally free, but the blank
+                            # can be one the user just cleared on a contact
+                            # with sent history — after which this would put a
+                            # different person's address on that history.
+                            if not _contact_has_been_emailed(existing_contact["id"]):
+                                richer["email"] = addr
+                                same_mailbox = True
                         elif (
                             not same_mailbox
                             and existing_contact.get("email_kind") == "generic"
@@ -801,8 +810,10 @@ async def create_contact(payload: ContactCreate):
 
 
 @app.put("/api/contacts/{contact_id}")
-async def update_contact(contact_id: str, payload: ContactUpdate):
-    if not db.get_contact(contact_id):
+async def update_contact(contact_id: str, payload: ContactUpdate,
+                         force: bool = False):
+    existing = db.get_contact(contact_id)
+    if not existing:
         raise HTTPException(404, "Contact not found")
     updates = payload.model_dump(exclude_none=True)
     if updates.get("company_id") and not db.get_company(updates["company_id"]):
@@ -819,20 +830,52 @@ async def update_contact(contact_id: str, payload: ContactUpdate):
         clash = db.find_contact_by_linkedin(new_linkedin)
         if clash and clash["id"] != contact_id:
             raise HTTPException(409, "Another contact already uses that LinkedIn profile")
-    if "email" in updates:
-        # Re-classify, or the stored kind describes the previous address:
-        # editing a person's mailbox to careers@ would keep email_kind
-        # 'personal', and the drafts screen would stay silent on a role inbox.
-        # Silence reads as an all-clear once the warning exists.
+    old_email = (existing.get("email") or "").strip()
+    address_changed = "email" in updates and new_email.lower() != old_email.lower()
+
+    if address_changed and _contact_has_been_emailed(contact_id) and not force:
+        # Nothing here freezes a *future* email. `emails.recipient_email`
+        # preserves who past ones went to, but a follow-up is composed fresh
+        # against the live contact — so moving the address after a send makes
+        # "I wanted to follow up on my note from <date>" arrive at someone who
+        # never got the note, threaded into a conversation they were not part
+        # of. Same rule as deleting a contact with sent history.
+        raise HTTPException(
+            409,
+            f"{existing.get('name') or old_email} has already been emailed. "
+            f"Changing the address now would aim any follow-up at someone who "
+            f"never received the original. Re-send with ?force=true to do it "
+            f"anyway, or add the new address as a separate contact.")
+
+    # Re-classify whenever either half of the (name, address) pair moves.
+    # Keying off the address alone left the mirror-image staleness: renaming
+    # the contact on jane.doe@ to "Bob Smith" kept email_kind 'personal' and
+    # email_verified 1, which then assert that jane.doe@ is Bob's mailbox and
+    # keep the mismatch warning silent.
+    new_name = updates.get("name", existing.get("name"))
+    if address_changed or ("name" in updates
+                           and new_name != existing.get("name")
+                           and (new_email or old_email)):
         from contact_verify import verify_email
-        existing = db.get_contact(contact_id) or {}
-        name = updates.get("name", existing.get("name"))
-        verdict = verify_email(new_email, name, check_mx=False,
-                               name_from_email=True)
-        updates["email_kind"] = verdict["email_kind"] if new_email else "none"
-        # The old flags described the old mailbox.
-        updates["email_verified"] = 0
-        updates["person_verified"] = 0
+        addr = new_email if "email" in updates else old_email
+        # name_from_email stays False here on purpose. Unlike the legacy-row
+        # repair, this name arrived from the caller alongside the address, so
+        # comparing them is real evidence rather than circular. Forcing the
+        # conservative branch made verify_email structurally unable to return
+        # 'personal', so every edit downgraded a correct row and the drafts
+        # list cried "address doesn't match" at perfectly matching addresses.
+        verdict = verify_email(addr, new_name, check_mx=False)
+        updates["email_kind"] = verdict["email_kind"] if addr else "none"
+        if address_changed:
+            # These described the previous mailbox and were never checked
+            # against this one.
+            updates["email_verified"] = 0
+            updates["person_verified"] = 0
+    elif "email" in updates:
+        # Same address echoed back by the client. Rewriting the classification
+        # from an unchanged value can only lose information.
+        updates.pop("email", None)
+
     db.update_contact(contact_id, updates)
     return db.get_contact(contact_id)
 
@@ -1234,7 +1277,15 @@ def _contact_has_been_emailed(contact_id: Optional[str]) -> bool:
         return False
     return bool(db.query_one(
         "SELECT 1 FROM emails WHERE contact_id=? "
-        "AND (status='sent' OR gmail_message_id IS NOT NULL) LIMIT 1",
+        # send_attempted_at counts. It is set before the network call and
+        # cleared only on a definite verdict, so a row sitting in that window
+        # may already be in the recipient's inbox. Treating it as "nothing
+        # sent yet" let the address move mid-flight, after which
+        # find_delivered_message searched the wrong mailbox — so the retry
+        # could not tell the send had landed — and a confirmed resend
+        # delivered real mail to someone who was never the recipient.
+        "AND (status='sent' OR gmail_message_id IS NOT NULL "
+        "     OR send_attempted_at IS NOT NULL) LIMIT 1",
         (contact_id,),
     ))
 
@@ -1798,7 +1849,8 @@ def check_replies(recheck: bool = Query(False)):
     if not recheck:
         where += " AND (e.has_response=0 OR e.response_verified_at IS NULL)"
     sent_emails = db.query(
-        f"""SELECT e.*, ct.name AS contact_name, ct.email AS contact_email
+        f"""SELECT e.*, ct.name AS contact_name,
+                  COALESCE(e.recipient_email, ct.email) AS contact_email
            FROM emails e LEFT JOIN contacts ct ON e.contact_id=ct.id
            WHERE {where}
            ORDER BY e.sent_at DESC LIMIT 200"""

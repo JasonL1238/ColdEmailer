@@ -415,7 +415,11 @@ Body:
         # "key rejected") so the drafts screen can tell the user what to fix
         # instead of the unactionable "AI unavailable".
         llm_reason = None
-        if not use_template_only and llm_complete and get_cloud_llm_provider():
+        # Deliberately not gated on get_cloud_llm_provider(): the client
+        # reports "no provider configured" as its own reason, and guarding
+        # it out here made the single most common failure — no key at all —
+        # render as the generic "AI was unavailable".
+        if not use_template_only and llm_complete:
             prompt = self._build_prompt(contact, company, email_type, profile,
                                         resume_text, custom_instructions)
             out, llm_reason = self._llm_text(prompt, max_tokens=2048)
@@ -476,7 +480,7 @@ Body:
             "is attached."
         )
 
-        if llm_complete and get_cloud_llm_provider():
+        if llm_complete:
             prompt = f"""Write a brief, polite follow-up to a cold email that got no reply.
 
 ORIGINAL EMAIL (sent {sent_date}):

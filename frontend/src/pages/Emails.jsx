@@ -59,7 +59,6 @@ export const addressWarning = (e) => {
   }
   return null
 }
-export const isRoleInbox = (e) => e.contact_email_kind === 'generic'
 
 export const hasVerifiedReply = (e) => !!e.has_response && !e.reply_unverified
 export const hasUnverifiedReply = (e) => !!(e.reply_unverified || e.contact_reply_unverified)

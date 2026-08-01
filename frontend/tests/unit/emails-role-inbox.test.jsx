@@ -29,6 +29,15 @@ const emails = [
     has_response: 0, has_follow_up: 0, used_template_fallback: 0,
   },
   {
+    id: 'mismatch', status: 'draft', subject: 'ZZTEST wrong human',
+    body: 'Hi Jane,\n\nA perfectly ordinary body.\n\nThanks so much,',
+    contact_name: 'ZZTEST Jane Doe', contact_email: 'bob.smith@zztest.invalid',
+    contact_email_kind: 'named_unmatched',
+    company_name: 'ZZTEST Corp', email_type: 'application',
+    sent_at: null, gmail_message_id: null, created_at: '2026-07-01T10:30:00',
+    has_response: 0, has_follow_up: 0, used_template_fallback: 0,
+  },
+  {
     id: 'quota', status: 'draft', subject: 'ZZTEST fell back',
     body: 'Hi Sam,\n\nA perfectly ordinary body.\n\nThanks so much,',
     contact_name: 'ZZTEST Sam', contact_email: 'sam@zztest.invalid',
@@ -68,7 +77,7 @@ vi.mock('react-hot-toast', () => ({
   default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
 }))
 
-import Emails, { isRoleInbox, addressWarning, fallbackExplanation } from '../../src/pages/Emails'
+import Emails, { addressWarning, fallbackExplanation } from '../../src/pages/Emails'
 
 const rows = () => [...document.querySelectorAll('.email-row')]
 const rowFor = (name) => rows().find((r) => r.textContent.includes(name))
@@ -79,22 +88,6 @@ async function open() {
   render(<Emails />)
   await waitFor(() => expect(rows().length).toBeGreaterThan(0))
 }
-
-describe('isRoleInbox', () => {
-  it('is true only for a shared company inbox', () => {
-    expect(isRoleInbox({ contact_email_kind: 'generic' })).toBe(true)
-    expect(isRoleInbox({ contact_email_kind: 'personal' })).toBe(false)
-    expect(isRoleInbox({ contact_email_kind: 'named_unmatched' })).toBe(false)
-  })
-
-  it('does not guess when the classification is missing', () => {
-    // An older row, or a payload that never joined the contact. Claiming
-    // "role inbox" on absent data would be a warning the app cannot back up.
-    expect(isRoleInbox({})).toBe(false)
-    expect(isRoleInbox({ contact_email_kind: null })).toBe(false)
-    expect(isRoleInbox({ contact_email_kind: 'unknown' })).toBe(false)
-  })
-})
 
 describe('addressWarning', () => {
   it('flags a shared inbox', () => {
@@ -137,8 +130,18 @@ describe('Emails — role inbox warning', () => {
 
   it('chips the draft aimed at a shared inbox, and only that one', async () => {
     await open()
-    expect(rowFor('info@zztest.invalid').textContent).toContain('role inbox')
-    expect(rowFor('ZZTEST Jane').textContent).not.toContain('role inbox')
+    expect(rowFor('ZZTEST to a shared inbox').textContent).toContain('role inbox')
+    expect(rowFor('ZZTEST to a human').textContent).not.toContain('role inbox')
+  })
+
+  it('chips the draft whose address does not match the person it greets', async () => {
+    /* The sharper case, and the one that had no rendered coverage: the body
+       opens "Hi Jane," and goes to bob.smith@. Without a row of this shape in
+       the fixture, both render sites could be reverted invisibly. */
+    await open()
+    const row = rowFor('ZZTEST wrong human')
+    expect(row.textContent).toMatch(/doesn't match/i)
+    expect(row.textContent).not.toContain('role inbox')
   })
 
   it('repeats it in the send dialog, where the decision is actually made', async () => {
