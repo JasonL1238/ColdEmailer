@@ -38,9 +38,27 @@ const FALLBACK_REASONS = {
 export const fallbackExplanation = (reason) =>
   FALLBACK_REASONS[reason] || 'AI was unavailable — this used the plain template.'
 
-/* A shared inbox (info@, careers@, hello@) rather than a named person. New
-   contacts never enter the DB this way, but older ones did, and a draft
-   addressed to one is worth flagging before it is sent rather than after. */
+/* Warnings about who a draft is actually addressed to.
+
+   'generic' is a shared inbox (info@, careers@) rather than a person.
+   'named_unmatched' is worse and easy to miss: the address does not match the
+   contact's name, so the body opens "Hi Jane," and arrives in bob.smith@'s
+   mailbox. Every other layer treats that as unsendable — contact_ingest
+   rejects it, discovery and enrich blank the address — so the only rows that
+   still carry it are legacy ones, which is exactly where a silent chip would
+   read as an all-clear. */
+export const addressWarning = (e) => {
+  if (e.contact_email_kind === 'generic') {
+    return { label: 'role inbox', title: 'A shared company inbox, not a person. These reply far less often.' }
+  }
+  if (e.contact_email_kind === 'named_unmatched') {
+    return {
+      label: "address doesn't match",
+      title: `This address does not look like ${e.contact_name || 'this contact'}. The email greets them by name — check it is the right person.`,
+    }
+  }
+  return null
+}
 export const isRoleInbox = (e) => e.contact_email_kind === 'generic'
 
 export const hasVerifiedReply = (e) => !!e.has_response && !e.reply_unverified
@@ -327,9 +345,9 @@ export default function Emails() {
                           ? <Chip tone="amber"><MessageSquare size={10} /> reply unverified</Chip>
                           : null}
                       {isUnconfirmed(e) && <Chip tone="amber">delivery unconfirmed</Chip>}
-                      {isRoleInbox(e) && (
-                        <Chip tone="amber" title="A shared company inbox, not a person. These reply far less often.">
-                          role inbox
+                      {addressWarning(e) && (
+                        <Chip tone="amber" title={addressWarning(e).title}>
+                          {addressWarning(e).label}
                         </Chip>
                       )}
                       {!!e.used_template_fallback && <Chip tone="amber">template</Chip>}
@@ -658,7 +676,11 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
               <div key={e.id} className="row-between" style={{ padding: '8px 14px', borderBottom: '1px solid var(--border)' }}>
                 <span className="small" style={{ fontWeight: 600 }}>
                   {e.contact_name || e.contact_email}
-                  {isRoleInbox(e) && <span className="tiny" style={{ color: 'var(--amber)' }}>{' '}· role inbox</span>}
+                  {addressWarning(e) && (
+                    <span className="tiny" style={{ color: 'var(--amber)' }}>
+                      {' '}· {addressWarning(e).label}
+                    </span>
+                  )}
                 </span>
                 <span className="tiny mono">
                   {e.contact_email}

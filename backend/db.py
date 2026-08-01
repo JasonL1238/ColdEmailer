@@ -154,8 +154,13 @@ CREATE INDEX IF NOT EXISTS idx_events_created ON events (created_at);
 # existing table alone, so they have to be added explicitly or every query
 # touching them fails against the user's real database.
 _ADDED_COLUMNS = {
+    # `recipient_email` is who this message actually went to, frozen at send.
+    # Without it the recipient of every sent email was resolved by live join
+    # onto contacts.email — so editing or re-researching a contact silently
+    # rewrote the history of who had already been written to, and a follow-up
+    # saying "following up on my note" could go to someone who never got one.
     "emails": {"send_attempted_at": "TEXT", "send_attempt_error": "TEXT",
-               "response_verified_at": "TEXT"},
+               "response_verified_at": "TEXT", "recipient_email": "TEXT"},
     # Why the search matched this company, per the model that suggested it.
     # Kept apart from `summary` on purpose: summary is scraped evidence and is
     # quoted into emails, this is an unverified guess and must not be.
@@ -1044,7 +1049,8 @@ class Database:
 
     def get_email(self, email_id: str) -> Optional[Dict[str, Any]]:
         return self._annotate_email(self.query_one(
-            f"""SELECT e.*, ct.name AS contact_name, ct.email AS contact_email,
+            f"""SELECT e.*, ct.name AS contact_name,
+                   COALESCE(e.recipient_email, ct.email) AS contact_email,
                       ct.role AS contact_role,
                       ct.email_kind AS contact_email_kind,
                       c.name AS company_name,
@@ -1066,7 +1072,7 @@ class Database:
             "response_verified_at", "email_type",
             "resume_id", "used_template_fallback", "fallback_reason",
             "custom_instructions", "is_follow_up", "original_email_id",
-            "send_attempted_at", "send_attempt_error",
+            "send_attempted_at", "send_attempt_error", "recipient_email",
         }
         updates = {k: v for k, v in updates.items() if k in allowed}
         for bool_key in ("has_response", "is_follow_up", "used_template_fallback"):
@@ -1080,7 +1086,8 @@ class Database:
 
     def list_emails(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         sql = f"""
-            SELECT e.*, ct.name AS contact_name, ct.email AS contact_email,
+            SELECT e.*, ct.name AS contact_name,
+                   COALESCE(e.recipient_email, ct.email) AS contact_email,
                    ct.role AS contact_role, ct.email_kind AS contact_email_kind,
                    c.name AS company_name,
                    {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
@@ -1121,7 +1128,8 @@ class Database:
         """
         cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
         rows = self.query(
-            """SELECT e.*, ct.name AS contact_name, ct.email AS contact_email,
+            """SELECT e.*, ct.name AS contact_name,
+                   COALESCE(e.recipient_email, ct.email) AS contact_email,
                       c.name AS company_name, MAX(e.sent_at) AS _latest_sent_at
                FROM emails e
                LEFT JOIN contacts ct ON e.contact_id = ct.id

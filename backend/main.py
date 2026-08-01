@@ -474,8 +474,13 @@ def _enrich_company_async(company_id: str, mode: str = "full"):
                             and candidate.get("email_kind") == "personal"
                             and (candidate.get("email_verified")
                                  or candidate.get("email_person_match"))
+                            and not _contact_has_been_emailed(existing_contact["id"])
                         ):
                             # Upgrade company inbox → verified person mailbox.
+                            # Only while nothing has been sent yet: a follow-up
+                            # is composed as "following up on my note", and
+                            # moving the address underneath a sent history
+                            # points that at someone who never got the note.
                             richer["email"] = addr
                             same_mailbox = True
                         if same_mailbox:
@@ -814,6 +819,20 @@ async def update_contact(contact_id: str, payload: ContactUpdate):
         clash = db.find_contact_by_linkedin(new_linkedin)
         if clash and clash["id"] != contact_id:
             raise HTTPException(409, "Another contact already uses that LinkedIn profile")
+    if "email" in updates:
+        # Re-classify, or the stored kind describes the previous address:
+        # editing a person's mailbox to careers@ would keep email_kind
+        # 'personal', and the drafts screen would stay silent on a role inbox.
+        # Silence reads as an all-clear once the warning exists.
+        from contact_verify import verify_email
+        existing = db.get_contact(contact_id) or {}
+        name = updates.get("name", existing.get("name"))
+        verdict = verify_email(new_email, name, check_mx=False,
+                               name_from_email=True)
+        updates["email_kind"] = verdict["email_kind"] if new_email else "none"
+        # The old flags described the old mailbox.
+        updates["email_verified"] = 0
+        updates["person_verified"] = 0
     db.update_contact(contact_id, updates)
     return db.get_contact(contact_id)
 
@@ -1203,6 +1222,23 @@ async def get_email(email_id: str):
     return email
 
 
+def _contact_has_been_emailed(contact_id: Optional[str]) -> bool:
+    """True once anything has actually gone out to this contact.
+
+    Guards edits that would move the address underneath a sent history. The
+    stored recipient is what the app treats as the record of who has already
+    been written to, and re-pointing it makes a follow-up ("following up on my
+    note from…") arrive at someone who never received the note.
+    """
+    if not contact_id:
+        return False
+    return bool(db.query_one(
+        "SELECT 1 FROM emails WHERE contact_id=? "
+        "AND (status='sent' OR gmail_message_id IS NOT NULL) LIMIT 1",
+        (contact_id,),
+    ))
+
+
 def _already_delivered(email: Optional[dict]) -> bool:
     """True once Gmail has actually delivered this message.
 
@@ -1544,6 +1580,7 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                         "gmail_message_id": found.get("gmail_message_id"),
                         "gmail_thread_id": found.get("gmail_thread_id"),
                         "send_attempted_at": None, "send_attempt_error": None,
+                        "recipient_email": email.get("contact_email"),
                     })
                     db.log_event("email", email_id, "send_reconciled",
                                  f"found in Gmail Sent → {email.get('contact_email')}")
@@ -1614,6 +1651,10 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                     "gmail_message_id": result.get("gmail_message_id"),
                     "gmail_thread_id": result.get("gmail_thread_id"),
                     "send_attempted_at": None, "send_attempt_error": None,
+                    # Freeze who this actually went to. Resolving the recipient
+                    # by live join meant a later contact edit or re-research
+                    # rewrote the record of who had already been written to.
+                    "recipient_email": email.get("contact_email"),
                 })
                 db.update_contact(email["contact_id"], {"status": "sent"})
                 db.log_event("email", email_id, "sent",

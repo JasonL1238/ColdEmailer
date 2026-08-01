@@ -68,7 +68,7 @@ vi.mock('react-hot-toast', () => ({
   default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
 }))
 
-import Emails, { isRoleInbox, fallbackExplanation } from '../../src/pages/Emails'
+import Emails, { isRoleInbox, addressWarning, fallbackExplanation } from '../../src/pages/Emails'
 
 const rows = () => [...document.querySelectorAll('.email-row')]
 const rowFor = (name) => rows().find((r) => r.textContent.includes(name))
@@ -93,6 +93,27 @@ describe('isRoleInbox', () => {
     expect(isRoleInbox({})).toBe(false)
     expect(isRoleInbox({ contact_email_kind: null })).toBe(false)
     expect(isRoleInbox({ contact_email_kind: 'unknown' })).toBe(false)
+  })
+})
+
+describe('addressWarning', () => {
+  it('flags a shared inbox', () => {
+    expect(addressWarning({ contact_email_kind: 'generic' }).label).toBe('role inbox')
+  })
+
+  it('flags an address that does not match the person it greets', () => {
+    /* The sharper of the two: the body opens "Hi Jane," and arrives in
+       bob.smith@'s mailbox. Every other layer rejects this, so the only rows
+       carrying it are legacy — precisely where no chip reads as an all-clear. */
+    const w = addressWarning({ contact_email_kind: 'named_unmatched', contact_name: 'Jane Doe' })
+    expect(w.label).toMatch(/doesn't match/i)
+    expect(w.title).toContain('Jane Doe')
+  })
+
+  it('stays quiet when the address is fine or unclassified', () => {
+    expect(addressWarning({ contact_email_kind: 'personal' })).toBeNull()
+    expect(addressWarning({ contact_email_kind: 'unknown' })).toBeNull()
+    expect(addressWarning({})).toBeNull()
   })
 })
 
