@@ -22,6 +22,7 @@ if os.path.isfile(_root_env):
 
 from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
                 normalize_linkedin_url,
+                repair_contact_email_kinds,
                 repair_contact_reply_status, repair_delivered_email_status,
                 repair_mismatched_company_sites,
                 repair_offdomain_contact_warnings,
@@ -153,6 +154,7 @@ repair_contact_reply_status(db)
 repair_mismatched_company_sites(db)
 repair_speculative_company_summaries(db)
 repair_offdomain_contact_warnings(db)
+repair_contact_email_kinds(db)
 resumes.migrate_legacy_resumes(_PROJECT_ROOT)
 _seed_profile_once()
 _reap_orphaned_jobs()
@@ -282,20 +284,28 @@ async def list_deep_research_jobs():
 # Must stay above /api/deep-research/{job_id} — a literal path declared after
 # a path parameter would be swallowed by it.
 @app.get("/api/deep-research/consolidated")
-async def list_consolidated_research(search: Optional[str] = None):
+async def list_consolidated_research(search: Optional[str] = None,
+                                     include_all: bool = False):
     """Every company that has been deep-dived, with all of its runs merged.
 
     Two dives on one company — even with different criteria — come back as a
     single section rather than two unrelated job rows.
+
+    `include_all` also returns companies that have never been dived (with
+    run_count 0), so the UI can offer one searchable list of everything
+    instead of making the user go elsewhere to find a company.
     """
     out = []
     for company in db.list_companies(search=search):
-        if not has_deep_research(company):
+        researched = has_deep_research(company)
+        if not researched and not include_all:
             continue
         contacts = db.list_contacts(company_id=company["id"])
         out.append(consolidate(company, contacts))
+    # Deep-dived first (most recent at the top), then everything else by name.
+    out.sort(key=lambda c: (c["company"].get("name") or "").lower())
     out.sort(
-        key=lambda c: (c.get("last_researched_at") or "", c["company"].get("name") or ""),
+        key=lambda c: (bool(c["run_count"]), c.get("last_researched_at") or ""),
         reverse=True,
     )
     return out

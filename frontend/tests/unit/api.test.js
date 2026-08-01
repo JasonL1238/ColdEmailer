@@ -25,10 +25,17 @@ beforeEach(() => {
 })
 
 describe('API client', () => {
-  it('starts discovery with query and count', () => {
+  it('starts discovery with query and count, defaulting to full mode', () => {
     discoveryAPI.start('fintech startups', 10)
     expect(mockAxiosInstance.post).toHaveBeenCalledWith('/discovery', {
-      query: 'fintech startups', count: 10,
+      query: 'fintech startups', count: 10, mode: 'full',
+    })
+  })
+
+  it('passes an explicit discovery mode through', () => {
+    discoveryAPI.start('fintech startups', 10, 'fast')
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/discovery', {
+      query: 'fintech startups', count: 10, mode: 'fast',
     })
   })
 

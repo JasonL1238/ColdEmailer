@@ -144,7 +144,7 @@ export default function Dashboard() {
 
           {/* unverified legacy reply flags */}
           {counts.replied_unverified > 0 && (
-            <div className="card card-pad mt-16 row-between" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+            <div className="card card-pad mt-16 row-between" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
               <div className="row">
                 <AlertTriangle size={17} style={{ color: 'var(--amber)' }} />
                 <div>
@@ -165,7 +165,7 @@ export default function Dashboard() {
 
           {/* follow-ups banner */}
           {follow_ups_due > 0 && (
-            <div className="card card-pad mt-16 row-between" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+            <div className="card card-pad mt-16 row-between" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
               <div className="row">
                 <Clock size={17} style={{ color: 'var(--amber)' }} />
                 <div>
@@ -189,7 +189,7 @@ export default function Dashboard() {
                     <span style={{ width: 9, height: 9, borderRadius: 3, background: 'var(--accent)' }} /> sent
                   </span>
                   <span className="row" style={{ gap: 5 }}>
-                    <span style={{ width: 9, height: 9, borderRadius: 3, background: '#22c55e' }} /> replies
+                    <span style={{ width: 9, height: 9, borderRadius: 3, background: 'var(--green)' }} /> replies
                   </span>
                 </div>
               </div>
@@ -235,7 +235,7 @@ export default function Dashboard() {
                 ) : (
                   <div className="feed">
                     {recent_events.slice(0, 10).map((ev) => {
-                      const meta = EVENT_ICONS[ev.event] || { icon: Zap, bg: '#f1f1ef', color: 'var(--text-2)' }
+                      const meta = EVENT_ICONS[ev.event] || { icon: Zap, bg: 'var(--surface-2)', color: 'var(--text-2)' }
                       return (
                         <div key={ev.id} className="feed-item">
                           <div className="feed-dot" style={{ background: meta.bg, color: meta.color }}>

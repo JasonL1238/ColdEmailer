@@ -13,10 +13,15 @@ from db import Database
 from resume_service import ResumeService
 
 try:
-    from llm_client import complete as llm_complete, get_cloud_llm_provider
+    from llm_client import (REASON_EMPTY, complete as llm_complete,
+                            get_cloud_llm_provider, last_failure_reason,
+                            reset_failure_reason)
 except ImportError:
     llm_complete = None
     get_cloud_llm_provider = lambda: None
+    last_failure_reason = lambda: None
+    reset_failure_reason = lambda: None
+    REASON_EMPTY = "llm_empty"
 
 
 EMAIL_TYPES = {
@@ -406,11 +411,18 @@ Body:
         # decided at send time; the body never refers to it either way, so the
         # two no longer have to be kept in agreement.
 
+        # Why the AI step gave up, if it did. Kept specific ("quota exhausted",
+        # "key rejected") so the drafts screen can tell the user what to fix
+        # instead of the unactionable "AI unavailable".
+        llm_reason = None
         if not use_template_only and llm_complete and get_cloud_llm_provider():
             prompt = self._build_prompt(contact, company, email_type, profile,
                                         resume_text, custom_instructions)
-            out = llm_complete(prompt=prompt, system=None, max_tokens=2048)
+            out, llm_reason = self._llm_text(prompt, max_tokens=2048)
             parsed = _parse_subject_body(_clean_llm_email_text(out or ""))
+            if out and not parsed:
+                # It answered, but not in the format we can use.
+                llm_reason = REASON_EMPTY
             if parsed:
                 body = parsed["body"]
                 signature = self._signature(profile)
@@ -432,12 +444,28 @@ Body:
         body = tpl["body"].rstrip() + ("\n" + signature if signature else "")
         return {"subject": tpl["subject"], "body": body,
                 "used_template_fallback": True,
-                "fallback_reason": "user_requested" if use_template_only else "llm_unavailable"}
+                "fallback_reason": ("user_requested" if use_template_only
+                                    else (llm_reason or "llm_unavailable"))}
+
+    @staticmethod
+    def _llm_text(prompt: str, max_tokens: int) -> tuple:
+        """(text, reason_or_None).
+
+        Deliberately goes through `llm_complete` rather than a richer
+        two-value client call: that name is the seam every caller and test
+        patches, and routing around it made the suite talk to the live API.
+        The reason is read back out of the client afterwards, and is simply
+        None when the seam has been stubbed.
+        """
+        reset_failure_reason()
+        out = llm_complete(prompt=prompt, system=None, max_tokens=max_tokens)
+        return out, (None if out else last_failure_reason())
 
     def compose_follow_up(self, contact: Dict, company: Optional[Dict],
                           original: Dict) -> Dict:
         """Short follow-up referencing the original sent email."""
         profile = self.db.get_profile()
+        llm_reason = None
         sent_date = (original.get("sent_at") or "")[:10] or "recently"
         signature = self._signature(profile)
         first = (contact.get("name") or "").split(" ")[0] or "there"
@@ -469,8 +497,10 @@ OUTPUT FORMAT (exactly):
 Subject: <subject — usually "Re: {original.get('subject')}">
 Body:
 <body ending after the closing line>"""
-            out = llm_complete(prompt=prompt, system=None, max_tokens=1024)
+            out, llm_reason = self._llm_text(prompt, max_tokens=1024)
             parsed = _parse_subject_body(_clean_llm_email_text(out or ""))
+            if out and not parsed:
+                llm_reason = REASON_EMPTY
             if parsed:
                 body = parsed["body"]
                 if signature and not self._already_signed(body, signature):
@@ -485,4 +515,4 @@ Body:
         body = body.rstrip() + ("\n" + signature if signature else "")
         return {"subject": f"Re: {original.get('subject') or 'my earlier note'}",
                 "body": body, "used_template_fallback": True,
-                "fallback_reason": "llm_unavailable"}
+                "fallback_reason": llm_reason or "llm_unavailable"}

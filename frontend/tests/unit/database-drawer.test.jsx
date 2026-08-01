@@ -48,7 +48,7 @@ describe('CompanyDrawer 20s refresh timer', () => {
       .find((b) => /research/i.test(b.textContent) && !/failed/i.test(b.textContent))
     expect(research).toBeTruthy()
     await act(async () => { research.click() })
-    expect(companiesAPI.enrich).toHaveBeenCalledWith(1)
+    expect(companiesAPI.enrich).toHaveBeenCalledWith(1, 'full')
 
     const getCallsBeforeClose = companiesAPI.get.mock.calls.length
 

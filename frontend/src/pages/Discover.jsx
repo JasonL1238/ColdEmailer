@@ -150,7 +150,7 @@ export default function Discover() {
 
       {/* hero search */}
       <div className="card discover-hero">
-        <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.01em' }}>
+        <div className="hero-title" style={{ fontSize: 22 }}>
           <Sparkles size={16} style={{ color: 'var(--accent)', verticalAlign: -2, marginRight: 7 }} />
           What kind of companies are you looking for?
         </div>

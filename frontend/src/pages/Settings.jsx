@@ -73,7 +73,7 @@ export default function Settings() {
       </div>
 
       {settings.profile_incomplete?.length > 0 && (
-        <div className="card card-pad mb-16 row" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6', gap: 10 }}>
+        <div className="card card-pad mb-16 row" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)', gap: 10 }}>
           <XCircle size={16} style={{ color: 'var(--amber)', flexShrink: 0 }} />
           <div className="small">
             <b>Your emails are missing {settings.profile_incomplete.join(', ')}.</b>{' '}

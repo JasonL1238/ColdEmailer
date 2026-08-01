@@ -3,9 +3,10 @@
   "configurations": [
     {
       "name": "backend",
-      "runtimeExecutable": "backend/venv/bin/python",
+      "runtimeExecutable": "venv/bin/python",
       "runtimeArgs": [
-        "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"
+        "-m", "uvicorn", "main:app", "--reload",
+        "--host", "127.0.0.1", "--port", "8000"
       ],
       "cwd": "backend",
       "port": 8000
@@ -13,7 +14,9 @@
     {
       "name": "frontend",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--prefix", "frontend"],
+      "runtimeArgs": [
+        "run", "dev", "--prefix", "frontend", "--", "--host", "127.0.0.1"
+      ],
       "port": 5173
     }
   ]

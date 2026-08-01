@@ -24,6 +24,25 @@ export const isUnconfirmed = (e) => !!e.send_attempted_at && !isDelivered(e)
 // A reply flag the current checker has confirmed vs. one inherited from the old
 // checker (which counted bounces, auto-replies and our own messages). Only the
 // first may be stated as fact — including its date.
+/* Why a draft came out of the plain template. "AI was unavailable" was the
+   only thing the app could ever say, which tells you nothing about whether to
+   wait, swap a key, or check your connection. */
+const FALLBACK_REASONS = {
+  llm_quota: 'Your AI quota is exhausted — this used the plain template. Wait for the reset, add billing, or switch provider in Settings.',
+  llm_auth: 'Your AI provider rejected the API key — this used the plain template. Check the key in your .env.',
+  llm_no_key: 'No AI provider is configured — this used the plain template. Add a key in your .env.',
+  llm_no_model: 'None of the configured AI models are available — this used the plain template.',
+  llm_network: 'Could not reach the AI provider — this used the plain template.',
+  llm_empty: 'The AI returned nothing usable — this used the plain template.',
+}
+export const fallbackExplanation = (reason) =>
+  FALLBACK_REASONS[reason] || 'AI was unavailable — this used the plain template.'
+
+/* A shared inbox (info@, careers@, hello@) rather than a named person. New
+   contacts never enter the DB this way, but older ones did, and a draft
+   addressed to one is worth flagging before it is sent rather than after. */
+export const isRoleInbox = (e) => e.contact_email_kind === 'generic'
+
 export const hasVerifiedReply = (e) => !!e.has_response && !e.reply_unverified
 export const hasUnverifiedReply = (e) => !!(e.reply_unverified || e.contact_reply_unverified)
 
@@ -207,7 +226,7 @@ export default function Emails() {
       </div>
 
       {unverifiedCount > 0 && (
-        <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+        <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
           <div className="row">
             <AlertTriangle size={16} style={{ color: 'var(--amber)' }} />
             <span className="small">
@@ -225,7 +244,7 @@ export default function Emails() {
       )}
 
       {followUps.length > 0 && tab !== 'trashed' && (
-        <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+        <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
           <div className="row">
             <Clock size={16} style={{ color: 'var(--amber)' }} />
             <span className="small">
@@ -308,6 +327,11 @@ export default function Emails() {
                           ? <Chip tone="amber"><MessageSquare size={10} /> reply unverified</Chip>
                           : null}
                       {isUnconfirmed(e) && <Chip tone="amber">delivery unconfirmed</Chip>}
+                      {isRoleInbox(e) && (
+                        <Chip tone="amber" title="A shared company inbox, not a person. These reply far less often.">
+                          role inbox
+                        </Chip>
+                      )}
                       {!!e.used_template_fallback && <Chip tone="amber">template</Chip>}
                       <span className="tiny">{timeAgo(e.sent_at || e.created_at)}</span>
                     </div>
@@ -481,7 +505,7 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
           <AlertTriangle size={13} />
           {email.fallback_reason === 'user_requested'
             ? 'Written from the plain template (AI was skipped).'
-            : 'AI was unavailable — this used the plain template. Hit Rewrite to try AI again.'}
+            : `${fallbackExplanation(email.fallback_reason)} Hit Rewrite to try AI again.`}
           {/* The template ignores instructions entirely — say so rather than
               letting the user assume they were applied. */}
           {email.custom_instructions ? ' Your extra instructions were not applied.' : ''}
@@ -632,7 +656,10 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
           <div className="card" style={{ maxHeight: 160, overflowY: 'auto' }}>
             {emails.map((e) => (
               <div key={e.id} className="row-between" style={{ padding: '8px 14px', borderBottom: '1px solid var(--border)' }}>
-                <span className="small" style={{ fontWeight: 600 }}>{e.contact_name || e.contact_email}</span>
+                <span className="small" style={{ fontWeight: 600 }}>
+                  {e.contact_name || e.contact_email}
+                  {isRoleInbox(e) && <span className="tiny" style={{ color: 'var(--amber)' }}>{' '}· role inbox</span>}
+                </span>
                 <span className="tiny mono">
                   {e.contact_email}
                   {/* Which PDF this draft was written around — without it a
@@ -650,7 +677,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
             ))}
           </div>
           {claimConflicts.length > 0 && (
-            <div className="card card-pad stack" style={{ gap: 6, background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+            <div className="card card-pad stack" style={{ gap: 6, background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
               <div className="row small" style={{ gap: 6, fontWeight: 650 }}>
                 <AlertTriangle size={13} style={{ color: 'var(--amber)' }} />
                 {claimConflicts.length === 1 ? 'One of these emails says' : `${claimConflicts.length} of these emails say`}
@@ -676,7 +703,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
             </div>
           )}
           {unconfirmed.length > 0 && (
-            <div className="card card-pad stack" style={{ gap: 6, background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+            <div className="card card-pad stack" style={{ gap: 6, background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
               <div className="row small" style={{ gap: 6, fontWeight: 650 }}>
                 <AlertTriangle size={13} style={{ color: 'var(--amber)' }} />
                 {unconfirmed.length === 1 ? 'One of these was' : `${unconfirmed.length} of these were`} already handed to Gmail
@@ -744,7 +771,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
                   {failures.length > 0 && <> · <b style={{ color: 'var(--red)' }}>{failures.length} failed</b></>}
                 </div>
                 {unknownOut.length > 0 && (
-                  <div className="card card-pad" style={{ background: 'var(--amber-soft)', borderColor: '#f3dcb6' }}>
+                  <div className="card card-pad" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
                     <div className="small" style={{ fontWeight: 650, marginBottom: 6 }}>
                       We could not confirm whether these were delivered — check your
                       Gmail Sent folder before retrying:
@@ -753,7 +780,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
                   </div>
                 )}
                 {refused.length > 0 && (
-                  <div className="card card-pad" style={{ background: 'var(--red-soft)', borderColor: '#f5c6c6' }}>
+                  <div className="card card-pad" style={{ background: 'var(--red-soft)', borderColor: 'var(--red-border)' }}>
                     <div className="small" style={{ fontWeight: 650, marginBottom: 6 }}>
                       These did not go out — they stay in Drafts so you can retry:
                     </div>

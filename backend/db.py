@@ -1045,7 +1045,9 @@ class Database:
     def get_email(self, email_id: str) -> Optional[Dict[str, Any]]:
         return self._annotate_email(self.query_one(
             f"""SELECT e.*, ct.name AS contact_name, ct.email AS contact_email,
-                      ct.role AS contact_role, c.name AS company_name,
+                      ct.role AS contact_role,
+                      ct.email_kind AS contact_email_kind,
+                      c.name AS company_name,
                       {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
                       {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
                       {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
@@ -1079,7 +1081,8 @@ class Database:
     def list_emails(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         sql = f"""
             SELECT e.*, ct.name AS contact_name, ct.email AS contact_email,
-                   ct.role AS contact_role, c.name AS company_name,
+                   ct.role AS contact_role, ct.email_kind AS contact_email_kind,
+                   c.name AS company_name,
                    {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
                    {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
                    {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
@@ -1617,6 +1620,71 @@ def repair_speculative_company_summaries(db: "Database") -> int:
                      f"Moved {len(rows)} unscraped company description(s) out of research")
         print(f"[startup] moved {len(rows)} speculative company summary/-ies to notes")
     return len(rows)
+
+
+def repair_contact_email_kinds(db: "Database") -> int:
+    """Classify contacts that predate `email_kind`.
+
+    Ingest rejects role inboxes (hello@, info@, careers@) and the outreach
+    ranking puts named people first, but both read `contacts.email_kind`.
+    Anything imported or scraped before that column existed still carries
+    'unknown', so info@acme.com is indistinguishable from a named human to
+    every filter, chip and sort in the app — and gets an email written to it.
+
+    **This never assigns 'personal', on purpose.** 'personal' means the local
+    part was checked against a name that came from somewhere other than the
+    address itself. For these rows that provenance is not merely unset, it is
+    unrecordable — there is no name_from_email column, and discovery stores
+    `name = candidate.name or _guess_name_from_email(local)`. So a legacy row
+    can perfectly well be name='Press Releases' / press.releases@acme.com,
+    where the name was *derived from* the local part. Comparing the two then
+    matches circularly and promotes a role inbox to the strongest verdict —
+    the exact opposite of the point, and it would list the address under the
+    UI's "Personal email" filter while withholding the "role inbox" chip.
+
+    Passing name_from_email=True takes the conservative branch: a match that
+    could be circular is not treated as evidence. The result is that this
+    under-claims (a genuine jane.doe@ lands on 'named_unmatched' rather than
+    'personal') and never over-claims. Re-researching a company annotates
+    contacts properly and upgrades them.
+
+    Classification is pure string work — no DNS — so this is safe on every
+    startup and offline. It never sets `email_verified`, which means "MX was
+    actually confirmed" and cannot be inferred from an address.
+    """
+    from contact_verify import is_generic_inbox, verify_email
+
+    rows = db.query(
+        # `email <> ''` alone lets through junk like 'n/a' that can never be
+        # classified, which would then be re-examined on every startup forever.
+        "SELECT id, name, email FROM contacts "
+        "WHERE email IS NOT NULL AND email LIKE '%_@_%' "
+        "AND (email_kind IS NULL OR email_kind = 'unknown')"
+    )
+    kinds: Dict[str, int] = {}
+    for row in rows:
+        verdict = verify_email(row["email"], row["name"], check_mx=False,
+                               name_from_email=True)
+        kind = verdict["email_kind"]
+        # A local outside GENERIC_LOCALS (legal@, hiring@, noreply@) with no
+        # usable name lands on 'named_unmatched'. contact_ingest rejects that
+        # case outright rather than let it pass as a person; with nothing to
+        # associate the mailbox with, treat it as the role inbox it is.
+        if kind == "named_unmatched" and not (row["name"] or "").strip():
+            kind = "generic"
+        elif kind == "named_unmatched" and is_generic_inbox(row["email"]):
+            kind = "generic"
+        if kind == "unknown":
+            continue
+        db.update_contact(row["id"], {"email_kind": kind})
+        kinds[kind] = kinds.get(kind, 0) + 1
+    total = sum(kinds.values())
+    if total:
+        summary = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+        db.log_event("system", None, "repair",
+                     f"Classified {total} unclassified contact address(es): {summary}")
+        print(f"[startup] classified {total} contact address(es): {summary}")
+    return total
 
 
 def repair_contact_reply_status(db: "Database") -> int:

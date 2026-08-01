@@ -18,7 +18,9 @@ ddgs>=9.0                    # duckduckgo-search is deprecated and returns 0 res
 playwright>=1.45             # optional at runtime; used only for JS-shell pages
 
 # --- LLM providers (only one key is needed at runtime) ---
-google-generativeai>=0.8
+# google-generativeai is end-of-life and prints a deprecation warning on
+# import; google-genai is its supported replacement.
+google-genai>=1.0
 openai>=1.40                 # also used for OpenRouter (OpenAI-compatible API)
 
 # --- Gmail ---

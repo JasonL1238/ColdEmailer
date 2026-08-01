@@ -6,7 +6,7 @@ import {
 } from 'lucide-react'
 import { companiesAPI, deepResearchAPI, errMessage } from '../api'
 import {
-  Button, Chip, EmptyState, ProgressBar, Spinner, contactStatusMeta, timeAgo,
+  Button, Chip, EmptyState, ProgressBar, Segmented, Spinner, contactStatusMeta, timeAgo,
 } from '../ui'
 import { useApp } from '../App'
 import CompanyDrawer from '../components/CompanyDrawer'
@@ -43,8 +43,12 @@ export default function DeepDive() {
   const [historyLoaded, setHistoryLoaded] = useState(false)
   const [consolidated, setConsolidated] = useState([])
   const [expanded, setExpanded] = useState(() => new Set())
+  const [browseQuery, setBrowseQuery] = useState('')
+  const [showAllCompanies, setShowAllCompanies] = useState(false)
+  const [resultCompact, setResultCompact] = useState(false)
   const pollRef = useRef(null)
   const loadHistoryRef = useRef(null)
+  const loadConsolidatedRef = useRef(null)
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) clearInterval(pollRef.current)
@@ -72,6 +76,8 @@ export default function DeepDive() {
         if (['done', 'failed', 'cancelled'].includes(data.status)) {
           stopPolling()
           loadHistoryRef.current?.()
+          // Fold the finished run into its company's merged section.
+          loadConsolidatedRef.current?.()
           if (announce && !announced) {
             announced = true
             if (data.status === 'done') {
@@ -145,14 +151,18 @@ export default function DeepDive() {
     } finally {
       setHistoryLoaded(true)
     }
-    // Separate try: a consolidated failure must not blank the run history.
+  }, [pollRun])
+
+  // Kept separate from loadHistory: a consolidated failure must not blank the
+  // run list, and this refetches on its own when the search/scope changes.
+  const loadConsolidated = useCallback(async (query, all) => {
     try {
-      const { data } = await deepResearchAPI.consolidated()
+      const { data } = await deepResearchAPI.consolidated(query, all)
       setConsolidated(Array.isArray(data) ? data : [])
     } catch {
       /* keep prior UI */
     }
-  }, [pollRun])
+  }, [])
 
   const toggleExpanded = useCallback((id) => {
     setExpanded((prev) => {
@@ -166,6 +176,16 @@ export default function DeepDive() {
   useEffect(() => {
     loadHistoryRef.current = loadHistory
   }, [loadHistory])
+
+  useEffect(() => {
+    loadConsolidatedRef.current = () => loadConsolidated(browseQuery, showAllCompanies)
+  }, [loadConsolidated, browseQuery, showAllCompanies])
+
+  // Debounced so typing in the company search does not fire a request per key.
+  useEffect(() => {
+    const t = setTimeout(() => loadConsolidated(browseQuery, showAllCompanies), 220)
+    return () => clearTimeout(t)
+  }, [loadConsolidated, browseQuery, showAllCompanies])
 
   useEffect(() => {
     loadHistory()
@@ -506,6 +526,14 @@ export default function DeepDive() {
               </div>
             </div>
             <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+              <Button
+                size="sm"
+                icon={resultCompact ? ChevronRight : ChevronDown}
+                onClick={() => setResultCompact((v) => !v)}
+                title={resultCompact ? 'Show the full result' : 'Collapse to the summary line'}
+              >
+                {resultCompact ? 'Expand' : 'Compact'}
+              </Button>
               {companyId && (
                 <Button size="sm" onClick={() => openCompany(companyId)}>
                   Open company
@@ -552,6 +580,8 @@ export default function DeepDive() {
             </div>
           </div>
 
+          {/* Compact keeps the header, actions and any error — it only hides
+              the long intel and contact lists. */}
           {(intel.error || intel.last_error) ? (
             <div className="card card-pad" style={{ borderColor: 'var(--amber)' }}>
               <div className="row" style={{ gap: 8 }}>
@@ -559,7 +589,7 @@ export default function DeepDive() {
                 <div className="small">{intel.error || intel.last_error}</div>
               </div>
             </div>
-          ) : (
+          ) : resultCompact ? null : (
             <div className="deep-grid">
               <IntelBlock title="Key changes" items={intel.key_changes} />
               <IntelBlock title="Improvements" items={intel.improvements} />
@@ -568,7 +598,7 @@ export default function DeepDive() {
             </div>
           )}
 
-          {(intel.talking_points || []).length > 0 && (
+          {!resultCompact && (intel.talking_points || []).length > 0 && (
             <div className="card card-pad">
               <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
                 Interview talking points
@@ -579,6 +609,7 @@ export default function DeepDive() {
             </div>
           )}
 
+          {!resultCompact && (
           <div className="card card-pad">
             <div className="row-between" style={{ marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
               <div className="row" style={{ gap: 8 }}>
@@ -654,6 +685,7 @@ export default function DeepDive() {
               </div>
             )}
           </div>
+          )}
         </div>
       )}
 
@@ -665,17 +697,48 @@ export default function DeepDive() {
         />
       )}
 
-      {consolidated.length > 0 && (
+      {(consolidated.length > 0 || browseQuery || showAllCompanies) && (
         <div style={{ marginBottom: 22 }}>
-          <div className="row-between" style={{ marginBottom: 10 }}>
+          <div className="row-between" style={{ marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
             <div className="row" style={{ gap: 8 }}>
               <Layers size={14} />
               <div style={{ fontWeight: 650, fontSize: 13.5 }}>By company</div>
             </div>
             <div className="tiny muted">
-              {consolidated.length} researched · every dive merged
+              {consolidated.length} {showAllCompanies ? 'companies' : 'researched'}
+              {' · every dive merged'}
             </div>
           </div>
+
+          <div className="row" style={{ gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
+            <div className="discover-search-wrap" style={{ flex: '1 1 240px', minWidth: 0 }}>
+              <Search size={16} />
+              <input
+                className="discover-input"
+                type="search"
+                placeholder="Search companies…"
+                value={browseQuery}
+                onChange={(e) => setBrowseQuery(e.target.value)}
+              />
+            </div>
+            <Segmented
+              value={showAllCompanies ? 'all' : 'dived'}
+              onChange={(v) => setShowAllCompanies(v === 'all')}
+              options={[
+                { value: 'dived', label: 'Deep dived' },
+                { value: 'all', label: 'All companies' },
+              ]}
+            />
+          </div>
+
+          {consolidated.length === 0 && (
+            <div className="small muted" style={{ padding: '10px 2px' }}>
+              {browseQuery
+                ? `No companies match “${browseQuery}”.`
+                : 'No companies yet.'}
+            </div>
+          )}
+
           <div className="stack" style={{ gap: 8 }}>
             {consolidated.map((entry) => (
               <CompanyDigest
@@ -830,7 +893,9 @@ function CompanyDigest({ entry, open, onToggle, onOpenCompany, onCompose, onReru
           <div style={{ minWidth: 0 }}>
             <div style={{ fontWeight: 650, fontSize: 14 }}>{company.name}</div>
             <div className="tiny muted" style={{ marginTop: 2 }}>
-              {entry.run_count} {entry.run_count === 1 ? 'dive' : 'dives'}
+              {entry.run_count === 0
+                ? 'Never deep dived'
+                : `${entry.run_count} ${entry.run_count === 1 ? 'dive' : 'dives'}`}
               {' · '}{contacts?.total ?? 0} contacts
               {contacts?.matched ? ` · ${contacts.matched} matched` : ''}
               {bulletTotal ? ` · ${bulletTotal} findings` : ''}
@@ -839,7 +904,10 @@ function CompanyDigest({ entry, open, onToggle, onOpenCompany, onCompose, onReru
           </div>
         </div>
         <div className="row" style={{ gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-          {criteria.length === 0 && <Chip tone="gray">No criteria</Chip>}
+          {entry.run_count === 0 && <Chip tone="gray">Not dived</Chip>}
+          {entry.run_count > 0 && criteria.length === 0 && (
+            <Chip tone="gray">No criteria</Chip>
+          )}
           {criteria.slice(0, 3).map((c) => (
             <Chip key={c} tone="violet" title={c}>{c}</Chip>
           ))}
@@ -927,7 +995,11 @@ function CompanyDigest({ entry, open, onToggle, onOpenCompany, onCompose, onReru
           )}
 
           {sections.length === 0 && !contacts?.total && (
-            <div className="small muted">No grounded findings or contacts saved yet.</div>
+            <div className="small muted">
+              {entry.run_count === 0
+                ? 'Not deep dived yet — “Dive again” loads this company into the form above.'
+                : 'No grounded findings or contacts saved yet.'}
+            </div>
           )}
         </div>
       )}
@@ -968,21 +1040,58 @@ function ContactGroup({ label, people, onCompose, muted }) {
           </button>
         )}
       </div>
-      <div className="stack" style={{ gap: 3 }}>
-        {people.map((p) => (
-          <div key={p.id} className="row-between tiny">
-            <span style={{ minWidth: 0 }}>
-              <strong>{p.name || p.email || 'Unnamed'}</strong>
-              {p.role && <span className="muted"> · {p.role}</span>}
-            </span>
-            <span className="row" style={{ gap: 5 }}>
-              {p.email
-                ? <Chip tone="green">Email</Chip>
-                : p.linkedin_url ? <Chip tone="accent">LinkedIn</Chip>
-                  : <Chip tone="gray">No channel</Chip>}
-            </span>
-          </div>
-        ))}
+      <div className="stack" style={{ gap: 6 }}>
+        {people.map((p) => <ContactRow key={p.id} contact={p} onCompose={onCompose} />)}
+      </div>
+    </div>
+  )
+}
+
+/** A person with the channel you would actually reach them on, spelled out. */
+function ContactRow({ contact: p, onCompose }) {
+  const linkedinLabel = (p.linkedin_url || '')
+    .replace(/^https?:\/\/(www\.)?linkedin\.com\/in\//i, '')
+    .replace(/\/$/, '')
+  return (
+    <div className="row-between" style={{ gap: 10, alignItems: 'flex-start' }}>
+      <div style={{ minWidth: 0 }}>
+        <div className="tiny">
+          <strong>{p.name || p.email || 'Unnamed'}</strong>
+          {p.role && <span className="muted"> · {p.role}</span>}
+        </div>
+        <div className="row" style={{ gap: 10, flexWrap: 'wrap', marginTop: 2 }}>
+          {p.email && (
+            <a className="tiny mono linkish" href={`mailto:${p.email}`}>{p.email}</a>
+          )}
+          {p.linkedin_url && (
+            <a
+              className="tiny linkish"
+              href={p.linkedin_url}
+              target="_blank"
+              rel="noreferrer"
+              title={p.linkedin_url}
+            >
+              in/{linkedinLabel}
+            </a>
+          )}
+          {!p.email && !p.linkedin_url && (
+            <span className="tiny muted">No email or LinkedIn found</span>
+          )}
+        </div>
+      </div>
+      <div className="row" style={{ gap: 5, flexShrink: 0 }}>
+        {p.email_verified && <Chip tone="green">Verified</Chip>}
+        {!p.email && p.linkedin_url && <Chip tone="accent">LinkedIn only</Chip>}
+        {onCompose && p.email && (
+          <button
+            type="button"
+            className="icon-btn"
+            title="Draft an email to this person"
+            onClick={() => onCompose([p.id])}
+          >
+            <Sparkles size={13} />
+          </button>
+        )}
       </div>
     </div>
   )

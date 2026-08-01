@@ -83,11 +83,12 @@ export default function App() {
         toastOptions={{
           className: 'toast-base',
           style: {
-            background: '#1a1a1e', color: '#fff', borderRadius: 10,
-            boxShadow: '0 8px 30px rgba(0,0,0,0.25)', maxWidth: 420,
+            background: '#171b22', color: '#eceae4', borderRadius: 12,
+            border: '1px solid #2a3140',
+            boxShadow: '0 12px 40px rgba(0,0,0,0.45)', maxWidth: 420,
           },
-          success: { iconTheme: { primary: '#4ade80', secondary: '#1a1a1e' } },
-          error: { iconTheme: { primary: '#f87171', secondary: '#1a1a1e' }, duration: 5000 },
+          success: { iconTheme: { primary: '#b8e62e', secondary: '#0b0d10' } },
+          error: { iconTheme: { primary: '#f87171', secondary: '#0b0d10' }, duration: 5000 },
         }}
       />
       <div className="shell">

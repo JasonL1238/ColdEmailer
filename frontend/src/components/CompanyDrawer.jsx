@@ -13,7 +13,10 @@ export const SCRAPE_STATUS = {
   scraped: { label: 'Contacts found', tone: 'green' },
   pending: { label: 'Not researched', tone: 'gray' },
   scraping: { label: 'Researching…', tone: 'accent' },
-  no_emails_found: { label: 'No contacts found', tone: 'amber' },
+  // Names the thing that is actually missing. A deep dive routinely saves
+  // LinkedIn-only people here, so "No contacts found" read as a flat lie next
+  // to a list of 28 of them.
+  no_emails_found: { label: 'No email addresses', tone: 'amber' },
   no_website: { label: 'No website', tone: 'gray' },
   wrong_site: { label: 'Wrong site found', tone: 'amber' },
   scrape_failed: { label: 'Research failed', tone: 'red' },
