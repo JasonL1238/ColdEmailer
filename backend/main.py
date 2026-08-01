@@ -41,12 +41,13 @@ from generation import GenerationBusy, GenerationService
 from models import (
     BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
     ContactCreate, ContactUpdate, DeepResearchRequest, DiscoveryRequest,
-    CadenceUpdate,
+    CadenceUpdate, SendWindowUpdate,
     EmailUpdate, EnrichRequest, GenerateRequest, ProfileUpdate, ResumeUpdate,
     SendRequest, LinkedInDraftRequest,
 )
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
+import send_window
 from response_checker import ResponseChecker
 from linkedin_outreach import draft_linkedin_message
 
@@ -2258,6 +2259,22 @@ def send_emails(payload: SendRequest):
                 400, f"{len(conflicts)} of these emails promise an attachment that "
                      f"these send options would change: {listed}. Rewrite the "
                      f"draft, fix the attachment, or confirm the change.")
+    # Scheduling needs BOTH gates: the window switched on in Settings, and this
+    # batch asking for it. Either alone does nothing — that is the whole
+    # arrangement that keeps a background thread from mailing real people
+    # before anyone has looked at it.
+    scheduled_for = None
+    if payload.schedule == "next_window":
+        window = db.get_send_window()
+        if not window.get("enabled"):
+            raise HTTPException(
+                400, "Scheduled sending is switched off. Turn on the sending "
+                     "window in Settings first — until then nothing sends "
+                     "itself.")
+        scheduled_for = send_window.next_opening(window)
+        if scheduled_for is None:
+            raise HTTPException(400, "That sending window never opens. Check "
+                                     "the days and hours in Settings.")
     can, err = rate_limiter.can_send_email()
     if not can:
         raise HTTPException(429, err)
@@ -2278,6 +2295,24 @@ def send_emails(payload: SendRequest):
         job = db.create_job("send", {"email_ids": sendable})
         db.update_job(job["id"], progress_total=len(sendable), stage="Sending")
         from_email = (payload.from_email or "").strip() or (db.get_profile().get("email") or "me")
+        if scheduled_for is not None:
+            # Both gates passed: the window is enabled *and* this batch asked
+            # to be scheduled. Stamp the rows and hand them to the scheduler
+            # rather than to Gmail. Nothing is sent in this request.
+            stamp = scheduled_for.replace(tzinfo=None).isoformat(timespec="seconds")
+            for eid in sendable:
+                db.update_email(eid, {"status": "approved",
+                                      "scheduled_at": stamp,
+                                      "scheduled_by_job": job["id"]})
+            db.update_job(job["id"], stage=f"Scheduled for {stamp}",
+                          progress_current=0)
+            db.finish_job(job["id"], "done",
+                          {"sent": 0, "failed": 0, "scheduled": len(sendable),
+                           "scheduled_at": stamp, "results": []})
+            db.log_event("job", job["id"], "send_scheduled",
+                         f"{len(sendable)} email(s) → {stamp}")
+            _send_lock.release()
+            return _parse_job(db.get_job(job["id"]))
         threading.Thread(
             target=_send_batch_job,
             args=(job["id"], sendable, payload.resume_id, payload.attach_resume,
@@ -2290,6 +2325,121 @@ def send_emails(payload: SendRequest):
         _send_lock.release()
         raise
     return _parse_job(db.get_job(job["id"]))
+
+
+_SCHEDULER_TICK_SECONDS = int(os.getenv("COLD_SCHEDULER_TICK_SECONDS", "60"))
+
+
+def scheduled_send_sweep() -> Optional[str]:
+    """One pass of the scheduler. Returns the job id it started, or None.
+
+    Split out from the loop so it can be driven directly by a test — a
+    behaviour that hands real email to Gmail with nobody watching should not
+    only be reachable through a sleeping thread.
+
+    Refuses in every uncertain case: window off, window shut, nothing due,
+    another batch already running, Gmail not authenticated. Doing nothing this
+    minute costs a minute; sending when we should not costs a real person.
+    """
+    window = db.get_send_window()
+    if not window.get("enabled"):
+        return None
+    if not send_window.is_open(window):
+        return None
+    due = db.query(
+        "SELECT id, scheduled_by_job FROM emails "
+        "WHERE scheduled_at IS NOT NULL AND scheduled_at <= ? "
+        "  AND status IN ('draft', 'approved') "
+        "  AND sent_at IS NULL AND gmail_message_id IS NULL "
+        "ORDER BY scheduled_at ASC", (now_iso(),))
+    if not due:
+        return None
+    # Group by the batch that scheduled them, so each keeps the attachment and
+    # resume options the user chose when they queued it. Send the oldest batch
+    # this tick and leave the rest for the next one — one send batch at a time
+    # is an invariant of this app, not an accident.
+    batch_key = due[0]["scheduled_by_job"]
+    ids = [r["id"] for r in due if r["scheduled_by_job"] == batch_key]
+
+    if not _send_lock.acquire(blocking=False):
+        return None                      # a manual batch is running
+    try:
+        email_sender.authenticate()
+    except Exception as e:
+        _send_lock.release()
+        print(f"[scheduler] Gmail not authenticated, leaving {len(ids)} queued: {e}")
+        return None
+    try:
+        origin = _parse_job(db.get_job(batch_key)) if batch_key else None
+        options = (origin or {}).get("payload") or {}
+        # Clear the stamp before handing over. If this process dies mid-batch
+        # the rows become ordinary drafts the user can look at, rather than
+        # something a later sweep picks up and sends again.
+        for eid in ids:
+            db.update_email(eid, {"scheduled_at": None})
+        job = db.create_job("send", {"email_ids": ids, "scheduled_from": batch_key})
+        db.update_job(job["id"], progress_total=len(ids),
+                      stage="Sending (scheduled)")
+        threading.Thread(
+            target=_send_batch_job,
+            args=(job["id"], ids, options.get("resume_id"),
+                  bool(options.get("attach_resume", True)),
+                  options.get("from_email") or (db.get_profile().get("email") or "me"),
+                  bool(options.get("confirm_resend"))),
+            daemon=True,
+        ).start()
+        return job["id"]
+    except Exception:
+        _send_lock.release()
+        raise
+
+
+def _scheduler_loop():
+    import time as _t
+    while True:
+        try:
+            scheduled_send_sweep()
+        except Exception as e:                       # never let the loop die
+            print(f"[scheduler] sweep failed: {e}")
+        _t.sleep(_SCHEDULER_TICK_SECONDS)
+
+
+@app.get("/api/send-window")
+async def get_send_window():
+    window = db.get_send_window()
+    pending = db.query_one(
+        "SELECT COUNT(*) AS n, MIN(scheduled_at) AS next FROM emails "
+        "WHERE scheduled_at IS NOT NULL AND status IN ('draft', 'approved')")
+    upcoming = send_window.next_opening(window)
+    return {**window,
+            "description": send_window.describe(window),
+            "open_now": send_window.is_open(window) if window["enabled"] else None,
+            "next_opening": (upcoming.replace(tzinfo=None).isoformat(timespec="seconds")
+                             if upcoming else None),
+            "detected_timezone": send_window.local_timezone_name(),
+            "scheduled_count": (pending or {}).get("n") or 0,
+            "next_scheduled_at": (pending or {}).get("next")}
+
+
+@app.put("/api/send-window")
+async def set_send_window(payload: SendWindowUpdate):
+    window = db.update_send_window(payload.model_dump())
+    db.log_event("settings", "send_window", "send_window_updated",
+                 send_window.describe(window))
+    return {**window, "description": send_window.describe(window)}
+
+
+@app.post("/api/emails/unschedule")
+async def unschedule_emails(payload: BulkIds):
+    """Take queued messages back out of the scheduler. They stay as drafts."""
+    cleared = 0
+    for email_id in payload.ids:
+        row = db.get_email(email_id)
+        if row and row.get("scheduled_at") and not _already_delivered(row):
+            db.update_email(email_id, {"scheduled_at": None,
+                                       "scheduled_by_job": None})
+            cleared += 1
+    return {"success": True, "cleared": cleared}
 
 
 @app.post("/api/emails/send/{job_id}/cancel")
@@ -2494,3 +2644,14 @@ async def gmail_status():
 async def gmail_disconnect():
     removed = email_sender.disconnect()
     return {"success": True, "token_removed": removed}
+
+
+# The send scheduler runs from startup but does nothing until the sending
+# window is switched on, so enabling it in Settings takes effect without a
+# restart. Started here, at the bottom, because it references handlers defined
+# above. Off under pytest: a thread that hands mail to Gmail has no business
+# running inside a test suite, however inert it is meant to be — tests drive
+# `scheduled_send_sweep()` directly instead.
+if not os.getenv("COLD_DISABLE_SCHEDULER"):
+    threading.Thread(target=_scheduler_loop, daemon=True,
+                     name="send-scheduler").start()

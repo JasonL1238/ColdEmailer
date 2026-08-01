@@ -70,6 +70,7 @@ vi.mock('../../src/api', () => ({
     send: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })),
   },
   resumesAPI: { list: vi.fn(() => Promise.resolve({ data: [] })) },
+  sendWindowAPI: { get: vi.fn(() => Promise.resolve({ data: { enabled: false } })) },
   jobsAPI: { get: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })) },
 }))
 vi.mock('../../src/App', () => ({ useApp: () => ({ navigate: vi.fn(), settings: {} }) }))

@@ -5,7 +5,7 @@ import {
   Mail, Send, Trash2, RefreshCw, Check, Clock, Paperclip,
   AlertTriangle, MessageSquare, Sparkles, CornerUpLeft,
 } from 'lucide-react'
-import { emailsAPI, resumesAPI, errMessage } from '../api'
+import { emailsAPI, resumesAPI, sendWindowAPI, errMessage } from '../api'
 import {
   Button, Chip, EmptyState, Modal, ProgressBar, Segmented, Spinner,
   timeAgo, useJobPolling, EMAIL_TYPE_META,
@@ -64,6 +64,18 @@ export const addressWarning = (e) => {
     }
   }
   return null
+}
+
+/* "Tue 8:00am" — short enough for a button, specific enough that the user
+   knows what they are agreeing to before mail leaves without them. */
+export const whenLabel = (iso) => {
+  if (!iso) return ''
+  const at = new Date(iso)
+  if (Number.isNaN(at.getTime())) return ''
+  const today = new Date()
+  const sameDay = at.toDateString() === today.toDateString()
+  const time = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  return sameDay ? time : `${at.toLocaleDateString([], { weekday: 'short' })} ${time}`
 }
 
 export const hasVerifiedReply = (e) => !!e.has_response && !e.reply_unverified
@@ -705,6 +717,10 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
   const [phase, setPhase] = useState('confirm')  // confirm | sending | done
   const [confirmResend, setConfirmResend] = useState(false)
   const [confirmAttachment, setConfirmAttachment] = useState(false)
+  // null until it loads. Absent or disabled means the schedule button never
+  // renders — the same first gate the endpoint enforces, so the UI cannot
+  // offer something the server will refuse.
+  const [sendWindow, setSendWindow] = useState(null)
   const unconfirmed = emails.filter(isUnconfirmed)
 
   // The body's "my resume is attached" was decided once, when the draft was
@@ -752,9 +768,16 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
   useEffect(() => {
     resumesAPI.list().then(({ data }) => setResumeList(data || []))
       .catch(() => setResumeList([]))
+    // Guarded, not just catch()ed: against a backend that predates this
+    // endpoint the whole send dialog must still open. Losing the schedule
+    // button is a missing convenience; losing the dialog is losing the ability
+    // to send at all.
+    try {
+      sendWindowAPI.get().then(({ data }) => setSendWindow(data)).catch(() => {})
+    } catch { /* no sending window available — send-now only */ }
   }, [])
 
-  const send = async () => {
+  const send = async (schedule = null) => {
     setPhase('sending')
     try {
       const { data } = await emailsAPI.send({
@@ -763,7 +786,18 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
         resume_id: resumeId || null,
         confirm_resend: confirmResend,
         confirm_attachment_change: confirmAttachment,
+        // Omitted entirely unless the user picked "Send at…". This is the
+        // per-batch half of the opt-in that keeps mail from going out
+        // unattended, so it must never be implied by anything else.
+        ...(schedule ? { schedule } : {}),
       })
+      if (schedule) {
+        const when = data?.result?.scheduled_at
+        toast.success(`Queued — sending ${when ? whenLabel(when) : 'at the next window'}`)
+        setPhase('done')
+        onSent()
+        return
+      }
       track(data)
     } catch (e) {
       setPhase('confirm')
@@ -787,7 +821,17 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
       footer={phase === 'confirm' ? (
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" icon={Send} onClick={send}
+          {/* Only offered when the sending window is switched on. Without that
+              first gate this button would queue mail nothing will ever pick
+              up, and the endpoint rightly refuses it. */}
+          {sendWindow?.enabled && !sendWindow.open_now && (
+            <Button icon={Clock} onClick={() => send('next_window')}
+              disabled={needsAttachmentAck}
+              title={`Hold until business hours: ${sendWindow.description}`}>
+              Send at {whenLabel(sendWindow.next_opening) || 'next window'}
+            </Button>
+          )}
+          <Button variant="primary" icon={Send} onClick={() => send()}
             disabled={needsAttachmentAck}
             title={needsAttachmentAck
               ? 'These drafts promise an attachment these options would change'

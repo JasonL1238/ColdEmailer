@@ -1,8 +1,8 @@
 /* Settings: sender profile, Gmail connection, AI provider, limits */
 import { useEffect, useState } from 'react'
 import toast from 'react-hot-toast'
-import { Save, Unplug, CheckCircle2, XCircle, Sparkles, Mail, CornerUpLeft, Plus } from 'lucide-react'
-import { settingsAPI, gmailAPI, cadenceAPI, errMessage } from '../api'
+import { Save, Unplug, CheckCircle2, XCircle, Sparkles, Mail, CornerUpLeft, Plus, Clock } from 'lucide-react'
+import { settingsAPI, gmailAPI, cadenceAPI, sendWindowAPI, errMessage } from '../api'
 import { Button, Chip } from '../ui'
 import { useApp } from '../App'
 
@@ -152,8 +152,136 @@ export default function Settings() {
       </div>
 
       <FollowUpCadence />
+      <SendWindow />
     </div>
   )
+}
+
+const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+/* Business hours for sending.
+
+   This is the only setting in the app that lets mail leave without anyone
+   watching, so the card says so plainly and ships switched off. Turning it on
+   is one half of the permission; the other half is picking "Send at…" on a
+   specific batch, which is the only thing that ever queues anything. */
+function SendWindow() {
+  const [state, setState] = useState(null)      // server truth + derived fields
+  const [draft, setDraft] = useState(null)
+  const [saving, setSaving] = useState(false)
+
+  const load = () => sendWindowAPI.get()
+    .then(({ data }) => {
+      setState(data)
+      setDraft({
+        enabled: !!data.enabled, timezone: data.timezone || '',
+        days: [...(data.days || [])],
+        start_hour: data.start_hour, end_hour: data.end_hour,
+      })
+    })
+    .catch(() => {})
+
+  useEffect(() => { load() }, [])
+
+  if (!draft) return null
+
+  const toggleDay = (d) => setDraft((s) => ({
+    ...s,
+    days: s.days.includes(d) ? s.days.filter((x) => x !== d) : [...s.days, d].sort(),
+  }))
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      await sendWindowAPI.update(draft)
+      await load()
+      toast.success('Sending window saved')
+    } catch (e) { toast.error(errMessage(e)) }
+    finally { setSaving(false) }
+  }
+
+  return (
+    <div className="card card-pad stack mt-16" style={{ gap: 12 }}>
+      <div className="row-between">
+        <div className="row" style={{ gap: 8 }}>
+          <Clock size={16} style={{ color: 'var(--text-2)' }} />
+          <b>Sending window</b>
+        </div>
+        <label className="row small" style={{ gap: 6, cursor: 'pointer' }}>
+          <input type="checkbox" className="checkbox" checked={draft.enabled}
+            onChange={(e) => setDraft((s) => ({ ...s, enabled: e.target.checked }))} />
+          Allow scheduled sending
+        </label>
+      </div>
+
+      <div className="small muted">{state?.description}</div>
+
+      {draft.enabled && (
+        <>
+          <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+            {DAY_NAMES.map((name, i) => (
+              <button key={name} type="button"
+                className={`chip ${draft.days.includes(i) ? 'chip-sky' : ''}`}
+                style={{ cursor: 'pointer', border: '1px solid var(--border)' }}
+                onClick={() => toggleDay(i)}>
+                {name}
+              </button>
+            ))}
+          </div>
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            <span className="tiny muted">Between</span>
+            <input className="input" type="number" min={0} max={23} style={{ width: 66 }}
+              value={draft.start_hour}
+              onChange={(e) => setDraft((s) => ({
+                ...s, start_hour: clampHour(e.target.value, s.start_hour) }))} />
+            <span className="tiny muted">and</span>
+            <input className="input" type="number" min={1} max={23} style={{ width: 66 }}
+              value={draft.end_hour}
+              onChange={(e) => setDraft((s) => ({
+                ...s, end_hour: clampHour(e.target.value, s.end_hour) }))} />
+            <span className="tiny muted">o&apos;clock, timezone</span>
+            <input className="input" style={{ width: 190 }}
+              placeholder={state?.detected_timezone || 'your local time'}
+              value={draft.timezone}
+              onChange={(e) => setDraft((s) => ({ ...s, timezone: e.target.value }))} />
+          </div>
+          <div className="tiny muted">
+            Leave the timezone blank to use this machine&apos;s clock, or give an
+            IANA name like <span className="mono">America/New_York</span>. These
+            are <b>your</b> business hours, not the recipient&apos;s — we rarely
+            know where they are, and a confident 9am in the wrong zone is 4am
+            somewhere real.
+          </div>
+        </>
+      )}
+
+      <div className="tiny muted">
+        Switching this on does not schedule anything by itself. It adds a
+        <b> Send at…</b> button to the send dialog; a batch only waits if you
+        pick it. That is the one path where email leaves without you watching.
+      </div>
+
+      {state?.scheduled_count > 0 && (
+        <div className="small" style={{ color: 'var(--amber)' }}>
+          {state.scheduled_count} email{state.scheduled_count === 1 ? '' : 's'} queued,
+          next at {state.next_scheduled_at}.
+        </div>
+      )}
+
+      <div>
+        <Button size="sm" variant="primary" icon={Save} onClick={save} disabled={saving}>
+          {saving ? 'Saving…' : 'Save window'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+// Clamped on entry, not on save: a value that decides when real mail leaves
+// must never be displayed as one thing and stored as another.
+const clampHour = (value, fallback) => {
+  const n = Math.round(Number(value))
+  return Number.isFinite(n) ? Math.max(0, Math.min(23, n)) : fallback
 }
 
 /* How many times one silent contact gets chased, and how long the gaps are.

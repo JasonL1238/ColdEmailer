@@ -22,6 +22,14 @@ vi.mock('../../src/api', () => ({
   settingsAPI: { update: vi.fn(() => Promise.resolve({ data: {} })) },
   gmailAPI: { disconnect: vi.fn() },
   cadenceAPI: { update: updateCadence },
+  sendWindowAPI: {
+    get: vi.fn(() => Promise.resolve({ data: {
+      enabled: false, timezone: '', days: [0, 1, 2, 3, 4], start_hour: 8,
+      end_hour: 17, description: 'Sending is not held for business hours.',
+      scheduled_count: 0,
+    } })),
+    update: vi.fn((p) => Promise.resolve({ data: p })),
+  },
 }))
 vi.mock('../../src/App', () => ({ useApp: () => ({ settings, refreshSettings }) }))
 vi.mock('react-hot-toast', () => ({

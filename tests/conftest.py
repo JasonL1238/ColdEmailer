@@ -22,6 +22,11 @@ os.environ['COLD_DB_PATH'] = os.path.join(_tmp_data, "test.db")
 # a fresh temp DB has none — every suite run re-imported the user's real PDFs
 # and wrote new content-hashed copies into their real backend/data/resumes.
 os.environ['COLD_RESUME_DIR'] = os.path.join(_tmp_data, "resumes")
+# Importing `main` starts the send scheduler. It no-ops while the sending
+# window is off (the shipped default), but a background thread whose job is
+# to hand email to Gmail does not belong in a test process at all. Tests call
+# main.scheduled_send_sweep() directly, which is the honest way to test it.
+os.environ['COLD_DISABLE_SCHEDULER'] = '1'
 # Keep Gmail/OAuth paths pointed at nonexistent files so nothing can
 # accidentally authenticate or send during a test run.
 os.environ.setdefault('CREDENTIALS_JSON_PATH', os.path.join(_tmp_data, "no-credentials.json"))

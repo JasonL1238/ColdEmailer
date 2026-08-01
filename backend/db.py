@@ -15,6 +15,8 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from send_window import SEND_WINDOW_DEFAULT, normalize_send_window
+
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, "data", "coldemailer.db")
 
@@ -170,7 +172,14 @@ _ADDED_COLUMNS = {
     "emails": {"send_attempted_at": "TEXT", "send_attempt_error": "TEXT",
                "response_verified_at": "TEXT", "recipient_email": "TEXT",
                "llm_model": "TEXT", "bounced_at": "TEXT",
-               "follow_up_step": "INTEGER DEFAULT 0"},
+               "follow_up_step": "INTEGER DEFAULT 0",
+               # When this message should be handed to Gmail. NULL is the
+               # normal case — the user pressed Send and it went. A value here
+               # means a background thread will send it later, which is the one
+               # path in this app where mail leaves with nobody watching, so it
+               # is set only by an explicit per-batch choice.
+               "scheduled_at": "TEXT",
+               "scheduled_by_job": "TEXT"},
     # Why the search matched this company, per the model that suggested it.
     # Kept apart from `summary` on purpose: summary is scraped evidence and is
     # quoted into emails, this is an unverified guess and must not be.
@@ -745,6 +754,19 @@ class Database:
         self.set_setting("profile", profile)
         return profile
 
+    def get_send_window(self) -> Dict[str, Any]:
+        """Business hours for sending. Absent means the shipped default, which
+        is *off* — nothing sends itself until the user says so."""
+        stored = self.get_setting("send_window")
+        if stored is None:
+            return dict(SEND_WINDOW_DEFAULT, days=list(SEND_WINDOW_DEFAULT["days"]))
+        return normalize_send_window(stored)
+
+    def update_send_window(self, raw: Any) -> Dict[str, Any]:
+        window = normalize_send_window(raw)
+        self.set_setting("send_window", window)
+        return window
+
     def get_follow_up_cadence(self) -> Dict[str, Any]:
         """The configured follow-up schedule, always in a usable shape.
 
@@ -1154,6 +1176,8 @@ class Database:
             # (the legacy import, tests) lost who it actually went to — the one
             # fact that stops a later contact edit rewriting outreach history.
             "recipient_email": kwargs.get("recipient_email"),
+            "scheduled_at": kwargs.get("scheduled_at"),
+            "scheduled_by_job": kwargs.get("scheduled_by_job"),
             "is_follow_up": 1 if kwargs.get("is_follow_up") else 0,
             "follow_up_step": int(kwargs.get("follow_up_step") or 0),
             "used_template_fallback": 1 if kwargs.get("used_template_fallback") else 0,
@@ -1201,7 +1225,7 @@ class Database:
             "resume_id", "used_template_fallback", "fallback_reason", "llm_model",
             "custom_instructions", "is_follow_up", "original_email_id",
             "send_attempted_at", "send_attempt_error", "recipient_email",
-            "bounced_at", "follow_up_step",
+            "bounced_at", "follow_up_step", "scheduled_at", "scheduled_by_job",
         }
         updates = {k: v for k, v in updates.items() if k in allowed}
         for bool_key in ("has_response", "is_follow_up", "used_template_fallback"):

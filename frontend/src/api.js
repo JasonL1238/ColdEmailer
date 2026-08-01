@@ -86,6 +86,7 @@ export const emailsAPI = {
   regenerate: (id) => api.post(`/emails/${id}/regenerate`),
   send: (payload) => api.post('/emails/send', payload),
   cancelSend: (jobId) => api.post(`/emails/send/${jobId}/cancel`),
+  unschedule: (ids) => api.post('/emails/unschedule', { ids }),
   // No default `days`: leaving it off lets the configured cadence decide the
   // gap per step. Passing 7 here silently overrode a "chase after 3 days"
   // setting with the old hardcoded week.
@@ -94,6 +95,11 @@ export const emailsAPI = {
   draftAllFollowUps: () => api.post('/follow-ups/draft-all'),
   cancelDraftFollowUps: (jobId) => api.post(`/follow-ups/draft-all/${jobId}/cancel`),
   checkReplies: (recheck = false) => api.post('/emails/check-replies', null, { params: { recheck } }),
+}
+
+export const sendWindowAPI = {
+  get: () => api.get('/send-window'),
+  update: (payload) => api.put('/send-window', payload),
 }
 
 export const cadenceAPI = {

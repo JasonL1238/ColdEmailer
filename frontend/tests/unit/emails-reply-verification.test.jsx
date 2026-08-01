@@ -48,6 +48,7 @@ vi.mock('../../src/api', () => ({
     })),
   },
   resumesAPI: { list: vi.fn(() => Promise.resolve({ data: [] })) },
+  sendWindowAPI: { get: vi.fn(() => Promise.resolve({ data: { enabled: false } })) },
   jobsAPI: { get: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })) },
 }))
 

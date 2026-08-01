@@ -77,6 +77,37 @@ class CadenceUpdate(BaseModel):
         return v
 
 
+class SendWindowUpdate(BaseModel):
+    """Business hours for sending, in the sender's own timezone.
+
+    `enabled` is the first of the two gates that stand between this app and
+    unattended mail: with it off, the scheduler thread does nothing and the
+    send endpoint refuses to schedule at all.
+    """
+    enabled: bool = False
+    timezone: str = ""
+    days: List[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4], max_length=7)
+    start_hour: int = Field(8, ge=0, le=23)
+    end_hour: int = Field(17, ge=1, le=23)
+
+    @field_validator("days")
+    @classmethod
+    def _check_days(cls, v):
+        for day in v:
+            if not 0 <= day <= 6:
+                raise ValueError("Days are 0 (Monday) to 6 (Sunday)")
+        return v
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, v):
+        from send_window import resolve_timezone
+        value = (v or "").strip()
+        if value and resolve_timezone(value) is None:
+            raise ValueError(f"Unknown timezone: {value}")
+        return value
+
+
 class DiscoveryRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=300)
     count: int = Field(10, ge=1, le=100)
@@ -251,6 +282,12 @@ class SendRequest(BaseModel):
     # Opt-in to sending a draft whose body promises an attachment these options
     # would remove or swap. Off by default: the email would contradict itself.
     confirm_attachment_change: bool = False
+    # The per-batch half of the scheduling opt-in. None (the default) means
+    # "hand these to Gmail now", which is the only thing this endpoint has ever
+    # done. "next_window" hands them to a background thread instead, to go out
+    # when business hours next open — the one path where mail leaves without
+    # anyone watching, so it is never the default and never implied.
+    schedule: Optional[str] = Field(None, pattern="^(now|next_window)$")
 
     @field_validator("from_email")
     @classmethod

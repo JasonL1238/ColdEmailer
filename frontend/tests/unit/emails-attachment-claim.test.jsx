@@ -38,6 +38,7 @@ vi.mock('../../src/api', () => ({
     checkReplies: vi.fn(() => Promise.resolve({ data: {} })),
     send: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })),
   },
+  sendWindowAPI: { get: vi.fn(() => Promise.resolve({ data: { enabled: false } })) },
   resumesAPI: {
     list: vi.fn(() => Promise.resolve({
       data: [
