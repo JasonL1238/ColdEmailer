@@ -17,7 +17,8 @@ vi.mock('axios', () => ({
 
 import {
   discoveryAPI, companiesAPI, contactsAPI, resumesAPI, emailsAPI,
-  settingsAPI, dashboardAPI, cadenceAPI, pipelineAPI, campaignsAPI, errMessage,
+  settingsAPI, dashboardAPI, cadenceAPI, pipelineAPI, campaignsAPI,
+  suppressionsAPI, errMessage,
 } from '../../src/api.js'
 
 beforeEach(() => {
@@ -143,6 +144,16 @@ describe('follow-up cadence wiring', () => {
   it('reads a thread at the route the backend serves', () => {
     emailsAPI.thread('e1')
     expect(mockAxiosInstance.get).toHaveBeenCalledWith('/emails/e1/thread')
+  })
+
+  it('reads, adds and removes suppressions at the routes the backend serves', () => {
+    suppressionsAPI.list()
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/suppressions')
+    suppressionsAPI.add('dana@acme.com', 'asked to stop')
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/suppressions',
+      { value: 'dana@acme.com', reason: 'asked to stop' })
+    suppressionsAPI.remove('s1')
+    expect(mockAxiosInstance.delete).toHaveBeenCalledWith('/suppressions/s1')
   })
 
   it('lists and patches campaigns at the routes the backend serves', () => {

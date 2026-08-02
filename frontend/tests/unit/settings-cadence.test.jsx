@@ -22,6 +22,11 @@ vi.mock('../../src/api', () => ({
   settingsAPI: { update: vi.fn(() => Promise.resolve({ data: {} })) },
   gmailAPI: { disconnect: vi.fn() },
   cadenceAPI: { update: updateCadence },
+  suppressionsAPI: {
+    list: vi.fn(() => Promise.resolve({ data: [] })),
+    add: vi.fn(() => Promise.resolve({ data: {} })),
+    remove: vi.fn(() => Promise.resolve({ data: {} })),
+  },
   sendWindowAPI: {
     get: vi.fn(() => Promise.resolve({ data: {
       enabled: false, timezone: '', days: [0, 1, 2, 3, 4], start_hour: 8,

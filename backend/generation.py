@@ -7,6 +7,8 @@ import threading
 import time
 from typing import Dict, List, Optional
 
+import suppression
+
 from db import Database
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
                             TemplateUnavailable)
@@ -163,6 +165,10 @@ class GenerationService:
 
         generated_ids: List[str] = []
         skipped: List[Dict] = []
+        # Read once per job. Drafting for somebody on the do-not-contact list
+        # burns paid quota on a message the send path will refuse, and leaves
+        # a draft in the queue whose only outcome is an error.
+        suppressions = self.db.list_suppressions()
 
         for i, contact_id in enumerate(contact_ids):
             if self._cancelled(job_id):
@@ -175,6 +181,12 @@ class GenerationService:
                 skipped.append({"contact_id": contact_id,
                                 "name": contact.get("name"),
                                 "reason": "contact has no email address"})
+                continue
+            blocked = suppression.match(contact.get("email") or "", suppressions)
+            if blocked:
+                skipped.append(self._skip_entry(
+                    contact_id,
+                    suppression.blocked_reason(blocked, contact.get("email") or "")))
                 continue
             # Archiving a contact means "stop reaching out" — honour it even if
             # the row is still selected in the table.

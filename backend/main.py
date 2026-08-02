@@ -41,7 +41,7 @@ from generation import GenerationBusy, GenerationService
 from models import (
     BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
     ContactCreate, ContactUpdate, DeepResearchRequest, DiscoveryRequest,
-    CadenceUpdate, SendWindowUpdate, CampaignUpdate,
+    CadenceUpdate, SendWindowUpdate, CampaignUpdate, SuppressionCreate,
     EmailUpdate, EnrichRequest, GenerateRequest, ProfileUpdate, ResumeUpdate,
     SendRequest, LinkedInDraftRequest,
 )
@@ -50,6 +50,7 @@ from resume_service import ResumeService
 import analytics as analytics_module
 import campaigns as campaigns_module
 import pipeline
+import suppression
 import send_window
 import thread_reader
 from response_checker import ResponseChecker
@@ -752,7 +753,8 @@ async def create_contact(payload: ContactCreate):
     email = (payload.email or "").strip()
     cleaned, err = sanitize_inbound_contact(
         name=payload.name, email=email, linkedin_url=payload.linkedin_url,
-        role=payload.role, require_person_email=True, check_mx=False)
+        role=payload.role, require_person_email=True, check_mx=False,
+        suppressions=db.list_suppressions())
     if err:
         messages = {
             "company_or_role_inbox":
@@ -770,6 +772,9 @@ async def create_contact(payload: ContactCreate):
                 "That email address is not valid.",
             "no_usable_contact_method":
                 "Provide a personal email and/or a LinkedIn profile URL.",
+            "suppressed":
+                "That address is on your do-not-contact list. Remove it in "
+                "Settings first if you meant to add this person.",
             "invalid_linkedin_url":
                 "Use a full https://www.linkedin.com/in/... profile URL.",
         }
@@ -1044,6 +1049,9 @@ async def import_contacts_csv(file: UploadFile = File(...)):
         added = duplicates = invalid = warnings = 0
         invalid_samples = []
         from contact_ingest import sanitize_inbound_contact
+        # Read once for the file, not per row: a 2000-row CSV would otherwise
+        # re-read the list 2000 times.
+        suppressions = db.list_suppressions()
         for row in reader:
             def get(key):
                 return (row.get(cols[key]) or "").strip() if key in cols else ""
@@ -1071,7 +1079,8 @@ async def import_contacts_csv(file: UploadFile = File(...)):
                 source = "csv"
             cleaned, err = sanitize_inbound_contact(
                 name=name, email=email, linkedin_url=linkedin_url, role=role,
-                require_person_email=True, check_mx=False)
+                require_person_email=True, check_mx=False,
+                suppressions=suppressions)
             if err:
                 invalid += 1
                 if len(invalid_samples) < 5:
@@ -1632,6 +1641,15 @@ def _follow_up_plan(contact_id: Optional[str], *, manual: bool) -> Dict[str, Any
             "Mail to this address bounced, so a follow-up would bounce too. Add "
             "a different address for this person first.")
         return plan
+    # Beside the bounce gate, for the same reason it is here: drafting a
+    # follow-up to somebody on the do-not-contact list produces work whose only
+    # possible outcome is the send path refusing it.
+    blocked = suppression.match((contact_row or {}).get("email") or "",
+                                db.list_suppressions())
+    if blocked:
+        plan["refusal"] = suppression.blocked_reason(
+            blocked, (contact_row or {}).get("email") or "This address")
+        return plan
 
     # Nothing dedupes downstream: two clicks used to mean two near-identical
     # follow-ups in Drafts, both caught by "Select all", both delivered. The
@@ -2025,7 +2043,28 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
     # Same rule for follow-ups: two follow-ups to one person are two copies of
     # "I wanted to follow up on my note" three seconds apart.
     follow_up_recipients = set()
+    suppressions: list = []
     try:
+        # Read once for the batch, before the loop, so a read failure stops
+        # everything rather than letting the first few emails through and
+        # blocking the rest. An unreadable list blocks everything — the only
+        # direction this particular check may fail in.
+        #
+        # Inside the try, so the failure path still reaches the finally that
+        # releases _send_lock. Returning early from above it held the lock for
+        # the life of the process and no later batch could ever start.
+        #
+        # Re-read again per message below; this one exists so an unreadable
+        # list stops the batch before the first send rather than failing each
+        # message individually.
+        try:
+            suppressions = db.list_suppressions()
+        except Exception as e:
+            db.finish_job(
+                job_id, status="failed",
+                error=f"Could not read the do-not-contact list, so nothing was "
+                      f"sent: {e}")
+            return
         for i, email_id in enumerate(email_ids):
             job = db.get_job(job_id)
             if not job or job["status"] == "cancelled":
@@ -2150,6 +2189,41 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                              f"drafted, so it would ask someone who already "
                              f"answered whether they are still interested. "
                              f"Reply in Gmail instead."})
+                failed += 1
+                continue
+            # The do-not-contact list, asked again here rather than trusted
+            # from ingest. Rows predate the list, CSVs arrive with addresses
+            # already in them, and a draft can sit for a week after somebody
+            # asks to be removed — so this is the check that actually holds.
+            #
+            # Fails closed, unlike every other gate around it. If the list
+            # cannot be read, nothing goes out: a wrongly blocked email costs
+            # an error message, and a wrongly sent one costs a person who
+            # asked to be left alone hearing from you again.
+            # Re-read per message, not once for the batch. With the 3-second
+            # inter-send delay a 200-email run lasts ten minutes, and the
+            # scheduler's unattended batches are this same code — so "I added
+            # them to the list while it was sending" has to take effect on the
+            # next message, not the next batch. It is a local SELECT over a
+            # handful of rows against a network round trip; the cost is nothing.
+            try:
+                suppressions = db.list_suppressions()
+                blocked = suppression.match(recipient, suppressions)
+            except Exception as e:
+                # Still fails closed — nothing is sent — but it says what
+                # actually happened. Reporting this as "they are on your list"
+                # sent the user to Settings to remove an entry that does not
+                # exist, and marked a transient failure as permanent.
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": True,
+                    "error": f"Could not read the do-not-contact list, so "
+                             f"{recipient} was not written to: {e}"})
+                failed += 1
+                continue
+            if blocked:
+                results.append({
+                    "email_id": email_id, "success": False, "retryable": False,
+                    "error": suppression.blocked_reason(blocked, recipient)})
                 failed += 1
                 continue
             if _bounced_for_current_address(email, contact_row):
@@ -2808,6 +2882,47 @@ async def dashboard():
         "recent_events": events,
         "usage": rate_limiter.get_usage_stats(),
     }
+
+
+@app.get("/api/suppressions")
+async def list_suppressions():
+    return db.list_suppressions()
+
+
+@app.post("/api/suppressions")
+async def add_suppression(payload: SuppressionCreate):
+    """Add an address or a domain to the do-not-contact list.
+
+    Accepts `dana@acme.com`, `acme.com`, `@acme.com`, or a pasted
+    `Dana Lee <dana@acme.com>` — the forms people actually type when they mean
+    "stop writing to this person" or "stop writing to anyone here".
+    """
+    value, kind = suppression.normalize(payload.value)
+    if not value:
+        raise HTTPException(
+            422, "That is not an email address or a domain. Try dana@acme.com "
+                 "or acme.com.")
+    entry = db.add_suppression(value, kind, reason=payload.reason)
+    db.log_event("suppression", entry["id"], "added", f"{kind}: {value}")
+    # What it already covers, so the user learns immediately rather than by
+    # discovering a send was refused a week later.
+    covered = db.query_one(
+        "SELECT COUNT(*) AS n FROM contacts WHERE email IS NOT NULL AND email <> ''"
+    )["n"]
+    matches = [c for c in db.query(
+        "SELECT id, name, email FROM contacts "
+        "WHERE email IS NOT NULL AND email <> ''")
+        if suppression.match(c["email"], [entry])]
+    return {**entry, "matched_contacts": len(matches),
+            "checked_contacts": covered}
+
+
+@app.delete("/api/suppressions/{suppression_id}")
+async def remove_suppression(suppression_id: str):
+    if not db.remove_suppression(suppression_id):
+        raise HTTPException(404, "Not on the list")
+    db.log_event("suppression", suppression_id, "removed", "")
+    return {"success": True}
 
 
 @app.get("/api/campaigns")

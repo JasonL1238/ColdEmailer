@@ -1,8 +1,8 @@
 /* Settings: sender profile, Gmail connection, AI provider, limits */
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import toast from 'react-hot-toast'
-import { Save, Unplug, CheckCircle2, XCircle, Sparkles, Mail, CornerUpLeft, Plus, Clock } from 'lucide-react'
-import { settingsAPI, gmailAPI, cadenceAPI, sendWindowAPI, errMessage } from '../api'
+import { Save, Unplug, CheckCircle2, XCircle, Sparkles, Mail, CornerUpLeft, Plus, Clock, Trash2 } from 'lucide-react'
+import { settingsAPI, gmailAPI, cadenceAPI, sendWindowAPI, suppressionsAPI, errMessage } from '../api'
 import { Button, Chip } from '../ui'
 import { useApp } from '../App'
 
@@ -153,6 +153,118 @@ export default function Settings() {
 
       <FollowUpCadence />
       <SendWindow />
+      <DoNotContact />
+    </div>
+  )
+}
+
+/* The do-not-contact list.
+
+   Unlike everything else on this page it is not a preference — it is a
+   promise. So the UI leans on saying what an entry actually covers: a domain
+   entry blocks every address there including subdomains, which is the case
+   people do not expect, and the count of contacts already matched is shown at
+   the moment of adding rather than discovered later by a refused send. */
+export function DoNotContact() {
+  const [entries, setEntries] = useState(null)
+  const [value, setValue] = useState('')
+  const [reason, setReason] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const [failed, setFailed] = useState(false)
+
+  const load = useCallback(() => {
+    setFailed(false)
+    suppressionsAPI.list()
+      .then(({ data }) => setEntries(data))
+      // A failed read must never render as "Nobody on the list." — that is a
+      // positive claim that nothing is suppressed, made by the one feature in
+      // this app documented as fail-closed. The list is still enforced at send
+      // time whatever this card can see.
+      .catch(() => { setEntries([]); setFailed(true) })
+  }, [])
+  useEffect(() => { load() }, [load])
+
+  const add = async (e) => {
+    e?.preventDefault?.()
+    if (!value.trim()) return
+    setBusy(true)
+    try {
+      const { data } = await suppressionsAPI.add(value.trim(), reason.trim() || null)
+      setValue(''); setReason('')
+      load()
+      toast.success(data.matched_contacts > 0
+        ? `Added — this already covers ${data.matched_contacts} contact${data.matched_contacts === 1 ? '' : 's'} in your database.`
+        : 'Added to the do-not-contact list.')
+    } catch (err) { toast.error(errMessage(err)) }
+    finally { setBusy(false) }
+  }
+
+  const remove = async (entry) => {
+    const what = entry.kind === 'domain' ? `everyone at @${entry.value}` : entry.value
+    if (!window.confirm(`Remove ${what} from the do-not-contact list? Mail to ${entry.kind === 'domain' ? 'that domain' : 'that address'} will be allowed again.`)) return
+    try {
+      await suppressionsAPI.remove(entry.id)
+      load()
+    } catch (err) { toast.error(errMessage(err)) }
+  }
+
+  return (
+    <div className="card card-pad stack mt-16" style={{ gap: 12 }}>
+      <div>
+        <b>Do not contact</b>
+        <div className="tiny muted">
+          Addresses and domains this app will never write to. Checked when a contact
+          is added and again immediately before every send, so drafts written before
+          an entry was added are refused too.
+        </div>
+      </div>
+
+      <form className="row" style={{ gap: 8, flexWrap: 'wrap' }} onSubmit={add}>
+        <input className="input" style={{ flex: '2 1 220px' }} value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="dana@acme.com or acme.com" />
+        <input className="input" style={{ flex: '3 1 220px' }} value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Why (optional) — shown when a send is refused" />
+        <Button type="submit" variant="primary" disabled={busy || !value.trim()}>
+          Add
+        </Button>
+      </form>
+
+      {failed ? (
+        <div className="row small" style={{ gap: 8, color: 'var(--amber)' }}>
+          <span>
+            Could not load the do-not-contact list. It is still enforced at send
+            time — this card just cannot show it.
+          </span>
+          <Button size="sm" onClick={load}>Try again</Button>
+        </div>
+      ) : entries === null ? null : entries.length === 0 ? (
+        <div className="tiny muted">Nobody on the list.</div>
+      ) : (
+        <div className="stack" style={{ gap: 6 }}>
+          {entries.map((entry) => (
+            <div key={entry.id} className="row-between suppression-row">
+              <span style={{ minWidth: 0 }}>
+                <span className="small mono">
+                  {entry.kind === 'domain' ? `@${entry.value}` : entry.value}
+                </span>
+                {entry.kind === 'domain' && (
+                  <Chip tone="amber" title="Blocks every address at this domain, including its subdomains.">
+                    whole domain
+                  </Chip>
+                )}
+                {entry.reason && <div className="tiny muted">{entry.reason}</div>}
+              </span>
+              <button className="icon-btn danger" title="Remove from the list"
+                onClick={() => remove(entry)}>
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

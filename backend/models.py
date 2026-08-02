@@ -118,6 +118,11 @@ class DiscoveryRequest(BaseModel):
     campaign_id: Optional[str] = Field(None, max_length=64)
 
 
+class SuppressionCreate(BaseModel):
+    value: str = Field(..., min_length=3, max_length=320)
+    reason: Optional[str] = Field(None, max_length=500)
+
+
 class CampaignUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     notes: Optional[str] = Field(None, max_length=2000)

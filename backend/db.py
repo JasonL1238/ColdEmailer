@@ -138,6 +138,21 @@ CREATE TABLE IF NOT EXISTS campaigns (
     archived_at TEXT,                    -- set aside, never deleted
     created_at  TEXT NOT NULL
 );
+-- Addresses and domains this app must never write to. A bounce means an
+-- address cannot receive mail; this means it must not, which no other check
+-- can know. Unique on (kind, value) so adding the same address twice is a
+-- no-op rather than two rows that have to be removed separately.
+CREATE TABLE IF NOT EXISTS suppressions (
+    id         TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,           -- lowercased address or bare domain
+    kind       TEXT NOT NULL,           -- 'address' | 'domain'
+    reason     TEXT,
+    source     TEXT DEFAULT 'manual',
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_suppressions_value
+    ON suppressions (kind, value);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id               TEXT PRIMARY KEY,
     type             TEXT NOT NULL,           -- 'discovery' | 'generation' | 'enrich' | 'deep_research'
@@ -1210,6 +1225,37 @@ class Database:
             FROM contacts ct LEFT JOIN companies c ON ct.company_id = c.id
             """
         )
+
+    # ---------- suppressions ----------
+
+    def list_suppressions(self) -> List[Dict[str, Any]]:
+        return self.query(
+            "SELECT * FROM suppressions ORDER BY created_at DESC, value ASC")
+
+    def add_suppression(self, value: str, kind: str, reason: Optional[str] = None,
+                        source: str = "manual") -> Dict[str, Any]:
+        """Idempotent: adding the same entry twice returns the first one.
+
+        Silently keeping the original matters more than it looks — the reason
+        and the date on the first entry are what the send-path refusal quotes
+        back, and overwriting them with a later blank would lose the only
+        record of why somebody is on the list.
+        """
+        existing = self.query_one(
+            "SELECT * FROM suppressions WHERE kind=? AND value=?", (kind, value))
+        if existing:
+            return existing
+        data = {
+            "id": new_id(), "value": value, "kind": kind,
+            "reason": (reason or "").strip()[:500] or None,
+            "source": source, "created_at": now_iso(),
+        }
+        self._insert("suppressions", data)
+        return data
+
+    def remove_suppression(self, suppression_id: str) -> bool:
+        cur = self.execute("DELETE FROM suppressions WHERE id=?", (suppression_id,))
+        return cur.rowcount > 0
 
     # ---------- campaigns ----------
 

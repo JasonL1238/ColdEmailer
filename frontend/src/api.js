@@ -98,6 +98,12 @@ export const emailsAPI = {
   thread: (id) => api.get(`/emails/${id}/thread`),
 }
 
+export const suppressionsAPI = {
+  list: () => api.get('/suppressions'),
+  add: (value, reason = null) => api.post('/suppressions', { value, reason }),
+  remove: (id) => api.delete(`/suppressions/${id}`),
+}
+
 export const campaignsAPI = {
   list: () => api.get('/campaigns'),
   update: (id, data) => api.patch(`/campaigns/${id}`, data),

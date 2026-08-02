@@ -8,6 +8,7 @@ from contact_verify import (
     is_generic_inbox,
     linkedin_matches_person,
 )
+import suppression
 from models import EMAIL_ADDRESS_RE, validate_linkedin_profile_url
 
 
@@ -19,6 +20,7 @@ def sanitize_inbound_contact(
         role: Optional[str] = None,
         require_person_email: bool = True,
         check_mx: bool = True,
+        suppressions: Optional[list] = None,
 ) -> Tuple[Optional[Dict], Optional[str]]:
     """Normalize and verify an inbound contact.
 
@@ -32,6 +34,13 @@ def sanitize_inbound_contact(
     role = (role or "").strip() or None
     if email and not EMAIL_ADDRESS_RE.fullmatch(email):
         return None, "invalid_email"
+    # Refused at the door on the human-entered paths. The send gate is what
+    # guarantees nothing reaches a suppressed address, but letting one into the
+    # database means drafts get written for it and every one of them fails at
+    # the last step, which reads as the app being broken rather than as the
+    # list working.
+    if email and suppressions and suppression.match(email, suppressions):
+        return None, "suppressed"
     try:
         linkedin_url = validate_linkedin_profile_url(linkedin_url)
     except ValueError:
