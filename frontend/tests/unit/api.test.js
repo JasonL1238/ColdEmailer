@@ -17,7 +17,7 @@ vi.mock('axios', () => ({
 
 import {
   discoveryAPI, companiesAPI, contactsAPI, resumesAPI, emailsAPI,
-  settingsAPI, dashboardAPI, cadenceAPI, pipelineAPI, errMessage,
+  settingsAPI, dashboardAPI, cadenceAPI, pipelineAPI, campaignsAPI, errMessage,
 } from '../../src/api.js'
 
 beforeEach(() => {
@@ -143,6 +143,13 @@ describe('follow-up cadence wiring', () => {
   it('reads a thread at the route the backend serves', () => {
     emailsAPI.thread('e1')
     expect(mockAxiosInstance.get).toHaveBeenCalledWith('/emails/e1/thread')
+  })
+
+  it('lists and patches campaigns at the routes the backend serves', () => {
+    campaignsAPI.list()
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/campaigns')
+    campaignsAPI.update('c1', { archived: true })
+    expect(mockAxiosInstance.patch).toHaveBeenCalledWith('/campaigns/c1', { archived: true })
   })
 })
 

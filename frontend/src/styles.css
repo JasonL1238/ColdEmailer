@@ -967,6 +967,10 @@ button.linkish {
   transition: width .3s;
 }
 
+/* An archived campaign is dimmed, not hidden: its numbers are still true, it
+   is just no longer being compared. */
+.campaign-archived { opacity: 0.62; }
+
 .kbd {
   display: inline-block;
   font-family: var(--mono);

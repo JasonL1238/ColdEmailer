@@ -41,13 +41,14 @@ from generation import GenerationBusy, GenerationService
 from models import (
     BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
     ContactCreate, ContactUpdate, DeepResearchRequest, DiscoveryRequest,
-    CadenceUpdate, SendWindowUpdate,
+    CadenceUpdate, SendWindowUpdate, CampaignUpdate,
     EmailUpdate, EnrichRequest, GenerateRequest, ProfileUpdate, ResumeUpdate,
     SendRequest, LinkedInDraftRequest,
 )
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
 import analytics as analytics_module
+import campaigns as campaigns_module
 import pipeline
 import send_window
 import thread_reader
@@ -225,7 +226,8 @@ async def start_discovery(payload: DiscoveryRequest):
     if running:
         raise HTTPException(409, "A discovery search is already running. "
                                  "Wait for it to finish or cancel it first.")
-    job = discovery.start(payload.query.strip(), payload.count, mode=payload.mode)
+    job = discovery.start(payload.query.strip(), payload.count, mode=payload.mode,
+                          campaign_id=payload.campaign_id)
     return _parse_job(db.get_job(job["id"]))
 
 
@@ -2806,6 +2808,37 @@ async def dashboard():
         "recent_events": events,
         "usage": rate_limiter.get_usage_stats(),
     }
+
+
+@app.get("/api/campaigns")
+async def list_campaigns():
+    """Every campaign, plus what was never in one.
+
+    The unassigned counts are shipped alongside rather than folded in: they are
+    permanently unassigned by design, and omitting them would let the campaign
+    totals read as the whole database.
+    """
+    return campaigns_module.build(db.campaign_rows(), db.unassigned_counts())
+
+
+@app.patch("/api/campaigns/{campaign_id}")
+async def update_campaign(campaign_id: str, payload: CampaignUpdate):
+    """Rename, annotate, or set aside. Deliberately cannot delete: the rows
+    pointing at a campaign are real outreach history, and removing the label
+    would orphan them into the unassigned pile, which is supposed to mean
+    "predates campaigns" rather than "someone tidied up"."""
+    campaign = db.get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    updates: dict = {}
+    if payload.name is not None:
+        updates["name"] = payload.name.strip()[:200]
+    if payload.notes is not None:
+        updates["notes"] = payload.notes
+    if payload.archived is not None:
+        updates["archived_at"] = now_iso() if payload.archived else None
+    db.update_campaign(campaign_id, updates)
+    return db.get_campaign(campaign_id)
 
 
 @app.get("/api/pipeline")

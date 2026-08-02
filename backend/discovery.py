@@ -182,16 +182,27 @@ class DiscoveryService:
 
     # ---------- public API ----------
 
-    def start(self, query: str, count: int = 10, mode: str = "full") -> Dict:
+    def start(self, query: str, count: int = 10, mode: str = "full",
+              campaign_id: Optional[str] = None) -> Dict:
         count = max(1, min(int(count or 10), MAX_COMPANIES_PER_RUN))
         mode = "fast" if (mode or "full").lower() == "fast" else "full"
         job = self.db.create_job(
             "discovery", {"query": query, "count": count, "mode": mode})
+        # A campaign per run, named from the search that produced it. Anchored
+        # to something that happened rather than to a label the user has to
+        # remember to apply — an opt-in tag would be blank on exactly the runs
+        # worth comparing later.
+        if campaign_id and not self.db.get_campaign(campaign_id):
+            campaign_id = None
+        if not campaign_id:
+            campaign_id = self.db.create_campaign(
+                query, query=query, job_id=job["id"])["id"]
         thread = threading.Thread(
-            target=self._run_safe, args=(job["id"], query, count, mode), daemon=True
+            target=self._run_safe, args=(job["id"], query, count, mode, campaign_id),
+            daemon=True,
         )
         thread.start()
-        return job
+        return {**job, "campaign_id": campaign_id}
 
     def cancel(self, job_id: str) -> bool:
         """Only cancels discovery jobs — the id comes from the URL, so without
@@ -208,14 +219,16 @@ class DiscoveryService:
         job = self.db.get_job(job_id)
         return not job or job["status"] == "cancelled"
 
-    def _run_safe(self, job_id: str, query: str, count: int, mode: str = "full"):
+    def _run_safe(self, job_id: str, query: str, count: int, mode: str = "full",
+                  campaign_id: Optional[str] = None):
         try:
-            self._run(job_id, query, count, mode=mode)
+            self._run(job_id, query, count, mode=mode, campaign_id=campaign_id)
         except Exception as e:
             print(f"[discovery] job {job_id} crashed: {e}")
             self.db.finish_job(job_id, status="failed", error=str(e))
 
-    def _run(self, job_id: str, query: str, count: int, mode: str = "full"):
+    def _run(self, job_id: str, query: str, count: int, mode: str = "full",
+             campaign_id: Optional[str] = None):
         self.db.update_job(job_id, stage="Finding companies", progress_total=count)
         self.db.log_event("discovery", job_id, "started", query)
 
@@ -276,6 +289,7 @@ class DiscoveryService:
                 location=enriched.get("location"),
                 source="discovery",
                 job_id=job_id,
+                campaign_id=campaign_id,
                 scraped_at=enriched.get("scraped_at"),
                 scrape_status=status,
                 research_sources=enriched.get("research_sources"),
@@ -330,6 +344,15 @@ class DiscoveryService:
                 local = addr.split("@", 1)[0] if addr else ""
                 created = self.db.create_contact(
                     company_id=company["id"],
+                    # Stated, not inherited. `create_company` returns the
+                    # existing row when a candidate turns out to be a company
+                    # some earlier run already found — correctly leaving that
+                    # company with its original campaign. Falling back to the
+                    # company's campaign therefore credited people *this* run
+                    # discovered to a campaign that never went looking for
+                    # them, or to none at all. Inheritance is the floor for
+                    # callers that cannot know; this one knows.
+                    campaign_id=campaign_id,
                     name=candidate.get("name") or _guess_name_from_email(local),
                     email=addr,
                     linkedin_url=linkedin_url,

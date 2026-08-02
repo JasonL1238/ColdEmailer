@@ -112,6 +112,16 @@ class DiscoveryRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=300)
     count: int = Field(10, ge=1, le=100)
     mode: str = Field("full", pattern="^(fast|full)$")
+    # Add this run to an existing campaign instead of starting a new one. An
+    # unknown id is ignored rather than rejected: the run is the valuable part,
+    # and failing it over a stale campaign reference would be the wrong trade.
+    campaign_id: Optional[str] = Field(None, max_length=64)
+
+
+class CampaignUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    notes: Optional[str] = Field(None, max_length=2000)
+    archived: Optional[bool] = None
 
 
 class EnrichRequest(BaseModel):

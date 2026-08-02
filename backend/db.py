@@ -126,6 +126,18 @@ CREATE TABLE IF NOT EXISTS emails (
 CREATE INDEX IF NOT EXISTS idx_emails_contact ON emails (contact_id);
 CREATE INDEX IF NOT EXISTS idx_emails_status ON emails (status);
 
+-- A named run of outreach. Created when a discovery job starts, so a campaign
+-- is anchored to something that actually happened rather than to a label the
+-- user has to remember to apply.
+CREATE TABLE IF NOT EXISTS campaigns (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    query       TEXT,                    -- the search that started it, verbatim
+    job_id      TEXT,                    -- the discovery run, for provenance
+    notes       TEXT,
+    archived_at TEXT,                    -- set aside, never deleted
+    created_at  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS jobs (
     id               TEXT PRIMARY KEY,
     type             TEXT NOT NULL,           -- 'discovery' | 'generation' | 'enrich' | 'deep_research'
@@ -218,6 +230,21 @@ _ADDED_COLUMNS = {
         "follow_ups_declined_at": "TEXT",
     },
 }
+
+# Which campaign each row belongs to, if any.
+#
+# Added to all three tables rather than derived by join, because attribution
+# has to survive the row it came from: a contact with sent history can still be
+# force-deleted, and a join would then quietly drop that campaign's sent mail
+# out of its own numbers. Same reasoning as `recipient_email` — freeze the fact
+# at the moment it is true.
+#
+# NULL is a real and permanent answer. Everything that existed before campaigns
+# stays unassigned: guessing which campaign a company from three months ago
+# "would have" belonged to would invent the one thing this feature exists to
+# report.
+for _table in ("companies", "contacts", "emails"):
+    _ADDED_COLUMNS.setdefault(_table, {})["campaign_id"] = "TEXT"
 
 
 # A live (non-trashed) follow-up already drafted for *this person*, not just for
@@ -444,6 +471,11 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_contacts_seniority "
             "ON contacts (seniority_rank)"
         )
+        for table in ("companies", "contacts", "emails"):
+            self._conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_campaign "
+                f"ON {table} (campaign_id)"
+            )
         # Normalize LinkedIn URLs before unique-index creation
         rows = self._conn.execute(
             "SELECT id, linkedin_url FROM contacts "
@@ -854,6 +886,7 @@ class Database:
             "research_quality": kwargs.get("research_quality") or "low",
             "source": kwargs.get("source", "manual"),
             "job_id": kwargs.get("job_id"),
+            "campaign_id": kwargs.get("campaign_id"),
             "scraped_at": kwargs.get("scraped_at"),
             "scrape_status": kwargs.get("scrape_status", "pending"),
             "scrape_warnings": json.dumps(kwargs.get("scrape_warnings") or []),
@@ -990,6 +1023,11 @@ class Database:
             "status": kwargs.get("status", "new"),
             "notes": kwargs.get("notes"),
             "source_url": kwargs.get("source_url"),
+            # Inherited from the company unless given. One choke point, so a
+            # new scraping path cannot quietly create contacts that belong to
+            # no campaign while their company belongs to one.
+            "campaign_id": (kwargs.get("campaign_id")
+                            or self._campaign_of_company(kwargs.get("company_id"))),
             "evidence": kwargs.get("evidence"),
             "affinity": kwargs.get("affinity"),
             "seniority_rank": kwargs.get("seniority_rank", 20),
@@ -1173,6 +1211,110 @@ class Database:
             """
         )
 
+    # ---------- campaigns ----------
+
+    def _campaign_of_company(self, company_id: Optional[str]) -> Optional[str]:
+        if not company_id:
+            return None
+        row = self.query_one("SELECT campaign_id FROM companies WHERE id=?",
+                             (company_id,))
+        return row["campaign_id"] if row else None
+
+    def _campaign_of_contact(self, contact_id: Optional[str]) -> Optional[str]:
+        if not contact_id:
+            return None
+        row = self.query_one("SELECT campaign_id FROM contacts WHERE id=?",
+                             (contact_id,))
+        return row["campaign_id"] if row else None
+
+    def create_campaign(self, name: str, **kwargs) -> Dict[str, Any]:
+        data = {
+            "id": kwargs.get("id") or new_id(),
+            "name": (name or "").strip()[:200] or "Untitled campaign",
+            "query": kwargs.get("query"),
+            "job_id": kwargs.get("job_id"),
+            "notes": kwargs.get("notes"),
+            "archived_at": None,
+            "created_at": now_iso(),
+        }
+        self._insert("campaigns", data)
+        return data
+
+    def get_campaign(self, campaign_id: str) -> Optional[Dict[str, Any]]:
+        return self.query_one("SELECT * FROM campaigns WHERE id=?", (campaign_id,))
+
+    def update_campaign(self, campaign_id: str, updates: Dict[str, Any]) -> None:
+        allowed = {k: v for k, v in updates.items()
+                   if k in ("name", "notes", "archived_at")}
+        if allowed:
+            self._update("campaigns", campaign_id, allowed)
+
+    def campaign_rows(self) -> List[Dict[str, Any]]:
+        """Every campaign with the counts its report is built from.
+
+        Sent mail is counted from `emails.campaign_id` directly rather than
+        joined back through contacts. Force-deleting a contact still takes
+        their sent mail with it — that cascade is the app's existing rule and
+        campaigns do not override it — but the count does not additionally
+        depend on the contact row surviving intact.
+
+        Only `response_verified_at` replies count, the same rule the reply rate
+        and the pipeline follow — an unverified legacy flag is not evidence
+        here either, and a campaign page is precisely where a flattering wrong
+        number would change what the user does next.
+        """
+        return self.query(
+            """
+            SELECT c.*,
+                   (SELECT COUNT(*) FROM companies co
+                     WHERE co.campaign_id = c.id) AS companies,
+                   (SELECT COUNT(*) FROM contacts ct
+                     WHERE ct.campaign_id = c.id) AS contacts,
+                   (SELECT COUNT(*) FROM emails e WHERE e.campaign_id = c.id
+                     AND (e.gmail_message_id IS NOT NULL OR e.sent_at IS NOT NULL
+                          OR e.status='sent')) AS sent,
+                   (SELECT COUNT(*) FROM emails e WHERE e.campaign_id = c.id
+                     AND e.status IN ('draft','approved')
+                     AND e.gmail_message_id IS NULL AND e.sent_at IS NULL
+                     AND e.status <> 'sent') AS drafts,
+                   (SELECT COUNT(*) FROM emails e WHERE e.campaign_id = c.id
+                     AND e.has_response=1 AND e.response_verified_at IS NOT NULL)
+                     AS replied,
+                   (SELECT COUNT(*) FROM emails e WHERE e.campaign_id = c.id
+                     AND e.has_response=1 AND e.response_verified_at IS NULL)
+                     AS unverified,
+                   (SELECT COUNT(*) FROM emails e WHERE e.campaign_id = c.id
+                     AND e.bounced_at IS NOT NULL) AS bounced,
+                   (SELECT MAX(e.sent_at) FROM emails e WHERE e.campaign_id = c.id)
+                     AS last_sent_at
+            FROM campaigns c
+            ORDER BY c.created_at DESC
+            """
+        )
+
+    def unassigned_counts(self) -> Dict[str, int]:
+        """Everything from before campaigns existed, reported rather than hidden.
+
+        These rows are permanently unassigned by design. Leaving them out of
+        the page entirely would make the campaign totals look like the whole
+        database, which is the one misreading that matters here.
+        """
+        def _count(sql: str) -> int:
+            return self.query_one(sql)["n"]
+        return {
+            "companies": _count(
+                "SELECT COUNT(*) AS n FROM companies WHERE campaign_id IS NULL"),
+            "contacts": _count(
+                "SELECT COUNT(*) AS n FROM contacts WHERE campaign_id IS NULL"),
+            "sent": _count(
+                "SELECT COUNT(*) AS n FROM emails WHERE campaign_id IS NULL "
+                "AND (gmail_message_id IS NOT NULL OR sent_at IS NOT NULL "
+                "     OR status='sent')"),
+            "replied": _count(
+                "SELECT COUNT(*) AS n FROM emails WHERE campaign_id IS NULL "
+                "AND has_response=1 AND response_verified_at IS NOT NULL"),
+        }
+
     # ---------- resumes ----------
 
     def create_resume(self, label: str, filename: str, path: str,
@@ -1244,6 +1386,16 @@ class Database:
             "recipient_email": kwargs.get("recipient_email"),
             "scheduled_at": kwargs.get("scheduled_at"),
             "scheduled_by_job": kwargs.get("scheduled_by_job"),
+            # Stored, not joined at read time. Both parents cascade on delete
+            # so a join would give the same answer today, but it would give it
+            # through two hops that each have their own delete rules — and the
+            # campaign query is the one place those rules must not quietly
+            # change what a past run reports. An indexed column on the row
+            # itself is the same choice the schema already makes for
+            # recipient_email.
+            "campaign_id": (kwargs.get("campaign_id")
+                            or self._campaign_of_contact(kwargs.get("contact_id"))
+                            or self._campaign_of_company(kwargs.get("company_id"))),
             "is_follow_up": 1 if kwargs.get("is_follow_up") else 0,
             "follow_up_step": int(kwargs.get("follow_up_step") or 0),
             "used_template_fallback": 1 if kwargs.get("used_template_fallback") else 0,

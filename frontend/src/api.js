@@ -98,6 +98,11 @@ export const emailsAPI = {
   thread: (id) => api.get(`/emails/${id}/thread`),
 }
 
+export const campaignsAPI = {
+  list: () => api.get('/campaigns'),
+  update: (id, data) => api.patch(`/campaigns/${id}`, data),
+}
+
 export const pipelineAPI = {
   get: () => api.get('/pipeline'),
 }
