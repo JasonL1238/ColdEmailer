@@ -47,6 +47,7 @@ from models import (
 )
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
+import analytics as analytics_module
 import send_window
 from response_checker import ResponseChecker
 from linkedin_outreach import draft_linkedin_message
@@ -2737,6 +2738,28 @@ async def dashboard():
         "recent_events": events,
         "usage": rate_limiter.get_usage_stats(),
     }
+
+
+@app.get("/api/analytics")
+async def analytics(days: int = Query(90, ge=7, le=730)):
+    """Which kind of email actually earns replies.
+
+    Sent mail only, joined to the contact so the person can be segmented as
+    well as the message. Trashed drafts and unsent rows are irrelevant here —
+    nobody received them.
+    """
+    since = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    rows = db.query(
+        """SELECT e.email_type, e.used_template_fallback, e.follow_up_step,
+                  e.has_response, e.response_verified_at, e.sent_at, e.response_at,
+                  ct.email_kind AS contact_email_kind, ct.seniority_rank,
+                  c.name AS company_name
+           FROM emails e
+           LEFT JOIN contacts ct ON e.contact_id = ct.id
+           LEFT JOIN companies c ON ct.company_id = c.id
+           WHERE e.status='sent' AND e.sent_at IS NOT NULL AND e.sent_at >= ?""",
+        (since,))
+    return {**analytics_module.build(rows), "days": days}
 
 
 @app.get("/api/usage")

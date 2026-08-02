@@ -107,6 +107,10 @@ export const cadenceAPI = {
   update: (payload) => api.put('/follow-ups/cadence', payload),
 }
 
+export const analyticsAPI = {
+  get: (days = 90) => api.get('/analytics', { params: { days } }),
+}
+
 export const dashboardAPI = {
   get: () => api.get('/dashboard'),
 }

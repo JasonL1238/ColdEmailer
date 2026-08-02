@@ -948,3 +948,21 @@ button.linkish {
   .database-pager { align-items: flex-start; }
   .database-page-size { display: none; }
 }
+
+/* analytics segments — same visual language as the dashboard chart, but a
+   horizontal track, because a segment's label is prose and needs the width.
+   An unrated segment renders the track with no fill: the absence is the
+   point, and a zero-width bar says "no evidence" where a 0% label would
+   have said "measured, and bad". */
+.analytics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+}
+.seg-track { height: 5px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+.seg-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  border-radius: 3px;
+  transition: width .3s;
+}
