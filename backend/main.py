@@ -49,6 +49,7 @@ from rate_limiter import RateLimiter
 from resume_service import ResumeService
 import analytics as analytics_module
 import send_window
+import thread_reader
 from response_checker import ResponseChecker
 from linkedin_outreach import draft_linkedin_message
 
@@ -2571,6 +2572,72 @@ def cancel_send(job_id: str):
 
 
 # ---------- reply tracking ----------
+
+@app.get("/api/emails/{email_id}/thread")
+def read_thread(email_id: str):
+    """The conversation this email started, read from Gmail on demand.
+
+    Nothing here is stored. A reply body is text written by someone outside
+    this system, and the app's standing rule for that is to treat it as data —
+    keeping it out of the database keeps it out of every prompt, export and
+    backup by construction rather than by remembering to exclude it.
+
+    Plain `def`: the Gmail round-trip belongs in the threadpool, not the event
+    loop.
+    """
+    email = db.get_email(email_id)
+    if not email:
+        raise HTTPException(404, "Email not found")
+    if not (email.get("gmail_message_id") or "").strip():
+        # Not an error the user can act on by retrying — an unsent draft has no
+        # thread, and a delivered-but-unrecorded row needs Re-verify first.
+        raise HTTPException(409, "This email has no Gmail thread yet — "
+                                 "it has not been sent from this app.")
+    try:
+        email_sender.authenticate()
+    except Exception as e:
+        raise HTTPException(401, f"Gmail authentication failed: {e}")
+
+    service = email_sender.service
+    try:
+        thread_id = (email.get("gmail_thread_id") or "").strip()
+        if not thread_id:
+            # Legacy rows recorded the message id alone.
+            thread_id = (service.users().messages().get(
+                userId="me", id=email["gmail_message_id"], format="minimal"
+            ).execute() or {}).get("threadId")
+        if not thread_id:
+            raise HTTPException(404, "Gmail no longer has this thread")
+        thread = service.users().threads().get(
+            userId="me", id=thread_id, format="full").execute() or {}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Read-only failure. Say so plainly; the stored reply state is
+        # untouched, so nothing here can turn a network blip into a verdict.
+        raise HTTPException(502, f"Could not read the thread from Gmail: {e}")
+
+    try:
+        parsed = thread_reader.parse_thread(
+            thread,
+            own_address=db.get_profile().get("email"),
+            sent_message_id=email.get("gmail_message_id"))
+    except Exception as e:
+        # Parsing runs over a payload this app did not write. A shape it cannot
+        # handle is a failure to read one thread, not a 500 with a traceback in
+        # it — and, being read-only, it has changed nothing on the way out.
+        raise HTTPException(502, f"Could not read the thread from Gmail: {e}")
+    # Reading a thread deliberately writes nothing, so when it disagrees with
+    # the stored state the honest move is to say so and point at the check that
+    # *is* allowed to decide. Silently correcting the record here would mean
+    # two code paths could mark a contact replied, on different rules.
+    parsed["thread_id"] = thread_id
+    parsed["unrecorded_reply"] = bool(
+        parsed["reply_count"] and not email.get("has_response"))
+    parsed["unrecorded_bounce"] = bool(
+        parsed["bounce_count"] and not email.get("bounced_at"))
+    return parsed
+
 
 @app.post("/api/emails/check-replies")
 def check_replies(recheck: bool = Query(False)):

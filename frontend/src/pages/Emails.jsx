@@ -741,6 +741,159 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
           </Button>
         )}
       </div>
+
+      {/* Gated on the message id, not on `delivered`. A legacy row imported
+          with status='sent' and no Gmail id is delivered as far as the app is
+          concerned, but the endpoint has nothing to fetch — so the button
+          could only ever produce a 409. */}
+      {!!email.gmail_message_id && <ThreadPane email={email} />}
+    </div>
+  )
+}
+
+/* ---------- the conversation ---------- */
+
+const KIND_META = {
+  reply: { tone: 'green', label: 'Reply' },
+  bounce: { tone: 'red', label: 'Bounce' },
+  auto: { tone: 'gray', label: 'Auto-reply' },
+  own: { tone: 'accent', label: 'You' },
+}
+
+/* What came back, read from Gmail when asked for.
+
+   Fetched on open rather than with the email list: a thread costs a Gmail
+   round-trip, and loading one for every row in a 200-email list would spend
+   the quota that reply-checking needs. Nothing here is stored — see the
+   backend module for why a reply body stays out of the database. */
+export function ThreadPane({ email }) {
+  const [state, setState] = useState({ status: 'idle' })
+  const [expanded, setExpanded] = useState({})
+
+  const load = useCallback(() => {
+    setState({ status: 'loading' })
+    emailsAPI.thread(email.id)
+      .then(({ data }) => setState({ status: 'ready', data }))
+      .catch((e) => setState({
+        status: 'error',
+        message: errMessage(e, 'Could not read the thread'),
+        // 409 means there is no thread to fetch, ever. Offering "Try again"
+        // for it invites the user to keep clicking at a wall.
+        retryable: e?.response?.status !== 409,
+      }))
+  }, [email.id])
+
+  // Belt and braces: the list keys EmailDetail on the email id, so this pane
+  // is remounted rather than reused when the selection moves. The reset keeps
+  // that true if it is ever rendered somewhere without that key.
+  useEffect(() => { setState({ status: 'idle' }); setExpanded({}) }, [email.id])
+
+  if (state.status === 'idle') {
+    return (
+      <div className="row" style={{ gap: 8 }}>
+        <Button size="sm" icon={MessageSquare} onClick={load}>Read the thread</Button>
+        <span className="tiny muted">Fetched from Gmail when you ask — nothing is stored.</span>
+      </div>
+    )
+  }
+  if (state.status === 'loading') {
+    return <div className="row tiny muted" style={{ gap: 8 }}><Spinner /> Reading from Gmail…</div>
+  }
+  if (state.status === 'error') {
+    return (
+      <div className="row small" style={{ gap: 8, color: 'var(--amber)' }}>
+        <AlertTriangle size={13} /> {state.message}
+        {state.retryable && <Button size="sm" onClick={load}>Try again</Button>}
+      </div>
+    )
+  }
+
+  const { messages = [], older_omitted: omitted = 0 } = state.data
+  const incoming = messages.filter((m) => !m.outgoing)
+
+  return (
+    <div className="stack thread-pane" style={{ gap: 10 }}>
+      <div className="row-between">
+        <b className="small">Conversation</b>
+        <button className="linkish tiny" type="button" onClick={() => setState({ status: 'idle' })}>Hide</button>
+      </div>
+
+      {/* Both banners are re-checked against the live row, not just against
+          the payload they were fetched with. The payload is a snapshot; once
+          Check replies records the reply, the row above shows a green
+          "replied" chip and an unrevalidated banner sat underneath it still
+          insisting the app had not recorded one. */}
+      {state.data.unrecorded_reply && !hasVerifiedReply(email)
+        && !email.contact_has_replied && (
+        <div className="row small" style={{ gap: 6, color: 'var(--amber)' }}>
+          <AlertTriangle size={13} />
+          There is a reply here that the app has not recorded. Hit “Re-verify replies”
+          above to count it — reading a thread deliberately changes nothing.
+        </div>
+      )}
+      {state.data.unrecorded_bounce && !email.bounced_at
+        && !email.contact_bounced_at && (
+        <div className="row small" style={{ gap: 6, color: 'var(--amber)' }}>
+          <AlertTriangle size={13} />
+          This thread contains a delivery failure the app has not recorded.
+          “Re-verify replies” will stop follow-ups to this address.
+        </div>
+      )}
+
+      {omitted > 0 && (
+        <div className="tiny muted">
+          Showing the most recent {messages.length}; {omitted} older message
+          {omitted === 1 ? '' : 's'} not shown.
+        </div>
+      )}
+
+      {incoming.length === 0 && (
+        <div className="tiny muted">
+          No one has written back in this thread yet.
+        </div>
+      )}
+
+      {messages.map((m) => {
+        const meta = KIND_META[m.kind] || KIND_META.auto
+        const open = !!expanded[m.id]
+        return (
+          <div key={m.id} className={`thread-msg${m.outgoing ? ' outgoing' : ''}`}>
+            <div className="row-between" style={{ gap: 8 }}>
+              <span className="tiny" style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <b>{m.from_name || m.from_email || 'Unknown sender'}</b>
+                {m.from_name && m.from_email ? <span className="muted mono"> {m.from_email}</span> : null}
+              </span>
+              <span className="row" style={{ gap: 6, flexShrink: 0 }}>
+                <Chip tone={meta.tone}>{meta.label}</Chip>
+                {/* No date beats 1970: a message whose timestamp Gmail did not
+                    give us should not claim to be 54 years old. */}
+                <span className="tiny muted">{m.sent_at ? timeAgo(m.sent_at) : 'no date'}</span>
+              </span>
+            </div>
+            {/* Rendered as text, never as markup — this is the one place in the
+                app where a stranger's writing reaches the DOM. */}
+            <div className="thread-body">{m.text || <span className="muted">(no text content)</span>}</div>
+            {m.attachments?.length > 0 && (
+              <div className="tiny muted row" style={{ gap: 5, flexWrap: 'wrap' }}>
+                <Paperclip size={11} />
+                {m.attachments.join(', ')}
+              </div>
+            )}
+            {m.truncated && (
+              <div className="tiny muted">Long message — shown up to the first 40,000 characters.</div>
+            )}
+            {m.quoted && (
+              <>
+                <button className="linkish tiny" type="button"
+                  onClick={() => setExpanded((x) => ({ ...x, [m.id]: !x[m.id] }))}>
+                  {open ? 'Hide quoted text' : 'Show quoted text'}
+                </button>
+                {open && <div className="thread-body quoted">{m.quoted}</div>}
+              </>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }

@@ -25,6 +25,16 @@ const emails = [
     sent_at: '2026-02-10T10:00:00', gmail_message_id: 'abc',
     created_at: '2026-02-10T09:00:00', has_response: 0, has_follow_up: 1,
   },
+  // A legacy import: the JSON said "sent", so db.migrate_legacy_data set the
+  // status, but there is no Gmail id and repair_delivered_email_status only
+  // backfills rows that already have one. There is no thread to read.
+  {
+    id: 'legacy', status: 'sent', subject: 'ZZTEST legacy import', body: 'hello',
+    contact_name: 'ZZTEST Legacy', contact_email: 'zzl@example.com',
+    company_name: 'ZZTEST Corp', email_type: 'application',
+    sent_at: null, gmail_message_id: null,
+    created_at: '2026-01-02T09:00:00', has_response: 0, has_follow_up: 0,
+  },
 ]
 
 vi.mock('../../src/api', () => ({
@@ -36,6 +46,7 @@ vi.mock('../../src/api', () => ({
     bulkStatus: vi.fn(() => Promise.resolve({ data: { updated: 0 } })),
     generateFollowUp: vi.fn(() => Promise.resolve({ data: {} })),
     send: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })),
+    thread: vi.fn(() => Promise.resolve({ data: { messages: [], older_omitted: 0 } })),
   },
   resumesAPI: { list: vi.fn(() => Promise.resolve({ data: [] })) },
   sendWindowAPI: { get: vi.fn(() => Promise.resolve({ data: { enabled: false } })) },
@@ -95,5 +106,36 @@ describe('Emails — already-delivered rows', () => {
     expect(detail().textContent).toContain('follow-up drafted')
     expect([...detail().querySelectorAll('button')]
       .some((b) => /follow.up/i.test(b.textContent))).toBe(false)
+  })
+
+  /* Where the reply pane is offered. The pane itself is tested in
+     emails-thread.test.jsx, which renders it directly — so nothing pinned
+     *which* emails get it, and every draft could have grown a button whose
+     only possible outcome was a 409. */
+  const canReadThread = () => [...detail().querySelectorAll('button')]
+    .some((b) => /read the thread/i.test(b.textContent))
+
+  it('offers the thread on an email Gmail actually has', async () => {
+    await open()
+    openTab('Sent')
+    await waitFor(() => expect(rowTitles()).toContain('ZZTEST Jason'))
+    openRow('ZZTEST Jason')
+    expect(canReadThread()).toBe(true)
+  })
+
+  it('does not offer the thread on an unsent draft', async () => {
+    await open()
+    openRow('ZZTEST Fresh')
+    expect(canReadThread()).toBe(false)
+  })
+
+  it('does not offer the thread on a legacy row with no Gmail id', async () => {
+    // Gated on the message id rather than on "delivered": this row counts as
+    // sent everywhere else in the app, but there is nothing to fetch.
+    await open()
+    openTab('Sent')
+    await waitFor(() => expect(rowTitles()).toContain('ZZTEST Legacy'))
+    openRow('ZZTEST Legacy')
+    expect(canReadThread()).toBe(false)
   })
 })

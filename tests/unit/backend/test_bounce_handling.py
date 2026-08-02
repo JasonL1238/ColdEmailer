@@ -136,6 +136,31 @@ class TestClassifyingOneMessage:
         checker = ResponseChecker(service, own_address="me@example.com")
         assert checker._classify("m1") == OWN
 
+    def test_an_address_that_merely_contains_ours_is_not_ours(self):
+        """The guard was `own in sender`, a substring test on the raw header.
+        A profile of hr@acme.com therefore read a genuine reply from
+        chr@acme.com as our own mail: dropped from the reply rate, and the
+        contact left queued for another follow-up on the premise of silence.
+        No attacker required — short local parts collide by themselves."""
+        service = _gmail([], {"m1": {"From": "Chris <chr@acme.com>",
+                                     "Subject": "Re: hello"}})
+        checker = ResponseChecker(service, own_address="hr@acme.com")
+        assert checker._classify("m1") == REPLY
+
+    def test_a_display_name_quoting_our_address_is_not_ours(self):
+        """From is sender-controlled, so a loose match is also spoofable —
+        and here it would suppress the reply rather than fake one."""
+        service = _gmail([], {"m1": {"From": '"me@example.com" <dana@x.com>',
+                                     "Subject": "Re: hello"}})
+        checker = ResponseChecker(service, own_address="me@example.com")
+        assert checker._classify("m1") == REPLY
+
+    def test_our_own_address_still_matches_with_odd_casing_and_spacing(self):
+        service = _gmail([], {"m1": {"From": "Me  <ME@Example.COM>  ",
+                                     "Subject": "Hi"}})
+        checker = ResponseChecker(service, own_address="me@example.com")
+        assert checker._classify("m1") == OWN
+
     def test_an_unreadable_message_is_never_called_a_bounce(self):
         """Guessing BOUNCE on a network blip would mark a live address dead
         and permanently stop mail to a real person."""

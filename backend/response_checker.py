@@ -8,6 +8,7 @@ reputation that decides whether the *good* emails arrive.
 """
 import re
 from datetime import datetime
+from email.utils import parseaddr
 from typing import Dict, Optional, Tuple
 
 # The postmaster told us the message could not be delivered.
@@ -50,6 +51,71 @@ BOUNCE = "bounce"
 AUTO = "auto"
 OWN = "own"
 
+# The headers this classification reads. The thread reader asks Gmail for the
+# full message and hands the same names down, so both callers see the same
+# evidence.
+CLASSIFY_HEADERS = ["From", "Subject", "Auto-Submitted", "Content-Type",
+                    "X-Failed-Recipients", "Return-Path"]
+
+
+def classify_headers(headers: Dict[str, str],
+                     own_address: Optional[str] = None) -> str:
+    """REPLY | BOUNCE | AUTO | OWN from one message's headers.
+
+    Pure, and the *only* implementation. The reply pane shows the user which
+    messages in a thread are real replies, and the reply-rate counts them; if
+    those two came from separate rules the app would show a message labelled
+    "reply" beside a contact it still reports as never having answered. Keys
+    are matched case-insensitively — Gmail's header casing is the sender's,
+    not a constant.
+    """
+    headers = {str(k).lower(): (v or "") for k, v in (headers or {}).items()}
+    sender = headers.get("from", "")
+    subject = headers.get("subject", "")
+    auto_submitted = headers.get("auto-submitted", "").lower()
+    own = (own_address or "").strip().lower() or None
+
+    # Our own mail first. The bounce test used to run ahead of this, so a
+    # subject match bypassed the guard entirely.
+    #
+    # Compared as a parsed address, not as a substring of the header. `own in
+    # sender` made every address that merely *contains* the user's own read as
+    # the user: a profile of hr@acme.com classified a genuine reply from
+    # chr@acme.com as OWN, which silently dropped it from the reply rate and
+    # left that contact queued for another follow-up. No attacker needed —
+    # short local parts collide on their own — though a sender is free to
+    # arrange one, and a header this cheap to spoof should not be matched
+    # loosely.
+    if own and parseaddr(sender)[1].strip().lower() == own:
+        return OWN
+
+    # A bounce needs machine provenance. Any ONE of these is proof the
+    # message came from a mail system rather than a person:
+    #   * the daemon itself in From or Return-Path
+    #   * an RFC 3464 delivery-status report
+    #   * X-Failed-Recipients, which only a reporting MTA sets
+    # A bounce-shaped subject is then corroborating evidence, never
+    # evidence on its own.
+    from_daemon = bool(
+        _BOUNCE_SENDER_RE.search(sender)
+        or _BOUNCE_SENDER_RE.search(headers.get("return-path", "")))
+    is_report = "report-type=delivery-status" in (
+        headers.get("content-type", "").lower().replace(" ", ""))
+    failed_recipients = bool(headers.get("x-failed-recipients"))
+    machine_sent = auto_submitted.startswith("auto-replied") or \
+        auto_submitted.startswith("auto-generated")
+    if from_daemon or is_report or failed_recipients or (
+            machine_sent and _BOUNCE_SUBJECT_RE.search(subject)):
+        return BOUNCE
+
+    if _AUTO_SENDER_RE.search(sender):
+        return AUTO
+    if _AUTO_SUBJECT_RE.search(subject):
+        return AUTO
+    if auto_submitted and auto_submitted != "no":
+        return AUTO
+    return REPLY
+
 
 class ResponseChecker:
     """Given an authenticated Gmail service, detect replies to sent messages."""
@@ -63,47 +129,11 @@ class ResponseChecker:
         try:
             msg = self.service.users().messages().get(
                 userId="me", id=message_id, format="metadata",
-                metadataHeaders=["From", "Subject", "Auto-Submitted",
-                                 "Content-Type", "X-Failed-Recipients",
-                                 "Return-Path"],
+                metadataHeaders=list(CLASSIFY_HEADERS),
             ).execute()
             headers = {h["name"].lower(): h.get("value", "")
                        for h in msg.get("payload", {}).get("headers", [])}
-            sender = headers.get("from", "")
-            subject = headers.get("subject", "")
-            auto_submitted = headers.get("auto-submitted", "").lower()
-
-            # Our own mail first. The bounce test used to run ahead of this,
-            # so a subject match bypassed the guard entirely.
-            if self.own_address and self.own_address in sender.lower():
-                return OWN
-
-            # A bounce needs machine provenance. Any ONE of these is proof the
-            # message came from a mail system rather than a person:
-            #   * the daemon itself in From or Return-Path
-            #   * an RFC 3464 delivery-status report
-            #   * X-Failed-Recipients, which only a reporting MTA sets
-            # A bounce-shaped subject is then corroborating evidence, never
-            # evidence on its own.
-            from_daemon = bool(
-                _BOUNCE_SENDER_RE.search(sender)
-                or _BOUNCE_SENDER_RE.search(headers.get("return-path", "")))
-            is_report = "report-type=delivery-status" in (
-                headers.get("content-type", "").lower().replace(" ", ""))
-            failed_recipients = bool(headers.get("x-failed-recipients"))
-            machine_sent = auto_submitted.startswith("auto-replied") or \
-                auto_submitted.startswith("auto-generated")
-            if from_daemon or is_report or failed_recipients or (
-                    machine_sent and _BOUNCE_SUBJECT_RE.search(subject)):
-                return BOUNCE
-
-            if _AUTO_SENDER_RE.search(sender):
-                return AUTO
-            if _AUTO_SUBJECT_RE.search(subject):
-                return AUTO
-            if auto_submitted and auto_submitted != "no":
-                return AUTO
-            return REPLY
+            return classify_headers(headers, self.own_address)
         except Exception:
             # If we can't inspect it, count it as a reply — better a false
             # positive than silently dropping a real one. Never guess BOUNCE

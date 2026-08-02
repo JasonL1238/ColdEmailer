@@ -95,6 +95,7 @@ export const emailsAPI = {
   draftAllFollowUps: () => api.post('/follow-ups/draft-all'),
   cancelDraftFollowUps: (jobId) => api.post(`/follow-ups/draft-all/${jobId}/cancel`),
   checkReplies: (recheck = false) => api.post('/emails/check-replies', null, { params: { recheck } }),
+  thread: (id) => api.get(`/emails/${id}/thread`),
 }
 
 export const sendWindowAPI = {

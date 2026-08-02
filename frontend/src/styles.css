@@ -966,3 +966,30 @@ button.linkish {
   border-radius: 3px;
   transition: width .3s;
 }
+
+/* reply threads
+   The body is somebody else's writing, so it is displayed with `pre-wrap` and
+   `break-word`: preserve their line breaks, but never let a 400-character
+   unbroken URL widen the pane and push the app's own layout sideways. */
+.thread-pane { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px; }
+.thread-msg {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--green);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.thread-msg.outgoing { border-left-color: var(--border-strong, var(--border)); opacity: .78; }
+.thread-body {
+  font-size: 12.5px; line-height: 1.55; color: var(--text-1);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 340px; overflow-y: auto;
+}
+.thread-body.quoted {
+  color: var(--text-2);
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  max-height: 220px;
+}
+.chip-slate { background: var(--surface-2); color: var(--text-2); border: 1px solid var(--border-strong, var(--border)); }
