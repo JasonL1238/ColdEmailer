@@ -165,6 +165,12 @@ export default function Emails() {
     }
   }, [emails])
 
+  const queued = useMemo(
+    () => (emails || [])
+      .filter((e) => e.scheduled_at && !isDelivered(e) && e.status !== 'trashed')
+      .sort((a, b) => a.scheduled_at.localeCompare(b.scheduled_at)),
+    [emails])
+
   const visible = groups[tab] || []
   const active = visible.find((e) => e.id === activeId) || visible[0] || null
 
@@ -236,6 +242,14 @@ export default function Emails() {
       toast.success('Rewritten with fresh AI output')
     } catch (e) { toast.error(errMessage(e)) }
     finally { setBusy(false) }
+  }
+
+  const cancelSchedule = async (ids) => {
+    try {
+      const { data } = await emailsAPI.unschedule(ids)
+      load()
+      toast.success(`${data.cleared} taken out of the send queue`)
+    } catch (e) { toast.error(errMessage(e)) }
   }
 
   const makeFollowUp = async (emailId) => {
@@ -380,6 +394,24 @@ export default function Emails() {
         </div>
       )}
 
+      {/* Mail that will leave on its own. The one thing in this app that
+          happens without a click deserves to be visible and stoppable from
+          the screen where the user would look for it. */}
+      {queued.length > 0 && tab !== 'trashed' && (
+        <div className="card card-pad row-between mb-16" style={{ background: 'var(--sky-soft, var(--amber-soft))', borderColor: 'var(--border)' }}>
+          <div className="row">
+            <Clock size={16} style={{ color: 'var(--text-2)' }} />
+            <span className="small">
+              <b>{queued.length} email{queued.length === 1 ? '' : 's'}</b> queued to
+              send {whenLabel(queued[0].scheduled_at)} without further confirmation.
+            </span>
+          </div>
+          <Button size="sm" onClick={() => cancelSchedule(queued.map((e) => e.id))}>
+            Cancel {queued.length === 1 ? 'it' : 'them all'}
+          </Button>
+        </div>
+      )}
+
       {followUps.length > 0 && tab !== 'trashed' && (
         <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
           <div className="row">
@@ -480,6 +512,11 @@ export default function Emails() {
                           ? <Chip tone="amber"><MessageSquare size={10} /> reply unverified</Chip>
                           : null}
                       {isUnconfirmed(e) && <Chip tone="amber">delivery unconfirmed</Chip>}
+                      {e.scheduled_at && !isDelivered(e) && (
+                        <Chip tone="sky" title={`Queued to send at ${e.scheduled_at} without further confirmation.`}>
+                          <Clock size={10} /> queued {whenLabel(e.scheduled_at)}
+                        </Chip>
+                      )}
                       {addressWarning(e) && (
                         <Chip tone="amber" title={addressWarning(e).title}>
                           {addressWarning(e).label}

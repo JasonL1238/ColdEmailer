@@ -1233,7 +1233,30 @@ class Database:
                 updates[bool_key] = 1 if updates[bool_key] else 0
         if "status" in updates:
             self._record_follow_up_opt_out(email_id, updates["status"])
+        self._drop_stale_schedule(email_id, updates)
         self._update("emails", email_id, updates)
+
+    def _drop_stale_schedule(self, email_id: str, updates: Dict[str, Any]):
+        """A queued message stops being queued the moment it changes.
+
+        Trashing one only dropped it out of the sweep's status filter; the
+        stamp survived, so restoring the draft a week later armed a background
+        send of week-old text. Editing the body was worse — the queue would
+        deliver something other than what was approved. Done here rather than
+        in each endpoint because trash, restore, edit and regenerate are four
+        separate routes and the next one added would have missed it.
+
+        Skipped when the caller is setting `scheduled_at` itself: that is the
+        scheduling branch, which sets status and stamp in one write.
+        """
+        if "scheduled_at" in updates:
+            return
+        if not any(k in updates for k in ("status", "body", "subject")):
+            return
+        row = self.query_one("SELECT scheduled_at FROM emails WHERE id=?", (email_id,))
+        if row and row["scheduled_at"]:
+            updates["scheduled_at"] = None
+            updates["scheduled_by_job"] = None
 
     def _record_follow_up_opt_out(self, email_id: str, new_status: str):
         """Trashing a follow-up means "not this person"; restoring it undoes

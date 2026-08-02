@@ -22,6 +22,8 @@ from datetime import datetime, timedelta
 import pytest
 from fastapi import HTTPException
 
+from zoneinfo import ZoneInfo
+
 import main
 import send_window
 from db import Database
@@ -37,6 +39,12 @@ MONDAY_9AM = datetime(2026, 8, 3, 9, 0)
 def db():
     with tempfile.TemporaryDirectory() as tmp:
         yield Database(os.path.join(tmp, "test.db"))
+
+
+def _recently(hours=1):
+    """A stamp whose moment has passed but is still inside the staleness
+    floor — the ordinary "this is due now" case."""
+    return (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
 def _window(**kw):
@@ -101,8 +109,11 @@ def test_a_corrupt_window_falls_back_instead_of_never_sending(db):
     fixed = send_window.normalize_send_window({"enabled": True, "start_hour": 17,
                                                "end_hour": 9})
     assert fixed["start_hour"] == 8 and fixed["end_hour"] == 17
-    assert send_window.normalize_send_window(
-        {"enabled": True, "start_hour": 17, "end_hour": 17})["end_hour"] == 17
+    # Equal hours are a zero-length window. Asserting only end_hour == 17 was
+    # a tautology — 17 is the answer with the repair and without it.
+    equal = send_window.normalize_send_window(
+        {"enabled": True, "start_hour": 17, "end_hour": 17})
+    assert equal["start_hour"] == 8 and equal["end_hour"] == 17
     # junk days are dropped; an empty result falls back to weekdays
     assert send_window.normalize_send_window(
         {"days": ["x", 9, -1, True, 2, 2]})["days"] == [2]
@@ -155,6 +166,7 @@ class _FakeSender:
 
     def __init__(self):
         self.calls = []
+        self.options = []
         self.authenticated = 0
 
     def authenticate(self):
@@ -162,6 +174,11 @@ class _FakeSender:
 
     def send_email(self, email, from_email, resume_path=None):
         self.calls.append(email["id"])
+        # Recorded, not ignored. Dropping these was why a scheduled batch could
+        # staple the default resume onto mail the user had unticked "Attach
+        # resume" for, with every test still green.
+        self.options.append({"email_id": email["id"], "resume_path": resume_path,
+                             "from_email": from_email})
         return {"success": True, "email_id": email["id"],
                 "gmail_message_id": "m", "gmail_thread_id": "t"}
 
@@ -240,7 +257,7 @@ def test_the_sweep_does_nothing_while_the_window_is_off(api):
     """Even with a row already stamped — switching the window off is a stop
     button, not just a refusal to queue new work."""
     sender, contact, draft = api
-    main.db.update_email(draft["id"], {"scheduled_at": "2020-01-01T09:00:00",
+    main.db.update_email(draft["id"], {"scheduled_at": _recently(),
                                        "status": "approved"})
 
     assert main.scheduled_send_sweep() is None
@@ -252,7 +269,7 @@ def test_the_sweep_does_nothing_outside_the_window(api, monkeypatch):
     sender, contact, draft = api
     main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
                                 "start_hour": 8, "end_hour": 17})
-    main.db.update_email(draft["id"], {"scheduled_at": "2020-01-01T09:00:00",
+    main.db.update_email(draft["id"], {"scheduled_at": _recently(),
                                        "status": "approved"})
     monkeypatch.setattr(send_window, "is_open", lambda w, now=None: False)
 
@@ -264,7 +281,7 @@ def test_the_sweep_sends_what_is_due_and_clears_the_stamp(api, monkeypatch):
     sender, contact, draft = api
     main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
                                 "start_hour": 8, "end_hour": 17})
-    main.db.update_email(draft["id"], {"scheduled_at": "2020-01-01T09:00:00",
+    main.db.update_email(draft["id"], {"scheduled_at": _recently(),
                                        "status": "approved"})
     monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
 
@@ -299,7 +316,7 @@ def test_the_sweep_never_resends_something_already_delivered(api, monkeypatch):
     sender, contact, draft = api
     main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
                                 "start_hour": 8, "end_hour": 17})
-    main.db.update_email(draft["id"], {"scheduled_at": "2020-01-01T09:00:00",
+    main.db.update_email(draft["id"], {"scheduled_at": _recently(),
                                        "status": "sent", "sent_at": "2020-01-02T09:00:00",
                                        "gmail_message_id": "already-gone"})
     monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
@@ -314,7 +331,7 @@ def test_the_sweep_stands_down_while_a_manual_batch_holds_the_lock(api, monkeypa
     sender, contact, draft = api
     main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
                                 "start_hour": 8, "end_hour": 17})
-    main.db.update_email(draft["id"], {"scheduled_at": "2020-01-01T09:00:00",
+    main.db.update_email(draft["id"], {"scheduled_at": _recently(),
                                        "status": "approved"})
     monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
     main._send_lock.acquire()
@@ -332,7 +349,7 @@ def test_the_sweep_leaves_everything_queued_when_gmail_is_not_authenticated(
     sender, contact, draft = api
     main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
                                 "start_hour": 8, "end_hour": 17})
-    main.db.update_email(draft["id"], {"scheduled_at": "2020-01-01T09:00:00",
+    main.db.update_email(draft["id"], {"scheduled_at": _recently(),
                                        "status": "approved"})
     monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
 
@@ -359,6 +376,215 @@ def test_a_queued_message_can_be_taken_back_out(api):
 
     assert result["cleared"] == 1
     assert main.db.get_email(draft["id"])["scheduled_at"] is None
+
+
+# ---------- what the queue remembers ----------
+
+def test_a_queued_batch_keeps_the_send_options_the_user_chose(api, monkeypatch):
+    """The batch is sent minutes or days later by a thread that can only know
+    what the user picked if it was written down. Storing just the ids meant
+    "Attach resume" unticked came back as True — the default resume stapled to
+    unattended mail — and a confirmed resume override came back as None."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
+    monkeypatch.setattr(main.resumes, "resolve_attachment_path",
+                        lambda rid: f"/tmp/{rid}.pdf" if rid else None)
+
+    main.send_emails(SendRequest(email_ids=[draft["id"]], attach_resume=False,
+                                 from_email="alias@example.com",
+                                 schedule="next_window"))
+    main.db.update_email(draft["id"], {"scheduled_at": _recently()})
+
+    _await(main.scheduled_send_sweep())
+
+    assert len(sender.options) == 1
+    assert sender.options[0]["resume_path"] is None      # not the default resume
+    assert sender.options[0]["from_email"] == "alias@example.com"
+
+
+def test_a_queued_batch_honours_a_chosen_resume(api, monkeypatch):
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
+    monkeypatch.setattr(main.resumes, "resolve_attachment_path",
+                        lambda rid: f"/tmp/{rid}.pdf" if rid else None)
+
+    main.send_emails(SendRequest(email_ids=[draft["id"]], attach_resume=True,
+                                 resume_id="chosen-one", schedule="next_window"))
+    main.db.update_email(draft["id"], {"scheduled_at": _recently()})
+
+    _await(main.scheduled_send_sweep())
+
+    assert sender.options[0]["resume_path"] == "/tmp/chosen-one.pdf"
+
+
+def test_a_draft_rewritten_while_queued_is_dropped_rather_than_sent(api, monkeypatch):
+    """The attachment check ran once, at request time, against options that
+    were then discarded. A body edited in the days before the batch fires can
+    start promising an attachment these options would not send — so the
+    question is asked again, at the moment nobody is watching."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
+
+    main.send_emails(SendRequest(email_ids=[draft["id"]], attach_resume=False,
+                                 schedule="next_window"))
+    # the user reopens it and adds a promise the queued options cannot keep
+    main.db.execute("UPDATE emails SET body=? WHERE id=?",
+                    ("Hi there,\n\nMy resume is attached.", draft["id"]))
+    main.db.update_email(draft["id"], {"scheduled_at": _recently()})
+
+    assert main.scheduled_send_sweep() is None
+    assert sender.calls == []
+    assert main.db.get_email(draft["id"])["scheduled_at"] is None
+    assert not main._send_lock.locked()
+
+
+# ---------- a queued row stops being queued when it changes ----------
+
+def test_trashing_a_queued_email_takes_it_out_of_the_queue(api):
+    """Trashing only dropped it out of the sweep's status filter — the stamp
+    survived, so restoring the draft a week later armed a background send of
+    week-old text with no fresh opt-in."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
+    assert main.db.get_email(draft["id"])["scheduled_at"] is not None
+
+    main.db.update_email(draft["id"], {"status": "trashed"})
+    assert main.db.get_email(draft["id"])["scheduled_at"] is None
+
+    main.db.update_email(draft["id"], {"status": "draft"})
+    assert main.db.get_email(draft["id"])["scheduled_at"] is None
+
+
+def test_editing_a_queued_email_takes_it_out_of_the_queue(api):
+    """What was approved for unattended sending is the text as it stood. Edit
+    it and the queue would deliver something else."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
+
+    main.db.update_email(draft["id"], {"body": "A different message entirely."})
+
+    assert main.db.get_email(draft["id"])["scheduled_at"] is None
+
+
+def test_switching_the_window_off_empties_the_queue(api):
+    """The card then reads "Sending is not held for business hours", which is
+    a claim about the future the app has to keep. Leaving rows stamped merely
+    paused them, invisibly, until the window came back on."""
+    import asyncio
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
+
+    result = asyncio.run(main.set_send_window(SendWindowUpdate(enabled=False)))
+
+    assert result["unscheduled"] == 1
+    assert main.db.get_email(draft["id"])["scheduled_at"] is None
+
+
+def test_a_stamp_left_behind_too_long_is_dropped_not_sent(api, monkeypatch):
+    """A queue abandoned while the window was off would otherwise all satisfy
+    `scheduled_at <= now` and leave in one burst the minute it came back —
+    months-old drafts, in a batch nobody asked for today."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
+    main.db.update_email(draft["id"], {"status": "approved"})
+    main.db.execute("UPDATE emails SET scheduled_at=? WHERE id=?",
+                    (_recently(hours=24 * 30), draft["id"]))
+
+    assert main.scheduled_send_sweep() is None
+    assert sender.calls == []
+    assert main.db.get_email(draft["id"])["scheduled_at"] is None
+
+
+# ---------- the stamp and the clock agree ----------
+
+def test_the_stamp_is_written_in_the_frame_the_sweep_compares_against(api):
+    """`next_opening` answers in the *window's* zone; the sweep compares
+    against naive server-local time. Storing the window's wall clock meant a
+    UTC container with an Australia/Sydney window fired ten hours out."""
+    from datetime import timezone as _tz
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "timezone": "Australia/Sydney",
+                                "days": [0, 1, 2, 3, 4, 5, 6],
+                                "start_hour": 0, "end_hour": 23})
+    main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
+
+    stamp = main.db.get_email(draft["id"])["scheduled_at"]
+    stored = datetime.fromisoformat(stamp)
+    # The stored instant is within a minute of now in *this machine's* frame,
+    # whatever offset Sydney happens to be at.
+    assert abs((stored - datetime.now()).total_seconds()) < 90, stamp
+
+
+def test_a_zone_aware_window_answers_in_that_zone():
+    """No test set a timezone at all, so the conversion branch was never taken
+    — which is how the frame mismatch above shipped."""
+    from zoneinfo import ZoneInfo
+    from datetime import timezone as _tz
+    w = _window(timezone="Australia/Sydney", days=[0, 1, 2, 3, 4],
+                start_hour=8, end_hour=17)
+    # 2026-08-03 22:00 UTC is Tuesday 08:00 in Sydney (UTC+10)
+    utc_moment = datetime(2026, 8, 3, 22, 0, tzinfo=_tz.utc)
+    assert send_window.is_open(w, utc_moment)
+    assert send_window.next_opening(w, utc_moment).tzinfo is not None
+    # ...and 2026-08-03 12:00 UTC is Monday 22:00 Sydney — shut
+    assert not send_window.is_open(w, datetime(2026, 8, 3, 12, 0, tzinfo=_tz.utc))
+
+
+def test_a_spring_forward_hour_that_does_not_exist_is_never_promised():
+    """`probe += timedelta(hours=1)` is wall-clock arithmetic, so it can land
+    on 02:00 on a US changeover day — a time that never occurs. Returning it
+    promises a moment that never arrives and the batch waits a whole week."""
+    from datetime import timezone as _tz
+    w = _window(timezone="America/New_York", days=[6], start_hour=2, end_hour=3)
+    saturday = datetime(2026, 3, 7, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+    opening = send_window.next_opening(w, saturday)
+    assert opening is not None
+    # whatever it picked, it must be a real instant that round-trips
+    assert opening == opening.astimezone(_tz.utc).astimezone(opening.tzinfo)
+
+
+def test_the_detected_timezone_is_a_region_not_a_fixed_offset_alias(monkeypatch):
+    """'EST' is a real tzdb entry — the legacy fixed UTC-05:00 zone that never
+    observes DST — so accepting it left the suggestion an hour wrong for eight
+    months of the year, silently, because it parses.
+
+    Forced down the abbreviation path rather than trusting whatever this
+    machine happens to report: on a box where tzlocal answers correctly the
+    fallback is never reached, and the bug lived there."""
+    import time as _time
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_tzlocal(name, *a, **kw):
+        if name == "tzlocal":
+            raise ImportError("not installed")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _no_tzlocal)
+    monkeypatch.setattr(_time, "tzname", ("EST", "EDT"))
+    assert send_window.local_timezone_name() == ""
+
+    monkeypatch.setattr(_time, "tzname", ("America/New_York", "EDT"))
+    assert send_window.local_timezone_name() == "America/New_York"
+
+    # ...and whatever this machine really reports must at least be usable
+    monkeypatch.undo()
+    name = send_window.local_timezone_name()
+    assert name == "" or ("/" in name and send_window.resolve_timezone(name)), name
 
 
 def _await(job_id, timeout=10.0):

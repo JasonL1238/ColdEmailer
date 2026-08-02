@@ -6,11 +6,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, waitFor, fireEvent } from '@testing-library/react'
 
-const { sendSpy, windowSpy } = vi.hoisted(() => ({
+const { sendSpy, windowSpy, unscheduleSpy } = vi.hoisted(() => ({
   sendSpy: vi.fn(() => Promise.resolve({
     data: { id: 'job1', status: 'done', result: { scheduled: 1, scheduled_at: '2026-08-04T08:00:00' } },
   })),
   windowSpy: vi.fn(),
+  unscheduleSpy: vi.fn(() => Promise.resolve({ data: { cleared: 1 } })),
 }))
 
 let emails = [{
@@ -29,6 +30,7 @@ vi.mock('../../src/api', () => ({
     followUps: vi.fn(() => Promise.resolve({ data: [] })),
     update: vi.fn(() => Promise.resolve({ data: {} })),
     bulkStatus: vi.fn(() => Promise.resolve({ data: { updated: 0 } })),
+    unschedule: unscheduleSpy,
     send: sendSpy,
   },
   resumesAPI: { list: vi.fn(() => Promise.resolve({ data: [] })) },
@@ -131,5 +133,41 @@ describe('SendModal — the scheduling gate', () => {
     expect(sendNowButton()).toBeTruthy()
     fireEvent.click(sendNowButton())
     await waitFor(() => expect(sendSpy).toHaveBeenCalled())
+  })
+})
+
+describe('Emails — queued mail is visible and stoppable', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    windowSpy.mockResolvedValue({ data: { enabled: true, open_now: false,
+      description: '8am–5pm on weekdays', next_opening: '2026-08-04T08:00:00' } })
+    emails = [{ ...emails[0], scheduled_at: '2026-08-04T08:00:00', status: 'approved' }]
+  })
+
+  it('says so on the list, and offers to take it back out', async () => {
+    /* This is the only thing in the app that happens without a click, and
+       before this it was invisible: no chip, no banner, and the unschedule
+       endpoint had no caller anywhere in the frontend. */
+    render(<Emails />)
+    await waitFor(() => expect(document.querySelectorAll('.email-row').length).toBe(1))
+
+    expect(document.body.textContent).toMatch(/queued to\s+send/i)
+    const cancel = [...document.querySelectorAll('button')]
+      .find((b) => /^Cancel it$/.test(b.textContent.trim()))
+    expect(cancel).toBeTruthy()
+
+    fireEvent.click(cancel)
+    await waitFor(() => expect(unscheduleSpy).toHaveBeenCalledWith(['e1']))
+  })
+
+  it('says nothing when a queued row has already been delivered', async () => {
+    /* A stamp left behind on a row that has since gone out — by a manual send
+       or by reconciliation — must not read as "this will send again". */
+    emails = [{ ...emails[0], status: 'sent', gmail_message_id: 'gm1',
+      sent_at: '2026-08-04T08:00:00' }]
+    render(<Emails />)
+    await waitFor(() => expect(document.querySelector('.page')).toBeTruthy())
+    await waitFor(() => expect(document.body.textContent).toMatch(/Sent/))
+    expect(document.body.textContent).not.toMatch(/queued to\s+send/i)
   })
 })

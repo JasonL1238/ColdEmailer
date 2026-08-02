@@ -2292,14 +2292,34 @@ def send_emails(payload: SendRequest):
         raise HTTPException(401, f"Gmail authentication failed: {e}")
 
     try:
-        job = db.create_job("send", {"email_ids": sendable})
-        db.update_job(job["id"], progress_total=len(sendable), stage="Sending")
         from_email = (payload.from_email or "").strip() or (db.get_profile().get("email") or "me")
+        # The whole option set, not just the ids. A scheduled batch is sent by
+        # a thread minutes or days later, and it can only know what the user
+        # chose if the choice was written down — reading these back out of a
+        # payload that held only `email_ids` meant "Attach resume" unticked
+        # came back as True, and a resume override the user confirmed came
+        # back as None.
+        job = db.create_job("send", {
+            "email_ids": sendable,
+            "resume_id": payload.resume_id,
+            "attach_resume": bool(payload.attach_resume),
+            "from_email": from_email,
+            "confirm_resend": bool(payload.confirm_resend),
+            "confirm_attachment_change": bool(payload.confirm_attachment_change),
+        })
+        db.update_job(job["id"], progress_total=len(sendable), stage="Sending")
         if scheduled_for is not None:
             # Both gates passed: the window is enabled *and* this batch asked
             # to be scheduled. Stamp the rows and hand them to the scheduler
             # rather than to Gmail. Nothing is sent in this request.
-            stamp = scheduled_for.replace(tzinfo=None).isoformat(timespec="seconds")
+            #
+            # Converted to *this machine's* frame before the tzinfo is dropped.
+            # The sweep compares the stamp against db.now_iso(), which is naive
+            # server-local — storing the window's wall clock instead meant a
+            # UTC container with an Australia/Sydney window fired ten hours
+            # out, in whichever direction the offset ran.
+            stamp = scheduled_for.astimezone().replace(tzinfo=None).isoformat(
+                timespec="seconds")
             for eid in sendable:
                 db.update_email(eid, {"status": "approved",
                                       "scheduled_at": stamp,
@@ -2328,6 +2348,10 @@ def send_emails(payload: SendRequest):
 
 
 _SCHEDULER_TICK_SECONDS = int(os.getenv("COLD_SCHEDULER_TICK_SECONDS", "60"))
+# A queued message whose moment passed this long ago is dropped rather than
+# sent. Generous enough to survive a laptop closed over a weekend, short enough
+# that nothing goes out claiming to be timely when it is not.
+_SCHEDULE_STALE_AFTER_HOURS = int(os.getenv("COLD_SCHEDULE_STALE_HOURS", "72"))
 
 
 def scheduled_send_sweep() -> Optional[str]:
@@ -2346,12 +2370,28 @@ def scheduled_send_sweep() -> Optional[str]:
         return None
     if not send_window.is_open(window):
         return None
+    # Anything whose moment passed more than this long ago is not "due", it is
+    # forgotten. Without the floor, a queue left behind while the window was
+    # switched off would all satisfy `scheduled_at <= now` and go out in one
+    # burst the minute it was switched back on — months-old drafts, in a batch
+    # nobody asked for today.
+    floor = (datetime.now() - timedelta(hours=_SCHEDULE_STALE_AFTER_HOURS)) \
+        .isoformat(timespec="seconds")
+    stale = db.query(
+        "SELECT id FROM emails WHERE scheduled_at IS NOT NULL AND scheduled_at < ? "
+        "AND status IN ('draft', 'approved')", (floor,))
+    for row in stale:
+        db.update_email(row["id"], {"scheduled_at": None, "scheduled_by_job": None})
+        db.log_event("email", row["id"], "send_unscheduled",
+                     "queued too long ago to send unattended")
+
     due = db.query(
         "SELECT id, scheduled_by_job FROM emails "
         "WHERE scheduled_at IS NOT NULL AND scheduled_at <= ? "
+        "  AND scheduled_at >= ? "
         "  AND status IN ('draft', 'approved') "
         "  AND sent_at IS NULL AND gmail_message_id IS NULL "
-        "ORDER BY scheduled_at ASC", (now_iso(),))
+        "ORDER BY scheduled_at ASC", (now_iso(), floor))
     if not due:
         return None
     # Group by the batch that scheduled them, so each keeps the attachment and
@@ -2372,6 +2412,30 @@ def scheduled_send_sweep() -> Optional[str]:
     try:
         origin = _parse_job(db.get_job(batch_key)) if batch_key else None
         options = (origin or {}).get("payload") or {}
+        attach = bool(options.get("attach_resume", True))
+        resume_override = options.get("resume_id")
+
+        # The attachment check runs again here, against the options actually
+        # stored. The request-time check happened before anything was queued,
+        # and a draft can be rewritten in the days between — so the only way to
+        # be sure the body and the attachment still agree is to ask now, with
+        # nobody watching, which is exactly when it matters most.
+        if not options.get("confirm_attachment_change"):
+            contradicted = []
+            for eid in list(ids):
+                row = db.get_email(eid)
+                if row and _attachment_claim_conflict(row, attach, resume_override):
+                    contradicted.append(eid)
+            for eid in contradicted:
+                ids.remove(eid)
+                db.update_email(eid, {"scheduled_at": None,
+                                      "scheduled_by_job": None})
+                db.log_event("email", eid, "send_unscheduled",
+                             "body no longer matches the queued attachment options")
+            if not ids:
+                _send_lock.release()
+                return None
+
         # Clear the stamp before handing over. If this process dies mid-batch
         # the rows become ordinary drafts the user can look at, rather than
         # something a later sweep picks up and sends again.
@@ -2382,8 +2446,7 @@ def scheduled_send_sweep() -> Optional[str]:
                       stage="Sending (scheduled)")
         threading.Thread(
             target=_send_batch_job,
-            args=(job["id"], ids, options.get("resume_id"),
-                  bool(options.get("attach_resume", True)),
+            args=(job["id"], ids, resume_override, attach,
                   options.get("from_email") or (db.get_profile().get("email") or "me"),
                   bool(options.get("confirm_resend"))),
             daemon=True,
@@ -2423,10 +2486,25 @@ async def get_send_window():
 
 @app.put("/api/send-window")
 async def set_send_window(payload: SendWindowUpdate):
+    was_enabled = db.get_send_window().get("enabled")
     window = db.update_send_window(payload.model_dump())
+    cleared = 0
+    if was_enabled and not window["enabled"]:
+        # Switching the window off reads as "stop", and the card then says
+        # sending is not held for business hours. Leaving rows stamped merely
+        # *paused* them: the queue survived, invisible, and re-enabling the
+        # window months later released every stale row at once.
+        for row in db.query(
+                "SELECT id FROM emails WHERE scheduled_at IS NOT NULL "
+                "AND status IN ('draft', 'approved')"):
+            db.update_email(row["id"], {"scheduled_at": None,
+                                        "scheduled_by_job": None})
+            cleared += 1
     db.log_event("settings", "send_window", "send_window_updated",
-                 send_window.describe(window))
-    return {**window, "description": send_window.describe(window)}
+                 send_window.describe(window)
+                 + (f" (unqueued {cleared})" if cleared else ""))
+    return {**window, "description": send_window.describe(window),
+            "unscheduled": cleared}
 
 
 @app.post("/api/emails/unschedule")

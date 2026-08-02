@@ -16,7 +16,7 @@ rarely know where a recipient is (the company `location` field is a scraped
 free-text string like "Remote / NYC"), and guessing wrong is worse than not
 guessing: a confident 09:00 in the wrong zone is 04:00 somewhere real.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 try:
@@ -45,23 +45,31 @@ SEND_WINDOW_DEFAULT = {
 
 
 def local_timezone_name() -> str:
-    """The machine's IANA zone name, or "" when it cannot be determined."""
+    """The machine's IANA zone name, or "" when it cannot be determined.
+
+    Only region/city names are accepted. `time.tzname` gives abbreviations —
+    ('EST', 'EDT') on a New York machine — and 'EST' happens to *be* a tzdb
+    entry: the legacy fixed UTC-05:00 zone that never observes daylight saving.
+    Taking it left the suggested timezone an hour wrong for eight months of the
+    year, silently, because it parses perfectly. A '/' is what separates a real
+    region from those fixed-offset aliases.
+    """
     try:
-        name = datetime.now().astimezone().tzname()
-        # tzname() gives an abbreviation ("EDT"), not an IANA name. Prefer the
-        # real thing when the platform exposes it.
+        import tzlocal                                  # optional, exact
+        name = str(tzlocal.get_localzone())
+        if "/" in name and resolve_timezone(name):
+            return name
+    except Exception:
+        pass
+    try:
+        zones = available_timezones() if available_timezones else set()
         import time as _time
         for candidate in (getattr(_time, "tzname", ()) or ()):
-            if candidate and available_timezones and candidate in available_timezones():
+            if candidate and "/" in candidate and candidate in zones:
                 return candidate
-        try:
-            import tzlocal                              # optional
-            return str(tzlocal.get_localzone())
-        except Exception:
-            pass
-        return name if (available_timezones and name in available_timezones()) else ""
     except Exception:
-        return ""
+        pass
+    return ""
 
 
 def resolve_timezone(name: Optional[str]):
@@ -182,11 +190,28 @@ def next_opening(window: Dict[str, Any],
     probe = moment.replace(minute=0, second=0, microsecond=0)
     for _ in range(24 * 15):
         probe += timedelta(hours=1)
+        # Wall-clock arithmetic enumerates hours that do not exist on a
+        # spring-forward day — 02:00 on the US changeover is 01:59:59 EST
+        # followed by 03:00:00 EDT. Returning one would promise a moment that
+        # never arrives, and the batch would sit unsent until the next week's
+        # opening. Normalizing through UTC maps a skipped hour onto the real
+        # instant the clock jumped to.
+        probe = _real_instant(probe)
         if probe.weekday() in window["days"] and probe.hour == window["start_hour"]:
             return probe
         if _in_window(probe, window):
             return probe
     return None
+
+
+def _real_instant(moment: datetime) -> datetime:
+    """Map a wall time onto the instant that actually occurs in its zone."""
+    if moment.tzinfo is None:
+        return moment
+    try:
+        return moment.astimezone(timezone.utc).astimezone(moment.tzinfo)
+    except Exception:
+        return moment
 
 
 def describe(window: Dict[str, Any]) -> str:
