@@ -21,6 +21,15 @@ export const isDelivered = (e) => !!(e.gmail_message_id || e.sent_at)
 // have queued it, so this is not a safe retry — never present it as one.
 export const isUnconfirmed = (e) => !!e.send_attempted_at && !isDelivered(e)
 
+/* Whether this email can still be changed at all — the single definition
+   behind both the detail pane's buttons and the keyboard shortcuts.
+   `isDelivered` alone is not it: a legacy row imported as status='sent'
+   carries no Gmail id and no timestamp, and the detail pane has always hidden
+   its Trash button. A shortcut gated on the narrower test offered to trash
+   exactly those rows, and the backend then refused — leaving a "trashed"
+   toast and an Undo button for something that never happened. */
+export const isEditable = (e) => !(e.status === 'sent' || isDelivered(e))
+
 // A reply flag the current checker has confirmed vs. one inherited from the old
 // checker (which counted bounces, auto-replies and our own messages). Only the
 // first may be stated as fact — including its date.
@@ -120,6 +129,42 @@ export const followUpState = (email, cadence) => {
   return { kind: 'ready', step: sent + 1, total: steps }
 }
 
+/* Keyboard review.
+
+   Reviewing forty drafts is forty round trips to the mouse, and the thing
+   that actually takes the time is moving between them, not deciding.
+
+   Two rules decide what is on this list and what is not.
+
+   **Nothing irreversible gets a key.** There is no send shortcut and there
+   never should be: every other action here can be undone from the UI, and a
+   single keystroke that mails a stranger cannot. Trash is the closest call,
+   and it is a status change that Trash → Restore reverses — plus the toast
+   carries an Undo, because a key you can hold down needs one.
+
+   **The editor owns the keyboard whenever it has focus.** Otherwise typing
+   "x" into a body trashes the draft you were writing. */
+export function shouldIgnoreShortcut(event, { modalOpen } = {}) {
+  if (modalOpen) return true
+  // Cmd/Ctrl/Alt combinations belong to the browser and the OS — swallowing
+  // Cmd+A or Cmd+E to mean "approve" or "edit" would be theft.
+  if (event.metaKey || event.ctrlKey || event.altKey) return true
+  const el = event.target
+  const tag = el?.tagName
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+    || !!el?.isContentEditable
+}
+
+export const SHORTCUTS = [
+  ['j  /  ↓', 'Next draft'],
+  ['k  /  ↑', 'Previous draft'],
+  ['e', 'Edit the body'],
+  ['Esc', 'Leave the editor'],
+  ['a', 'Approve'],
+  ['x', 'Trash (undoable)'],
+  ['?', 'This list'],
+]
+
 export default function Emails() {
   const { navigate, settings } = useApp()
   const [emails, setEmails] = useState(null)
@@ -130,9 +175,15 @@ export default function Emails() {
   const [sendModal, setSendModal] = useState(null)   // list of email ids to send
   const [busy, setBusy] = useState(false)
   const [editorRev, setEditorRev] = useState(0)      // forces the editor to reload its text
+  const [showKeys, setShowKeys] = useState(false)
   // Set by the open editor whenever it holds unsaved changes, so navigating
   // away can warn instead of silently discarding the user's writing.
   const pendingEdits = useRef(false)
+  const bodyRef = useRef(null)
+  // The detail pane publishes its own approve here, so the key and the button
+  // are one code path rather than two that can drift apart.
+  const approveRef = useRef(null)
+  const trashing = useRef(new Set())
 
   const confirmDiscard = useCallback(() => {
     if (!pendingEdits.current) return true
@@ -193,7 +244,7 @@ export default function Emails() {
   const patchLocal = (id, updates) =>
     setEmails((prev) => prev.map((e) => (e.id === id ? { ...e, ...updates } : e)))
 
-  const setStatus = async (ids, status, keepSelection = false) => {
+  const setStatus = async (ids, status, keepSelection = false, quiet = false) => {
     try {
       const { data } = await emailsAPI.bulkStatus(ids, status)
       // The backend refuses to change already-sent emails, so trust its count
@@ -204,9 +255,12 @@ export default function Emails() {
       // the user built up in the list.
       if (!keepSelection) setSelected(new Set())
       else setSelected((prev) => new Set([...prev].filter((id) => !ids.includes(id))))
+      // `quiet` is for callers that say it better themselves — the keyboard
+      // trash replaces this with a toast carrying an Undo, and two toasts for
+      // one keystroke is noise.
       if (updated < ids.length) {
         toast(`${updated} of ${ids.length} updated — sent emails can't be changed`, { icon: 'ℹ️' })
-      } else if (status === 'trashed') {
+      } else if (status === 'trashed' && !quiet) {
         toast.success(`${updated === 1 ? 'Email' : `${updated} emails`} trashed`)
       }
     } catch (e) { toast.error(errMessage(e)) }
@@ -252,6 +306,38 @@ export default function Emails() {
     } catch (e) { toast.error(errMessage(e)) }
   }
 
+  /* Trash, with a way back.
+
+     A key you can hold down needs an undo that is not "switch tabs and go
+     find it". The restore is the same status change the Trash tab's own
+     button makes, so there is one code path for coming back. */
+  const trashWithUndo = async (email) => {
+    // One trash per press, even if a second keystroke lands before the reload.
+    // Without this, repeats fired duplicate requests against the same id and
+    // stacked an Undo toast for each — all but one a no-op to dismiss.
+    if (trashing.current.has(email.id)) return
+    trashing.current.add(email.id)
+    // What it was before, so Undo is an undo. Restoring everything to 'draft'
+    // quietly demoted an approved email that had already been reviewed, which
+    // is a second, invisible change the user never asked for.
+    const was = email.status === 'approved' ? 'approved' : 'draft'
+    try {
+      await setStatus([email.id], 'trashed', true, true)
+    } finally {
+      trashing.current.delete(email.id)
+    }
+    const who = email.contact_name || email.contact_email || 'Draft'
+    toast((t) => (
+      <span className="row" style={{ gap: 10 }}>
+        {who} trashed
+        <button type="button" className="linkish tiny" onClick={() => {
+          toast.dismiss(t.id)
+          setStatus([email.id], was, true, true)
+        }}>Undo</button>
+      </span>
+    ), { duration: 6000 })
+  }
+
   const makeFollowUp = async (emailId) => {
     setBusy(true)
     try {
@@ -262,6 +348,94 @@ export default function Emails() {
     } catch (e) { toast.error(errMessage(e)) }
     finally { setBusy(false) }
   }
+
+  /* The keyboard.
+
+     Held in a ref and refreshed every render, so the handler always sees
+     current state without the window listener being torn down and re-added on
+     each keystroke — and without the [] deps that would have frozen `active`
+     at the first draft forever. */
+  const onKeyRef = useRef(null)
+  onKeyRef.current = (event) => {
+    if (event.key === '?' && !shouldIgnoreShortcut(event, { modalOpen: !!sendModal })) {
+      event.preventDefault()
+      setShowKeys((open) => !open)
+      return
+    }
+    // Escape belongs to whatever is in front: the editor first, then the help.
+    if (event.key === 'Escape') {
+      if (document.activeElement === bodyRef.current) {
+        bodyRef.current?.blur()
+        return
+      }
+      if (showKeys) setShowKeys(false)
+      return
+    }
+    if (showKeys || shouldIgnoreShortcut(event, { modalOpen: !!sendModal })) return
+    if (!active) return
+
+    const index = visible.findIndex((e) => e.id === active.id)
+    const move = (delta) => {
+      const next = visible[index + delta]
+      // Stop at the ends rather than wrapping: on a review list, wrapping
+      // silently starts you over and you re-read what you just cleared.
+      if (!next || !confirmDiscard()) return
+      setActiveId(next.id)
+      // Optional call: scrolling is a nicety, and an environment without it
+      // must not turn "move to the next draft" into a thrown error.
+      document.querySelector(`[data-email-row="${next.id}"]`)
+        ?.scrollIntoView?.({ block: 'nearest' })
+    }
+
+    // Caps Lock changes event.key to 'X', not the letter the user thinks they
+    // pressed, and every shortcut silently stopped working with no way to
+    // tell why. Only single characters are folded — 'ArrowDown' and 'Escape'
+    // must keep their case.
+    const pressed = event.key.length === 1 ? event.key.toLowerCase() : event.key
+
+    switch (pressed) {
+      case 'j': case 'ArrowDown': event.preventDefault(); move(1); break
+      case 'k': case 'ArrowUp': event.preventDefault(); move(-1); break
+      case 'e':
+        if (bodyRef.current) { event.preventDefault(); bodyRef.current.focus() }
+        break
+      case 'a':
+        // Only where the button exists. Approving a sent email is meaningless
+        // and the backend refuses it, so the key must not offer it either.
+        //
+        // Routed through the detail pane's own approve, not through a second
+        // status call: that function folds unsaved edits into the approval,
+        // and the shortcut used to skip it — marking a draft ready to send
+        // while the sentence the user had just typed stayed unsaved.
+        if (!event.repeat && isEditable(active) && active.status === 'draft') {
+          event.preventDefault()
+          approveRef.current?.()
+        }
+        break
+      case 'x':
+        // `event.repeat` is the difference between one trash and forty. A held
+        // key fires at ~30Hz, and because the list reloads after each one the
+        // cursor lands on whatever is now at the top — so the repeats chew
+        // back through drafts the user had already reviewed and kept.
+        if (!event.repeat && isEditable(active) && active.status !== 'trashed') {
+          event.preventDefault()
+          // Pin the successor from the pre-trash list. Otherwise `active`
+          // falls back to `visible[0]` once the row disappears, which sends
+          // the cursor to the top of the list rather than forward.
+          const after = visible[index + 1] || visible[index - 1] || null
+          setActiveId(after ? after.id : null)
+          trashWithUndo(active)
+        }
+        break
+      default: break
+    }
+  }
+
+  useEffect(() => {
+    const onKey = (event) => onKeyRef.current?.(event)
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   // "3 on step 1, 2 on step 2" — which rung the due contacts are on. Worth
   // saying out loud: a step-3 batch is the last thing these people will hear
@@ -453,6 +627,11 @@ export default function Emails() {
         />
         {tab === 'drafts' && visible.length > 0 && (
           <div className="row small muted">
+            {/* A shortcut nobody knows about is not a feature. */}
+            <button type="button" className="linkish tiny" onClick={() => setShowKeys(true)}
+              title="Keyboard shortcuts">
+              <kbd className="kbd">?</kbd> keys
+            </button>
             <label className="row" style={{ gap: 6, cursor: 'pointer' }}>
               <input type="checkbox" className="checkbox"
                 checked={visible.length > 0 && visible.every((e) => selected.has(e.id))}
@@ -492,7 +671,8 @@ export default function Emails() {
             {visible.map((e) => {
               const tm = EMAIL_TYPE_META[e.email_type] || EMAIL_TYPE_META.custom
               return (
-                <div key={e.id} className={`email-row ${active?.id === e.id ? 'active' : ''}`}
+                <div key={e.id} data-email-row={e.id}
+                  className={`email-row ${active?.id === e.id ? 'active' : ''}`}
                   onClick={() => { if (confirmDiscard()) setActiveId(e.id) }}>
                   {tab === 'drafts' && (
                     <input type="checkbox" className="checkbox" style={{ marginTop: 3 }}
@@ -548,11 +728,32 @@ export default function Emails() {
               busy={busy}
               llmReady={!!settings?.llm_provider}
               dirtyRef={pendingEdits}
+              bodyRef={bodyRef}
+              approveRef={approveRef}
             />
           ) : (
             <div className="card"><EmptyState icon={Mail} title="Select an email" /></div>
           )}
         </div>
+      )}
+
+      {showKeys && (
+        <Modal title="Keyboard review" onClose={() => setShowKeys(false)}>
+          <div className="stack" style={{ gap: 8 }}>
+            {SHORTCUTS.map(([key, what]) => (
+              <div key={key} className="row-between small">
+                <span className="muted">{what}</span>
+                <kbd className="kbd">{key}</kbd>
+              </div>
+            ))}
+            {/* Said out loud, because its absence is the design and someone
+                will otherwise go looking for the key. */}
+            <div className="tiny muted" style={{ marginTop: 6 }}>
+              There is no shortcut for sending. Everything above can be undone;
+              a sent email cannot, so it stays a deliberate click.
+            </div>
+          </div>
+        </Modal>
       )}
 
       {sendModal && (
@@ -571,7 +772,7 @@ export default function Emails() {
 
 /* ---------- detail pane ---------- */
 
-function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onRegenerate, onFollowUp, followUpDue, cadence, busy, llmReady, dirtyRef }) {
+function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onRegenerate, onFollowUp, followUpDue, cadence, busy, llmReady, dirtyRef, bodyRef, approveRef }) {
   const [subject, setSubject] = useState(email.subject)
   const [body, setBody] = useState(email.body)
   const [saving, setSaving] = useState(false)
@@ -602,9 +803,20 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
       const updates = dirty ? { subject, body, status: 'approved' } : { status: 'approved' }
       await emailsAPI.update(email.id, updates)
       onPatch(updates)
+      if (dirtyRef) dirtyRef.current = false
       toast.success('Approved — ready to send')
     } catch (e) { toast.error(errMessage(e)) }
   }
+
+  // Published so the `a` shortcut approves through this exact function.
+  // A second implementation would eventually forget the `dirty` branch above,
+  // which is what marks the text on screen — rather than the text last saved —
+  // as the thing being approved.
+  useEffect(() => {
+    if (!approveRef) return undefined
+    approveRef.current = approve
+    return () => { approveRef.current = null }
+  })
 
   // Sending must never ship the pre-edit text: persist pending edits first.
   const sendWithPendingEdits = async () => {
@@ -726,7 +938,7 @@ function EmailDetail({ email, onPatch, onSend, onTrash, onRestore, onDelete, onR
 
       <input className="email-subject-input" value={subject}
         onChange={(e) => setSubject(e.target.value)} readOnly={!editable} />
-      <textarea className="email-body-input" value={body}
+      <textarea ref={bodyRef} className="email-body-input" value={body}
         onChange={(e) => setBody(e.target.value)} readOnly={!editable} />
 
       <div className="row-between">

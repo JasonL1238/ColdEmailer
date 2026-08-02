@@ -967,6 +967,19 @@ button.linkish {
   transition: width .3s;
 }
 
+.kbd {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11px; line-height: 1.4;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--text);
+  white-space: pre;
+}
+
 /* pipeline board
    Columns scroll horizontally as a group and vertically on their own. Fixed
    column width rather than flex: seven stages squeezed to fit would make an
@@ -1020,7 +1033,7 @@ button.linkish {
   transition: border-color .15s, transform .15s;
 }
 .board-card:hover { border-color: var(--accent-border); transform: translateY(-1px); }
-.board-card-name { font-weight: 600; color: var(--text-1); }
+.board-card-name { font-weight: 600; color: var(--text); }
 .board-card-name, .board-card-sub {
   max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -1040,7 +1053,7 @@ button.linkish {
 }
 .thread-msg.outgoing { border-left-color: var(--border-strong, var(--border)); opacity: .78; }
 .thread-body {
-  font-size: 12.5px; line-height: 1.55; color: var(--text-1);
+  font-size: 12.5px; line-height: 1.55; color: var(--text);
   white-space: pre-wrap; overflow-wrap: anywhere;
   max-height: 340px; overflow-y: auto;
 }
