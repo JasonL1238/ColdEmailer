@@ -22,6 +22,7 @@ same discipline the reply-rate headline already follows.
 Pure functions over rows: the queries live in db.py, the arithmetic lives here
 where it can be tested without a database.
 """
+import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -41,12 +42,16 @@ def segment(rows: List[Dict[str, Any]], key, label=None) -> List[Dict[str, Any]]
 
     `key` returning None drops the row — "no data" is a different thing from a
     bucket called "unknown", and mixing them makes a segment look worse or
-    better than the evidence supports.
+    better than the evidence supports. The dropped count comes back on every
+    entry as `_dropped` so the UI can say "12 of 40 sends could be attributed"
+    rather than "nothing sent in this segment", which is false.
     """
     buckets: Dict[Any, Dict[str, Any]] = {}
+    dropped = 0
     for row in rows:
         bucket_key = key(row)
         if bucket_key is None:
+            dropped += 1
             continue
         entry = buckets.setdefault(bucket_key, {
             "key": bucket_key,
@@ -62,12 +67,26 @@ def segment(rows: List[Dict[str, Any]], key, label=None) -> List[Dict[str, Any]]
     out = []
     for entry in buckets.values():
         entry["enough_data"] = entry["sent"] >= MIN_SAMPLE
-        entry["rate"] = (round(entry["replied"] / entry["sent"] * 100, 1)
+        entry["rate"] = (rate_of(entry["replied"], entry["sent"])
                          if entry["enough_data"] else None)
+        entry["dropped"] = dropped
         out.append(entry)
     # Most-sent first, so the segments the user has actually invested in lead.
     out.sort(key=lambda e: (-e["sent"], e["label"]))
     return out
+
+
+def rate_of(replied: int, sent: int) -> Optional[float]:
+    """The single implementation of "what percentage replied".
+
+    Exported so the frontend can render a number rather than recompute one:
+    JS rounds halves up and Python rounds them to even, so 1 of 16 came out as
+    6.3% in the headline tile and 6.2% in the segment card directly beneath it,
+    for the very same rows.
+    """
+    if not sent:
+        return None
+    return round(replied / sent * 100, 1)
 
 
 def hours_to_reply(rows: List[Dict[str, Any]]) -> List[float]:
@@ -102,10 +121,14 @@ def distribution(values: List[float]) -> Dict[str, Optional[float]]:
     ordered = sorted(values)
 
     def _at(fraction: float) -> float:
-        # Nearest-rank. Interpolating between two samples invents a value that
-        # no reply had, which is the wrong trade for a handful of data points.
-        index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
-        return ordered[index]
+        # Nearest-rank, half *up*, spelled out. Interpolating between two
+        # samples invents a wait no reply had, which is the wrong trade for a
+        # handful of points — but plain round() is banker's rounding, so the
+        # tie between the two middle samples broke upward or downward with the
+        # parity of the index. Four replies gave a "median" with three of them
+        # at or below it; six gave the lower middle. Same word, two meanings.
+        index = math.floor(fraction * (len(ordered) - 1) + 0.5)
+        return ordered[min(len(ordered) - 1, max(0, index))]
 
     return {"count": len(ordered), "median": _at(0.5), "p25": _at(0.25),
             "p75": _at(0.75), "fastest": ordered[0], "slowest": ordered[-1]}
@@ -152,6 +175,30 @@ EMAIL_KIND_LABELS = {
 }
 
 
+def _rung(row: Dict[str, Any]) -> Optional[int]:
+    """Which follow-up this was, or None when the row cannot say.
+
+    `follow_up_step` arrived with the cadence feature and its migration
+    backfilled every existing row with 0, while the legacy JSON import never
+    set it at all. So a follow-up sent before that column existed carries
+    step 0 — indistinguishable from a first contact unless the older
+    `is_follow_up` flag is consulted. Folding those into "First contact" did
+    not just mislabel them: it merged a chased population into the un-chased
+    one and reported a rate for the mixture, which is the specific thing this
+    module exists not to do. Unknown rungs are dropped instead.
+    """
+    step = row.get("follow_up_step")
+    try:
+        step = int(step or 0)
+    except (TypeError, ValueError):
+        step = 0
+    if step > 0:
+        return step
+    if row.get("is_follow_up") or row.get("original_email_id"):
+        return None                     # a follow-up of unknown rung
+    return 0
+
+
 def build(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Every segment, from one pass of sent emails."""
     gaps = hours_to_reply(rows)
@@ -163,16 +210,30 @@ def build(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "sent": len(rows),
         "replied": sum(1 for r in rows if _verified_reply(r)),
+        # Rendered by the page rather than recomputed there, so the tile and
+        # the segment card below it cannot round the same rows differently.
+        "rate": rate_of(sum(1 for r in rows if _verified_reply(r)), len(rows))
+        if len(rows) >= MIN_SAMPLE else None,
         "unverified": sum(1 for r in rows
                           if r.get("has_response") and not _verified_reply(r)),
         "min_sample": MIN_SAMPLE,
-        "time_to_reply_hours": distribution(gaps),
+        "time_to_reply_hours": {
+            **distribution(gaps),
+            # Replies whose timestamps could not produce a wait. Without this
+            # the page printed "no replies yet" beside "Replied 5".
+            "excluded": sum(1 for r in rows if _verified_reply(r)) - len(gaps),
+        },
         "segments": {
             "email_type": segment(rows, key=lambda r: r.get("email_type") or None),
             "email_kind": by_kind,
             "seniority": segment(
                 rows, key=lambda r: _seniority_band(r.get("seniority_rank"))),
-            "company": segment(rows, key=lambda r: r.get("company_name") or None),
+            # Keyed on the id, labelled with the name: this app deliberately
+            # keeps two same-named companies on different domains as separate
+            # rows, and grouping by name merged their sends into one bucket
+            # that cleared the sample floor neither of them reached.
+            "company": segment(rows, key=lambda r: r.get("company_id") or None,
+                               label=lambda r: r.get("company_name") or "—"),
             "written_by": segment(
                 rows,
                 key=lambda r: ("Plain template" if r.get("used_template_fallback")
@@ -180,10 +241,9 @@ def build(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             ),
             # Does chasing actually work? Rung 0 is the first contact.
             "follow_up_step": segment(
-                rows,
-                key=lambda r: int(r.get("follow_up_step") or 0),
-                label=lambda r: ("First contact" if not r.get("follow_up_step")
-                                 else f"Follow-up {int(r['follow_up_step'])}")),
+                rows, key=_rung,
+                label=lambda r: ("First contact" if _rung(r) == 0
+                                 else f"Follow-up {_rung(r)}")),
         },
         "headline": {
             "email_type": best_and_worst(

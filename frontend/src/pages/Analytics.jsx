@@ -42,6 +42,23 @@ export function humanHours(hours) {
    Below the sample floor the backend sends `rate: null`, and this must not
    fall back to `rate ?? 0` — that renders a thin segment as a confident 0%
    next to a real one, which is exactly the wrong comparison to invite. */
+/* What the "Typical wait" tile says underneath itself.
+
+   "no replies yet" beside "Replied 5" is a flat contradiction, and it happens
+   whenever a verified reply carries a timestamp that cannot produce a wait —
+   clock skew, a Gmail message with no internalDate, a legacy import. Those
+   replies are real; only their clocks are not. */
+export function waitSub(wait, replied) {
+  if (wait.count) {
+    return `${wait.count} ${wait.count === 1 ? 'reply' : 'replies'} · `
+      + `${humanHours(wait.p25)}–${humanHours(wait.p75)}`
+  }
+  if (replied > 0) {
+    return `${replied} ${replied === 1 ? 'reply' : 'replies'}, none with a usable timestamp`
+  }
+  return 'no replies yet'
+}
+
 export function rateLabel(seg) {
   if (!seg.enough_data || seg.rate === null || seg.rate === undefined) {
     return { text: `${seg.replied}/${seg.sent}`, muted: true }
@@ -53,6 +70,7 @@ export default function Analytics() {
   const [days, setDays] = useState(90)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
+  const [reload, setReload] = useState(0)
 
   useEffect(() => {
     let live = true
@@ -62,12 +80,25 @@ export default function Analytics() {
       .then(({ data: d }) => { if (live) setData(d) })
       .catch((e) => { if (live) setError(errMessage(e, 'Could not load analytics')) })
     return () => { live = false }
-  }, [days])
+  }, [days, reload])
 
   if (error) {
+    // The window control stays: returning early removed the only thing that
+    // triggers a refetch, so a single failed request stranded the page until
+    // the user navigated away and back.
     return (
       <div className="page">
-        <div className="card"><EmptyState icon={AlertTriangle} title="Analytics unavailable" desc={error} /></div>
+        <div className="page-head">
+          <div>
+            <div className="page-title">Analytics</div>
+            <div className="page-desc">What earns replies — and what only looks like it does</div>
+          </div>
+          <Segmented value={days} onChange={setDays} options={WINDOWS} />
+        </div>
+        <div className="card">
+          <EmptyState icon={AlertTriangle} title="Analytics unavailable" desc={error}
+            action={<Button onClick={() => setReload((n) => n + 1)}>Try again</Button>} />
+        </div>
       </div>
     )
   }
@@ -97,12 +128,14 @@ export default function Analytics() {
           <div className="row" style={{ gap: 14, flexWrap: 'wrap', marginBottom: 16 }}>
             <Headline label="Sent" value={data.sent} icon={BarChart3} />
             <Headline label="Replied" value={data.replied}
-              sub={data.sent >= data.min_sample
-                ? `${Math.round(data.replied / data.sent * 1000) / 10}%`
-                : 'too few to rate'}
+              // Rendered, not recomputed. JS rounds halves up and Python
+              // rounds them to even, so the same rows read 6.3% here and 6.2%
+              // in the card directly below.
+              sub={data.rate === null || data.rate === undefined
+                ? 'too few to rate' : `${data.rate}%`}
               icon={MessageSquare} />
             <Headline label="Typical wait" value={humanHours(wait.median)}
-              sub={wait.count ? `${wait.count} replies · ${humanHours(wait.p25)}–${humanHours(wait.p75)}` : 'no replies yet'}
+              sub={waitSub(wait, data.replied)}
               icon={Clock} />
           </div>
 
@@ -123,7 +156,9 @@ export default function Analytics() {
           <div className="analytics-grid">
             {Object.entries(SEGMENT_TITLES).map(([key, title]) => (
               <SegmentCard key={key} title={title} rows={data.segments[key] || []}
-                minSample={data.min_sample} />
+                minSample={data.min_sample}
+                dropped={(data.segments[key] || [])[0]?.dropped
+                  ?? (data.segments[key]?.length === 0 ? data.sent : 0)} />
             ))}
           </div>
         </>
@@ -151,16 +186,33 @@ function Headline({ label, value, sub, icon: Icon }) {
    the sample floor, so an absent verdict here means "not enough evidence yet",
    which is said out loud rather than left as blank space. */
 function Verdict({ headline, minSample }) {
-  const picks = [
+  const qualified = [
     ['email type', headline.email_type],
     ['who you write to', headline.email_kind],
-  ].filter(([, v]) => v && v.best && v.worst && v.spread > 0)
+  ].filter(([, v]) => v && v.best && v.worst)
+  const picks = qualified.filter(([, v]) => v.spread > 0)
+  // A tie between two well-sampled segments is a finding — "these are level" —
+  // not an absence of evidence. Collapsing it into the sample-size sentence
+  // told the user to go and collect data they already had.
+  const level = qualified.filter(([, v]) => !(v.spread > 0))
 
-  if (picks.length === 0) {
+  if (picks.length === 0 && level.length === 0) {
     return (
       <div className="card card-pad small muted mb-16">
         No comparison is solid yet. Two segments each need about {minSample} sent
         emails before a difference between them means anything.
+      </div>
+    )
+  }
+  if (picks.length === 0) {
+    return (
+      <div className="card card-pad stack mb-16" style={{ gap: 8 }}>
+        {level.map(([what, v]) => (
+          <div key={what} className="small">
+            No measurable difference by {what} — {v.best.label} and{' '}
+            {v.worst.label} both reply at <b>{v.best.rate}%</b>.
+          </div>
+        ))}
       </div>
     )
   }
@@ -177,8 +229,12 @@ function Verdict({ headline, minSample }) {
   )
 }
 
-function SegmentCard({ title, rows, minSample }) {
-  const rated = rows.filter((r) => r.enough_data)
+function SegmentCard({ title, rows, minSample, dropped = 0 }) {
+  const shown = rows.slice(0, 8)
+  // Scaled to what is drawn. Computing the ceiling over every rated row let an
+  // off-screen 100% segment squash all eight visible bars into slivers, so the
+  // card looked like nothing worked.
+  const rated = shown.filter((r) => r.enough_data)
   const ceiling = Math.max(1, ...rated.map((r) => r.rate || 0))
 
   return (
@@ -192,8 +248,12 @@ function SegmentCard({ title, rows, minSample }) {
         )}
       </div>
       {rows.length === 0 ? (
-        <div className="tiny muted">Nothing sent in this segment yet.</div>
-      ) : rows.slice(0, 8).map((seg) => {
+        <div className="tiny muted">
+          {rows.length === 0 && dropped > 0
+            ? `None of your ${dropped} sent emails could be attributed here.`
+            : 'Nothing sent in this segment yet.'}
+        </div>
+      ) : shown.map((seg) => {
         const label = rateLabel(seg)
         return (
           <div key={String(seg.key)} className="stack" style={{ gap: 3 }}>

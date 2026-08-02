@@ -231,3 +231,93 @@ def test_the_endpoint_counts_only_delivered_mail_inside_the_window():
         assert forever["sent"] == window["sent"] + 1
     finally:
         main.db.delete_contact(contact["id"])
+
+
+# ---------- what the first adversarial round found ----------
+
+def test_a_follow_up_of_unknown_rung_is_dropped_not_called_first_contact():
+    """`follow_up_step` arrived with the cadence feature and its migration
+    backfilled every existing row with 0, so a follow-up sent before that
+    column existed is indistinguishable from a first contact by step alone.
+    Folding them together did not just mislabel: it merged a chased population
+    into an un-chased one and reported a rate for the mixture, which is the
+    exact thing this module exists not to do."""
+    rows = (_rows(6, replied=2)                                  # real first contacts
+            + _rows(6, replied=0, is_follow_up=1))               # legacy follow-ups
+    steps = analytics.build(rows)["segments"]["follow_up_step"]
+
+    assert [s["key"] for s in steps] == [0]
+    assert steps[0]["sent"] == 6 and steps[0]["replied"] == 2
+    assert steps[0]["enough_data"] is False        # 6 < MIN_SAMPLE, so no rate
+    assert steps[0]["dropped"] == 6
+
+    # an original_email_id alone is enough evidence that it is a follow-up
+    only_parent = analytics.build(_rows(4, original_email_id="root"))
+    assert only_parent["segments"]["follow_up_step"] == []
+
+
+def test_a_known_rung_still_reports_normally():
+    rows = _rows(4, follow_up_step=2, is_follow_up=1) + _rows(4)
+    steps = {s["key"]: s for s in analytics.build(rows)["segments"]["follow_up_step"]}
+    assert steps[0]["label"] == "First contact"
+    assert steps[2]["label"] == "Follow-up 2"
+
+
+def test_two_companies_sharing_a_name_stay_separate(db):
+    """This app deliberately keeps same-named companies on different domains as
+    distinct rows. Grouping the segment by name merged their sends into one
+    bucket that cleared the sample floor neither of them reached."""
+    rows = (_rows(6, replied=1, company_id="c-a", company_name="ZZTEST Atlas")
+            + _rows(6, replied=1, company_id="c-b", company_name="ZZTEST Atlas"))
+    companies = analytics.build(rows)["segments"]["company"]
+
+    assert len(companies) == 2
+    assert all(c["sent"] == 6 and c["enough_data"] is False for c in companies)
+    assert all(c["label"] == "ZZTEST Atlas" for c in companies)
+
+
+def test_the_percentile_index_has_one_convention_at_every_length():
+    """`round()` is banker's rounding, so the tie between the two middle
+    samples broke upward or downward with the parity of the index — four
+    replies gave a "median" with three of them at or below it, six gave the
+    lower middle. Same word, two meanings."""
+    assert analytics.distribution([1.0, 2.0])["median"] == 2.0
+    assert analytics.distribution([1.0, 2.0, 3.0, 4.0])["median"] == 3.0
+    assert analytics.distribution([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])["median"] == 4.0
+    # ...and half-up is applied consistently, not per-parity
+    for n in range(2, 12):
+        values = [float(i) for i in range(1, n + 1)]
+        d = analytics.distribution(values)
+        assert d["p25"] <= d["median"] <= d["p75"]
+
+
+def test_one_rounding_implementation_serves_the_page_and_the_segments():
+    """JS rounds halves up, Python rounds them to even, so 1 of 16 was 6.3% in
+    the headline tile and 6.2% in the segment card directly beneath it."""
+    rows = _rows(16, replied=1)
+    built = analytics.build(rows)
+    assert built["rate"] == analytics.rate_of(1, 16) == 6.2
+    assert built["segments"]["email_type"][0]["rate"] == built["rate"]
+    # ...and the overall rate is withheld on the same floor as any segment
+    assert analytics.build(_rows(4, replied=2))["rate"] is None
+
+
+def test_replies_with_unusable_timestamps_are_counted_and_reported():
+    """Dropping them from the wait is right; letting the page then say "no
+    replies yet" beside "Replied 5" is not."""
+    rows = _rows(12, replied=5)
+    for row in rows[:5]:
+        row["response_at"] = "2020-01-01T00:00:00"      # before its own send
+    built = analytics.build(rows)
+    assert built["replied"] == 5
+    assert built["time_to_reply_hours"]["count"] == 0
+    assert built["time_to_reply_hours"]["excluded"] == 5
+
+
+def test_a_segment_reports_how_many_rows_it_could_not_place():
+    """Otherwise a card whose rows all lack a company reads "nothing sent in
+    this segment", while the headline says forty."""
+    rows = _rows(12, company_id=None, company_name=None)
+    assert analytics.build(rows)["segments"]["company"] == []
+    mixed = analytics.build(_rows(4, company_id="c-a") + _rows(8, company_id=None))
+    assert mixed["segments"]["company"][0]["dropped"] == 8
