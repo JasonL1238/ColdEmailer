@@ -1107,6 +1107,72 @@ class Database:
         sql += " ORDER BY ct.created_at DESC"
         return self.query(sql, tuple(params))
 
+    def pipeline_rows(self) -> List[Dict[str, Any]]:
+        """Every contact, with the email evidence their stage is derived from.
+
+        One query rather than a fan-out per contact: the board renders the
+        whole book at once, and `contacts.status` is not consulted for the
+        stage because nothing resets it — deleting a draft leaves a contact
+        marked `drafted` for good.
+
+        "Delivered" has three forms and all three count. A Gmail id or a send
+        timestamp is the usual proof, but a legacy row imported from
+        `generated_emails.json` carries `status='sent'` with neither — and
+        `repair_delivered_email_status` only backfills rows that already have
+        an id, so those survive every startup. `_contact_has_been_emailed`
+        and the follow-up query both count them; a board that did not was the
+        one surface telling the user to write a first email to somebody who
+        had already received one.
+
+        A pending draft is narrower than "not sent yet". A row the scheduler
+        has armed, or one handed to Gmail without a verdict coming back, is
+        not work waiting on the user — the first will send itself and the
+        second may already be in the recipient's inbox.
+        """
+        delivered = ("(e.gmail_message_id IS NOT NULL OR e.sent_at IS NOT NULL "
+                     "OR e.status='sent')")
+        return self.query(
+            """
+            SELECT ct.id, ct.name, ct.email, ct.role, ct.status, ct.company_id,
+                   ct.bounced_at, ct.created_at, c.name AS company_name,
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND e.status IN ('draft','approved') AND NOT """ + delivered + """
+                     AND e.scheduled_at IS NULL AND e.send_attempted_at IS NULL)
+                     AS pending_draft_count,
+                   -- Armed by the send window. Nothing is waiting on the user.
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND e.status IN ('draft','approved') AND NOT """ + delivered + """
+                     AND e.scheduled_at IS NOT NULL) AS queued_count,
+                   -- Handed to Gmail, no verdict. May already have arrived, so
+                   -- it must never read as something still to write.
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND NOT """ + delivered + """
+                     AND e.send_attempted_at IS NOT NULL) AS unconfirmed_count,
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND """ + delivered + """) AS delivered_count,
+                   -- A bounce is a fact about an address, not about a person:
+                   -- scoped to the contact's *current* address exactly as
+                   -- _bounced_for_current_address and the follow-up query do,
+                   -- so giving somebody a new address revives them here too.
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND e.bounced_at IS NOT NULL
+                     AND lower(COALESCE(e.recipient_email, ct.email, ''))
+                         = lower(COALESCE(ct.email, ''))) AS bounced_email_count,
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND e.has_response=1 AND e.response_verified_at IS NOT NULL)
+                     AS verified_reply_count,
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND e.has_response=1 AND e.response_verified_at IS NULL)
+                     AS unverified_reply_count,
+                   (SELECT COUNT(*) FROM emails e WHERE e.contact_id = ct.id
+                     AND """ + IS_FOLLOW_UP_SQL % ("e", "e") + """
+                     AND """ + delivered + """) AS follow_up_count,
+                   (SELECT MAX(e.sent_at) FROM emails e WHERE e.contact_id = ct.id
+                     AND e.sent_at IS NOT NULL) AS last_sent_at
+            FROM contacts ct LEFT JOIN companies c ON ct.company_id = c.id
+            """
+        )
+
     # ---------- resumes ----------
 
     def create_resume(self, label: str, filename: str, path: str,

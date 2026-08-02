@@ -17,7 +17,7 @@ vi.mock('axios', () => ({
 
 import {
   discoveryAPI, companiesAPI, contactsAPI, resumesAPI, emailsAPI,
-  settingsAPI, dashboardAPI, cadenceAPI, errMessage,
+  settingsAPI, dashboardAPI, cadenceAPI, pipelineAPI, errMessage,
 } from '../../src/api.js'
 
 beforeEach(() => {
@@ -130,6 +130,19 @@ describe('follow-up cadence wiring', () => {
     cadenceAPI.update({ enabled: true, steps: [3, 7] })
     expect(mockAxiosInstance.put).toHaveBeenCalledWith('/follow-ups/cadence',
       { enabled: true, steps: [3, 7] })
+  })
+
+  /* Page suites mock this whole module, so a typo in a path is invisible to
+     them and to the backend tests, which call the route directly. This file is
+     the only place the two ends are held to the same string. */
+  it('asks for the pipeline at the route the backend serves', () => {
+    pipelineAPI.get()
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/pipeline')
+  })
+
+  it('reads a thread at the route the backend serves', () => {
+    emailsAPI.thread('e1')
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/emails/e1/thread')
   })
 })
 

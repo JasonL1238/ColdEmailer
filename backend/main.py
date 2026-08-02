@@ -48,6 +48,7 @@ from models import (
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
 import analytics as analytics_module
+import pipeline
 import send_window
 import thread_reader
 from response_checker import ResponseChecker
@@ -2805,6 +2806,17 @@ async def dashboard():
         "recent_events": events,
         "usage": rate_limiter.get_usage_stats(),
     }
+
+
+@app.get("/api/pipeline")
+async def pipeline_board(limit: int = Query(100, ge=10, le=500)):
+    """Every contact, filed under the stage the evidence puts them in.
+
+    Read-only, and deliberately does not repair `contacts.status` even where it
+    can prove it wrong — opening a page should not rewrite real rows. The
+    disagreement comes back as `status_drift` instead.
+    """
+    return pipeline.build(db.pipeline_rows(), limit=limit)
 
 
 @app.get("/api/analytics")

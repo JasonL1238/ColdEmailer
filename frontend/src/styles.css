@@ -967,6 +967,64 @@ button.linkish {
   transition: width .3s;
 }
 
+/* pipeline board
+   Columns scroll horizontally as a group and vertically on their own. Fixed
+   column width rather than flex: seven stages squeezed to fit would make an
+   empty column and a busy one look the same width, which is the one comparison
+   the board is for.
+
+   180px × 7 plus six 10px gaps is 1320, which fits inside `.page.wide`
+   (1400 less 72 of padding). At 216px the last two columns — including
+   Bounced, the one that means "stop, this address is dead" — sat off the right
+   edge, and macOS overlay scrollbars gave no resting hint they were there.
+   Below that width it does scroll, so the scrollbar is made permanent rather
+   than left to fade out. */
+.board {
+  display: flex; gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+  align-items: flex-start;
+  scrollbar-width: thin;
+}
+.board::-webkit-scrollbar { height: 8px; -webkit-appearance: none; }
+.board::-webkit-scrollbar-thumb {
+  background: var(--border-strong, var(--border));
+  border-radius: 4px;
+}
+.board-col {
+  flex: 0 0 180px;
+  display: flex; flex-direction: column; gap: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  max-height: 68vh; overflow-y: auto;
+}
+.board-col-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  position: sticky; top: -10px;
+  background: var(--surface-2);
+  margin: -10px -10px 0; padding: 10px;
+  border-radius: 10px 10px 0 0;
+  z-index: 1;
+}
+.board-empty { padding: 6px 2px; }
+.board-card {
+  display: flex; flex-direction: column; gap: 2px;
+  width: 100%; text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: border-color .15s, transform .15s;
+}
+.board-card:hover { border-color: var(--accent-border); transform: translateY(-1px); }
+.board-card-name { font-weight: 600; color: var(--text-1); }
+.board-card-name, .board-card-sub {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 /* reply threads
    The body is somebody else's writing, so it is displayed with `pre-wrap` and
    `break-word`: preserve their line breaks, but never let a 400-character

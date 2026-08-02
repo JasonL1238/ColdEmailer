@@ -98,6 +98,10 @@ export const emailsAPI = {
   thread: (id) => api.get(`/emails/${id}/thread`),
 }
 
+export const pipelineAPI = {
+  get: () => api.get('/pipeline'),
+}
+
 export const sendWindowAPI = {
   get: () => api.get('/send-window'),
   update: (payload) => api.put('/send-window', payload),

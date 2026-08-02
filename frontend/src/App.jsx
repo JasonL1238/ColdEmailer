@@ -2,11 +2,12 @@ import { createContext, useCallback, useContext, useEffect, useState } from 'rea
 import { Toaster } from 'react-hot-toast'
 import {
   LayoutDashboard, Compass, Database, FileText, Mail, Microscope,
-  Settings as SettingsIcon, Send, BarChart3,
+  Settings as SettingsIcon, Send, BarChart3, KanbanSquare,
 } from 'lucide-react'
 import { settingsAPI } from './api'
 import Dashboard from './pages/Dashboard'
 import Analytics from './pages/Analytics'
+import Pipeline from './pages/Pipeline'
 import Discover from './pages/Discover'
 import DeepDive from './pages/DeepDive'
 import DatabasePage from './pages/DatabasePage'
@@ -23,6 +24,7 @@ const PAGES = [
   { id: 'deep-dive', label: 'Deep Dive', icon: Microscope, section: 'Pipeline' },
   { id: 'database', label: 'Database', icon: Database, section: 'Pipeline' },
   { id: 'emails', label: 'Emails', icon: Mail, section: 'Pipeline' },
+  { id: 'pipeline', label: 'Pipeline', icon: KanbanSquare, section: 'Pipeline' },
   { id: 'analytics', label: 'Analytics', icon: BarChart3, section: 'Pipeline' },
   { id: 'resumes', label: 'Resumes', icon: FileText, section: 'Assets' },
   { id: 'settings', label: 'Settings', icon: SettingsIcon, section: 'Assets' },
@@ -143,6 +145,7 @@ export default function App() {
           {page === 'deep-dive' && <DeepDive />}
           {page === 'database' && <DatabasePage />}
           {page === 'emails' && <Emails />}
+          {page === 'pipeline' && <Pipeline />}
           {page === 'analytics' && <Analytics />}
           {page === 'resumes' && <Resumes />}
           {page === 'settings' && <Settings />}
