@@ -15,8 +15,8 @@ Rebuilt from a CSV/JSON pipeline onto SQLite. Architecture and setup are in
 
 ## Current state
 
-- **Green:** 366 backend tests (`cd tests && ../backend/venv/bin/python -m pytest`),
-  48 frontend tests (`cd frontend && npm test`), clean `vite build`.
+- **Green:** 1088 backend tests (`cd tests && ../backend/venv/bin/python -m pytest`),
+  225 frontend tests (`cd frontend && npm test`), clean `vite build`.
 - **Working tree clean**, `main` == `origin/main`.
 - **Run it:** `./start.sh` → app on :5173, API on :8000.
 - **Real user data** in `backend/data/coldemailer.db`: 115 companies,
@@ -35,7 +35,49 @@ Rebuilt from a CSV/JSON pipeline onto SQLite. Architecture and setup are in
 4. **The test suite is safe** — `tests/conftest.py` points `COLD_DB_PATH` at a
    temp database and stubs the Gmail paths, so pytest never touches real data.
 
+## The twelve-item roadmap is finished
+
+All twelve shipped, each one built → attacked by adversarial reviewers → every
+confirmed finding fixed → every guard mutation-verified (reverted in a scratch
+copy, confirmed a test fails) → both suites and `vite build` green → committed.
+Items 4 and 10 touch the send path and got two rounds each.
+
+| # | What | Where |
+|---|------|-------|
+| 1 | Person-level email finding (Hunter + pattern guess) | `contact_enrich.py` |
+| 2 | Address verification at send time, bounce handling | `contact_verify.py`, `response_checker.py` |
+| 3 | Multi-step follow-up cadences | `db.py` cadence fns, `main.py` |
+| 4 | Send scheduling — business hours + timezone | `send_window.py` |
+| 5 | Loop-closing analytics | `analytics.py`, `pages/Analytics.jsx` |
+| 6 | Read reply threads in-app | `thread_reader.py`, `ThreadPane` |
+| 7 | Pipeline board of contact stages | `pipeline.py`, `pages/Pipeline.jsx` |
+| 8 | Keyboard-driven draft review | `pages/Emails.jsx` |
+| 9 | Campaigns as a first-class object | `campaigns.py`, `pages/Campaigns.jsx` |
+| 10 | Suppression / do-not-contact list | `suppression.py` |
+| 11 | LLM provider resilience and quota surfacing | `llm_client.py` |
+| 12 | Repo hygiene | — |
+
+**Item 4 ships disabled.** The send window is off by default and needs both a
+Settings toggle and a per-batch opt-in before any mail leaves unattended.
+
 ## Deliberate design decisions — don't "fix" these
+
+- **The do-not-contact list is the only check that fails closed.** Every other
+  gate is optimistic — `domain_has_mx` returning "could not check" lets a send
+  proceed, so a DNS blip cannot block real mail. Suppression is the opposite:
+  if it cannot be evaluated, nothing goes out. Keep it that way.
+- **Nothing is backfilled into a campaign.** Rows predating campaigns stay
+  `campaign_id IS NULL` forever and are reported as their own bucket. Guessing
+  which campaign an old company belonged to would invent the fact the page
+  exists to report.
+- **The pipeline board derives stages from evidence, not `contacts.status`.**
+  That column is written from four places and reset from none, so a contact
+  whose draft was deleted stays `drafted` for good.
+- **A rate is withheld below `analytics.MIN_SAMPLE` (10 sends)** on every
+  surface — analytics, campaigns, the unassigned bucket — and counts are shown
+  instead. `MIN_SAMPLE` and `rate_of` are imported, never re-declared.
+- **There is no keyboard shortcut for sending, and the help says so.** Every
+  other shortcut is reversible; a delivered email is not.
 
 - **Reply rate shows 0% with "115 unverified".** This is correct. The old
   checker counted bounces, auto-replies and the user's own thread messages as
@@ -55,24 +97,20 @@ Rebuilt from a CSV/JSON pipeline onto SQLite. Architecture and setup are in
 
 ## Known open items
 
-1. **Adversarial round 5 never completed cleanly.** Rounds 1–4 found and fixed
-   44 confirmed defects. Round 5's patches are in and verified, but the run was
-   killed four times (API overload ×3, machine sleep ×1) so there is no clean
-   "no findings" pass. Convergence is not proven.
-2. **`resume28.pdf` / `resume29.pdf` are committed to a PUBLIC repo** and
+1. **`resume28.pdf` / `resume29.pdf` are committed to a PUBLIC repo** and
    contain the owner's phone number and email. They predate the `*.pdf`
    gitignore rule (added in `bcad104`), so the rule never applied. Untracking
    them leaves them in history; a real purge needs `git filter-repo` + force
    push, or making the repo private. **Owner's decision — do not act
    unilaterally.**
-3. **Commit `bcad104` is titled "email gen now with gemni key."** If a real key
+2. **Commit `bcad104` is titled "email gen now with gemni key."** If a real key
    was ever committed, it should be rotated. Not audited.
-4. Legacy migration reads `backend/backend/data/` (a nested duplicate path).
+3. Legacy migration reads `backend/backend/data/` (a nested duplicate path).
    Harmless, but odd — could be cleaned up once no one needs re-migration.
-5. **`google-generativeai` is deprecated** upstream in favour of `google-genai`.
+4. **`google-generativeai` is deprecated** upstream in favour of `google-genai`.
    It still works (the app runs on it today), but the SDK will stop getting
    fixes. Migration touches only `llm_client.py`.
-6. Keyless discovery quality is mediocre — web search alone returns VC firms
+5. Keyless discovery quality is mediocre — web search alone returns VC firms
    and startup directories alongside real companies. `discovery.py` has
    `AGGREGATOR_DOMAINS` and `is_junk_site()` to filter these; both could be
    extended.
@@ -87,13 +125,13 @@ Rebuilt from a CSV/JSON pipeline onto SQLite. Architecture and setup are in
 > `use_template_only: true` for any generation test (no API calls, no quota).
 > Prefix any test data ZZTEST and clean it up.
 >
-> Everything is committed and green: 366 backend + 48 frontend tests pass.
+> Everything is committed and green: 1088 backend + 225 frontend tests pass.
 > Start by running `./start.sh` and both test suites to confirm that still
 > holds, then read the "Known open items" section of HANDOFF.md.
 >
+> The twelve-item roadmap is complete — see the table in HANDOFF.md.
+>
 > <then state what you actually want, e.g.:>
-> - "Finish the adversarial hardening: run two adversarial agents over the
->    send path and the dashboard's numbers, verify each finding before
->    patching, and repeat until a round finds nothing."
 > - "Add <feature>."
 > - "Deploy this somewhere."
+> - "Run another adversarial round over <area>."
