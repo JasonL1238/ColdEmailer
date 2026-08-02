@@ -145,10 +145,6 @@ class _Fetched:
         return self.content.decode("utf-8", errors="replace")
 
 
-def registered_host(url: str) -> str:
-    return (urlparse(url).hostname or "").lower()
-
-
 def _same_origin(a: str, b: str) -> bool:
     pa, pb = urlparse(a), urlparse(b)
     return (

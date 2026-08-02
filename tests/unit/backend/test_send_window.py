@@ -573,7 +573,6 @@ def test_the_stamp_is_written_in_the_frame_the_sweep_compares_against(api):
     hardcoded — on a machine already running Australia/Sydney the assertion
     held with and without the conversion it exists to protect.
     """
-    from datetime import timezone as _tz
     sender, contact, draft = api
     zone = _a_zone_offset_from_here()
     main.db.update_send_window({"enabled": True, "timezone": zone,
@@ -591,7 +590,6 @@ def test_the_stamp_is_written_in_the_frame_the_sweep_compares_against(api):
 def test_a_zone_aware_window_answers_in_that_zone():
     """No test set a timezone at all, so the conversion branch was never taken
     — which is how the frame mismatch above shipped."""
-    from zoneinfo import ZoneInfo
     from datetime import timezone as _tz
     w = _window(timezone="Australia/Sydney", days=[0, 1, 2, 3, 4],
                 start_hour=8, end_hour=17)

@@ -23,16 +23,7 @@ proxied there by `vite.config.js`).
 
 ## Main pieces
 
-| File | Role |
-|---|---|
-| `src/App.jsx` | Shell, sidebar nav, shared settings/dashboard context |
-| `src/pages/Dashboard.jsx` | Pipeline counts, 30-day activity, follow-ups due, unverified-reply banner |
-| `src/pages/Discover.jsx` | Plain-English company search with live job progress |
-| `src/pages/DatabasePage.jsx` | Companies and contacts, with a drawer for scraped research and email history |
-| `src/pages/Emails.jsx` | Draft review, bulk approve/trash, send, follow-ups, reply state |
-| `src/pages/ComposeModal.jsx` | Pick contacts, email type and resume; generate a draft each |
-| `src/pages/Resumes.jsx` | Resume versions, default selection |
-| `src/pages/Settings.jsx` | Sender profile, Gmail connection, AI provider, limits |
-| `src/ui.jsx` | Shared primitives (Button, Chip, Drawer, Modal, Spinner, job polling) |
-| `src/api.js` | API client — one wrapper per backend route |
-| `src/styles.css` | Whole design system, token-driven |
+See [`../docs/architecture.md`](../docs/architecture.md) for frontend boundaries and
+[`../docs/repository-map.md`](../docs/repository-map.md) for where screen, API,
+component, and style changes belong. Validation tiers are in
+[`../docs/testing.md`](../docs/testing.md).

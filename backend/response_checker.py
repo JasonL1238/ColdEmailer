@@ -140,9 +140,6 @@ class ResponseChecker:
             # here: that would mark a live address dead on a network blip.
             return REPLY
 
-    def _is_real_reply(self, message_id: str) -> bool:
-        return self._classify(message_id) == REPLY
-
     def check_response(self, gmail_message_id: str,
                        gmail_thread_id: Optional[str] = None
                        ) -> Tuple[Optional[bool], Optional[datetime]]:

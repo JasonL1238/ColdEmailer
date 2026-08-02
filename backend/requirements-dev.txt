@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Repository checks; runtime dependencies remain in requirements.txt.
+ruff>=0.12,<1
+mypy>=1.17,<2

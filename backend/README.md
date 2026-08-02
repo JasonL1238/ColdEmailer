@@ -15,23 +15,10 @@ Normally you don't run this directly — `./start.sh` from the project root star
 
 ## Modules
 
-| File | Responsibility |
-|---|---|
-| `main.py` | All HTTP routes; wires the services together |
-| `db.py` | SQLite storage layer + one-time migration from the legacy CSV/JSON files |
-| `discovery.py` | Background jobs: natural-language query → real companies → scraped contacts |
-| `enrichment.py` | Per-company scraping, email extraction and ranking, LLM metadata |
-| `generation.py` | Background jobs: compose a draft per selected contact |
-| `email_composer.py` | Email types, prompt construction, offline template fallbacks |
-| `resume_service.py` | Resume PDF upload, text extraction, versioning |
-| `email_sender.py` | Gmail API send with attachments and recipient safety checks |
-| `response_checker.py` | Thread inspection for genuine replies (ignores bounces/auto-replies) |
-| `llm_client.py` | Provider abstraction: Gemini, OpenAI, OpenRouter |
-| `web_scraper.py` | Layered fetch (JSON API → HTTPX → Playwright) with SSRF guards and per-domain rate limiting. Does not consult robots.txt |
-| `text_cleaner.py` | Strips nav/footer/boilerplate lines out of scraped page text |
-| `ddg_search.py` | DuckDuckGo search wrapper that degrades gracefully |
-| `rate_limiter.py` | Send/generation/research caps |
-| `models.py` | Pydantic request models and input validators |
+See [`../docs/architecture.md`](../docs/architecture.md) for component and dependency
+boundaries and [`../docs/repository-map.md`](../docs/repository-map.md) for module-level
+change routing. Those documents are canonical so this runtime README does not duplicate
+an inventory that can drift.
 
 ## Data
 
@@ -49,5 +36,8 @@ Long operations run as background threads that report progress through the `jobs
 ## Tests
 
 ```bash
-cd ../tests && ../backend/venv/bin/python -m pytest
+make test-backend
 ```
+
+Targeted and full validation commands are in
+[`../docs/testing.md`](../docs/testing.md).

@@ -26,17 +26,6 @@ REASON_EMPTY = "llm_empty"          # provider answered, with nothing usable
 REASON_NO_PROVIDER = "llm_no_key"   # nothing configured at all
 REASON_UNAVAILABLE = "llm_unavailable"  # legacy catch-all
 
-# Human-readable, shown as-is in the UI.
-REASON_LABELS = {
-    REASON_QUOTA: "AI quota exhausted",
-    REASON_AUTH: "AI key rejected",
-    REASON_NOT_FOUND: "No usable AI model",
-    REASON_NETWORK: "Could not reach the AI provider",
-    REASON_EMPTY: "AI returned nothing usable",
-    REASON_NO_PROVIDER: "No AI provider configured",
-    REASON_UNAVAILABLE: "AI unavailable",
-}
-
 # Gemini ladder: tried in order, next one used on quota/error.
 #
 # Keep every entry a model the API actually serves. A previous ladder listed

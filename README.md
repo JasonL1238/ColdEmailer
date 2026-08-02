@@ -92,27 +92,10 @@ Open **Settings** and fill in your name, email, school, past employers/communiti
 
 ## Architecture
 
-```
-frontend/  React + Vite SPA
-  src/pages/   Dashboard, Discover, DatabasePage, Emails, Resumes, Settings, ComposeModal
-  src/ui.jsx   shared primitives (Modal, Drawer, Chip, job polling hook)
-  src/api.js   API client
-  src/styles.css  design system
-
-backend/   FastAPI
-  main.py           all HTTP routes
-  db.py             SQLite layer + legacy migration
-  discovery.py      background company-discovery jobs
-  enrichment.py     scraping, email extraction, LLM metadata
-  generation.py     background email-generation jobs
-  email_composer.py email types, prompts, template fallbacks
-  resume_service.py PDF upload/parse/versioning
-  email_sender.py   Gmail send
-  response_checker.py  reply detection
-  llm_client.py     provider abstraction (Gemini/OpenAI/OpenRouter)
-```
-
-Everything lives in one SQLite database at `backend/data/coldemailer.db` — companies, contacts, resumes, emails, background jobs, settings, and an event log. Long operations (discovery, generation, sending) run as background jobs the UI polls for progress, so nothing blocks the browser.
+The React/Vite frontend calls a FastAPI backend backed by one local SQLite
+database. Long operations run as background jobs that the UI polls for progress.
+See [`docs/architecture.md`](docs/architecture.md) for component and dependency
+boundaries, and [`docs/repository-map.md`](docs/repository-map.md) to locate changes.
 
 Data from the previous CSV/JSON version (`contacts.csv`, `generated_emails.json`, `company_cache.json`, root-level `resume*.pdf`) is imported automatically on first startup.
 
@@ -134,14 +117,16 @@ All optional, set in `.env`:
 ## Tests
 
 ```bash
-backend/venv/bin/python -m pytest                    # 400 backend tests
+make test-backend
 ```
 
 ```bash
-cd frontend && npm test                              # 53 frontend tests
+make test-frontend
 ```
 
 The backend suite runs against a throwaway database (`tests/conftest.py` sets `COLD_DB_PATH`), so it never touches your real data or Gmail credentials.
+See [`docs/testing.md`](docs/testing.md) for targeted checks, linting, scoped type
+checking, builds, and full validation.
 
 ## Notes on responsible use
 

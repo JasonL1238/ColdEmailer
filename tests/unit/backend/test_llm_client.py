@@ -15,7 +15,7 @@ import time
 import pytest
 
 import llm_client
-from llm_client import (GEMINI_MODEL_FALLBACK_ORDER, REASON_AUTH, REASON_EMPTY,
+from llm_client import (GEMINI_MODEL_FALLBACK_ORDER, REASON_AUTH,
                         REASON_NETWORK, REASON_NOT_FOUND, REASON_NO_PROVIDER,
                         REASON_QUOTA, _classify, _ladder,
                         complete_with_reason, get_cloud_llm_provider,
