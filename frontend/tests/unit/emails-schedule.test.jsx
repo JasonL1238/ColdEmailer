@@ -14,14 +14,16 @@ const { sendSpy, windowSpy, unscheduleSpy } = vi.hoisted(() => ({
   unscheduleSpy: vi.fn(() => Promise.resolve({ data: { cleared: 1 } })),
 }))
 
-let emails = [{
+const base = {
   id: 'e1', status: 'draft', subject: 'ZZTEST draft', body: 'Hi there,',
   contact_name: 'ZZTEST Jane', contact_email: 'jane@zztest.invalid',
   contact_email_kind: 'personal', company_name: 'ZZTEST Corp',
   email_type: 'application', sent_at: null, gmail_message_id: null,
   created_at: '2026-08-01T09:00:00', has_response: 0, claims_attachment: 0,
   follow_ups_sent: 0, follow_up_pending: 0,
-}]
+}
+
+let emails = [{ ...base }]
 
 vi.mock('../../src/api', () => ({
   errMessage: (e, f) => f || 'err',
@@ -141,33 +143,52 @@ describe('Emails — queued mail is visible and stoppable', () => {
     vi.clearAllMocks()
     windowSpy.mockResolvedValue({ data: { enabled: true, open_now: false,
       description: '8am–5pm on weekdays', next_opening: '2026-08-04T08:00:00' } })
-    emails = [{ ...emails[0], scheduled_at: '2026-08-04T08:00:00', status: 'approved' }]
+    emails = [
+      { ...base, id: 'e1', scheduled_at: '2026-08-04T08:00:00', status: 'approved' },
+      { ...base, id: 'e2', scheduled_at: '2026-08-05T08:00:00', status: 'approved',
+        contact_email: 'sam@zztest.invalid', subject: 'ZZTEST second' },
+    ]
   })
 
-  it('says so on the list, and offers to take it back out', async () => {
+  it('says so on every queued row, and takes them all back out at once', async () => {
     /* This is the only thing in the app that happens without a click, and
        before this it was invisible: no chip, no banner, and the unschedule
-       endpoint had no caller anywhere in the frontend. */
+       endpoint had no caller anywhere in the frontend.
+
+       Two rows, not one: with a single fixture the button reads "Cancel it"
+       and a regression that cancelled only the first of twelve queued messages
+       — leaving eleven armed after a click labelled "Cancel them all" — was
+       indistinguishable from correct. */
     render(<Emails />)
-    await waitFor(() => expect(document.querySelectorAll('.email-row').length).toBe(1))
+    await waitFor(() => expect(document.querySelectorAll('.email-row').length).toBe(2))
 
     expect(document.body.textContent).toMatch(/queued to\s+send/i)
+    // the per-row chip, which the banner assertion alone never observed
+    const chips = [...document.querySelectorAll('.email-row')]
+      .filter((r) => /queued/i.test(r.textContent))
+    expect(chips.length).toBe(2)
+
     const cancel = [...document.querySelectorAll('button')]
-      .find((b) => /^Cancel it$/.test(b.textContent.trim()))
+      .find((b) => /^Cancel them all$/.test(b.textContent.trim()))
     expect(cancel).toBeTruthy()
 
     fireEvent.click(cancel)
-    await waitFor(() => expect(unscheduleSpy).toHaveBeenCalledWith(['e1']))
+    await waitFor(() => expect(unscheduleSpy).toHaveBeenCalledWith(['e1', 'e2']))
   })
 
   it('says nothing when a queued row has already been delivered', async () => {
     /* A stamp left behind on a row that has since gone out — by a manual send
        or by reconciliation — must not read as "this will send again". */
-    emails = [{ ...emails[0], status: 'sent', gmail_message_id: 'gm1',
-      sent_at: '2026-08-04T08:00:00' }]
+    emails = [{ ...base, id: 'e1', scheduled_at: '2026-08-04T08:00:00',
+      status: 'sent', gmail_message_id: 'gm1', sent_at: '2026-08-04T08:00:00' }]
     render(<Emails />)
     await waitFor(() => expect(document.querySelector('.page')).toBeTruthy())
     await waitFor(() => expect(document.body.textContent).toMatch(/Sent/))
     expect(document.body.textContent).not.toMatch(/queued to\s+send/i)
+    // and the row chip is gone too, not just the banner
+    fireEvent.click([...document.querySelectorAll('button')]
+      .find((b) => b.textContent.trim().startsWith('Sent')))
+    await waitFor(() => expect(document.querySelectorAll('.email-row').length).toBe(1))
+    expect(document.querySelector('.email-row').textContent).not.toMatch(/queued/i)
   })
 })

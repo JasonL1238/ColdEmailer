@@ -895,6 +895,20 @@ async def update_contact(contact_id: str, payload: ContactUpdate,
         updates.pop("email", None)
 
     db.update_contact(contact_id, updates)
+    if address_changed:
+        # A queued message resolves its recipient at send time, so moving the
+        # address re-aims mail that is already approved and waiting — at a
+        # different human, days later, with nobody watching. `force` does not
+        # protect this: _contact_has_been_emailed only counts rows that have
+        # been sent or attempted, and a queued row is neither.
+        requeued = db.query(
+            "SELECT id FROM emails WHERE contact_id=? AND scheduled_at IS NOT NULL",
+            (contact_id,))
+        for row in requeued:
+            db.update_email(row["id"], {"scheduled_at": None,
+                                        "scheduled_by_job": None})
+            db.log_event("email", row["id"], "send_unscheduled",
+                         "recipient address changed while queued")
     if updates.get("bounced_at", "keep") is None:
         # The email-level flags too, not just the contact's. Nothing else in
         # the app ever writes NULL to emails.bounced_at, so a row that bounced
@@ -2321,9 +2335,19 @@ def send_emails(payload: SendRequest):
             stamp = scheduled_for.astimezone().replace(tzinfo=None).isoformat(
                 timespec="seconds")
             for eid in sendable:
-                db.update_email(eid, {"status": "approved",
-                                      "scheduled_at": stamp,
-                                      "scheduled_by_job": job["id"]})
+                updates = {"status": "approved", "scheduled_at": stamp,
+                           "scheduled_by_job": job["id"]}
+                # Pin the actual PDF now rather than resolving "the default" at
+                # send time. Promoting a different resume between queueing and
+                # sending would otherwise restaple a file the draft was never
+                # written around — and because the row's own resume_id was
+                # NULL, the sweep's attachment check could not see the swap.
+                if payload.attach_resume:
+                    pinned = _resolved_attachment_id(
+                        db.get_email(eid) or {}, True, payload.resume_id)
+                    if pinned:
+                        updates["resume_id"] = pinned
+                db.update_email(eid, updates)
             db.update_job(job["id"], stage=f"Scheduled for {stamp}",
                           progress_current=0)
             db.finish_job(job["id"], "done",
@@ -2448,7 +2472,14 @@ def scheduled_send_sweep() -> Optional[str]:
             target=_send_batch_job,
             args=(job["id"], ids, resume_override, attach,
                   options.get("from_email") or (db.get_profile().get("email") or "me"),
-                  bool(options.get("confirm_resend"))),
+                  # Never replayed. "Resend it anyway" is a statement about the
+                  # rows the user was looking at when they said it; days later
+                  # a *different* row in the same batch can have picked up an
+                  # unconfirmed attempt, and honouring the stored flag would
+                  # send that one a second copy on the strength of a decision
+                  # about someone else. A queued row whose delivery has become
+                  # unknown is left for a human.
+                  False),
             daemon=True,
         ).start()
         return job["id"]
@@ -2477,8 +2508,13 @@ async def get_send_window():
     return {**window,
             "description": send_window.describe(window),
             "open_now": send_window.is_open(window) if window["enabled"] else None,
-            "next_opening": (upcoming.replace(tzinfo=None).isoformat(timespec="seconds")
-                             if upcoming else None),
+            # Same conversion the stamp uses. Returning the window's wall clock
+            # here while `next_scheduled_at` below comes back in server-local
+            # put two frames in one payload with no marker on either — the
+            # "Send at Mon 8:00" button and the "queued Sun 10:00 PM" chip
+            # naming the same instant ten hours apart.
+            "next_opening": (upcoming.astimezone().replace(tzinfo=None)
+                             .isoformat(timespec="seconds") if upcoming else None),
             "detected_timezone": send_window.local_timezone_name(),
             "scheduled_count": (pending or {}).get("n") or 0,
             "next_scheduled_at": (pending or {}).get("next")}

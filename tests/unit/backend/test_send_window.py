@@ -16,7 +16,9 @@ through a sleeping thread.
 """
 import itertools
 import os
+import sys
 import tempfile
+import types
 from datetime import datetime, timedelta
 
 import pytest
@@ -45,6 +47,24 @@ def _recently(hours=1):
     """A stamp whose moment has passed but is still inside the staleness
     floor — the ordinary "this is due now" case."""
     return (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def _a_zone_offset_from_here():
+    """A real IANA zone whose current offset differs from this machine's.
+
+    Hardcoding one makes the frame assertions tautologies on any host that
+    happens to run it — which is precisely the bug those assertions guard.
+    """
+    from zoneinfo import ZoneInfo as _Z
+    here = datetime.now().astimezone().utcoffset()
+    for name in ("Pacific/Kiritimati", "Pacific/Midway", "Asia/Kathmandu",
+                 "Australia/Sydney", "America/Sao_Paulo", "UTC"):
+        try:
+            if datetime.now(_Z(name)).utcoffset() != here:
+                return name
+        except Exception:
+            continue
+    raise AssertionError("no zone differs from this host's offset")
 
 
 def _window(**kw):
@@ -473,7 +493,40 @@ def test_editing_a_queued_email_takes_it_out_of_the_queue(api):
 
     main.db.update_email(draft["id"], {"body": "A different message entirely."})
 
+    row = main.db.get_email(draft["id"])
+    assert row["scheduled_at"] is None
+    # the job link goes too, or the next sweep groups against a dead batch
+    assert row["scheduled_by_job"] is None
+
+
+def test_editing_only_the_subject_also_takes_it_out_of_the_queue(api):
+    """PATCH /api/emails/{id} accepts a subject on its own, and the subject is
+    the whole of what most recipients read. Triggering only on body meant the
+    queue could deliver a subject line nobody approved."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
+
+    main.db.update_email(draft["id"], {"subject": "Something else"})
+
     assert main.db.get_email(draft["id"])["scheduled_at"] is None
+
+
+def test_rescheduling_an_already_queued_row_keeps_the_new_time(api):
+    """The clearing skips itself when the caller is setting `scheduled_at` —
+    otherwise the scheduling write, which sets status and stamp together, would
+    wipe the stamp it had just written."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
+    first = main.db.get_email(draft["id"])["scheduled_at"]
+    assert first
+
+    main.db.update_email(draft["id"], {"status": "approved",
+                                       "scheduled_at": "2030-01-01T08:00:00"})
+    assert main.db.get_email(draft["id"])["scheduled_at"] == "2030-01-01T08:00:00"
 
 
 def test_switching_the_window_off_empties_the_queue(api):
@@ -514,10 +567,16 @@ def test_a_stamp_left_behind_too_long_is_dropped_not_sent(api, monkeypatch):
 def test_the_stamp_is_written_in_the_frame_the_sweep_compares_against(api):
     """`next_opening` answers in the *window's* zone; the sweep compares
     against naive server-local time. Storing the window's wall clock meant a
-    UTC container with an Australia/Sydney window fired ten hours out."""
+    UTC container with an Australia/Sydney window fired ten hours out.
+
+    The zone is chosen at runtime to differ from this host's, rather than
+    hardcoded — on a machine already running Australia/Sydney the assertion
+    held with and without the conversion it exists to protect.
+    """
     from datetime import timezone as _tz
     sender, contact, draft = api
-    main.db.update_send_window({"enabled": True, "timezone": "Australia/Sydney",
+    zone = _a_zone_offset_from_here()
+    main.db.update_send_window({"enabled": True, "timezone": zone,
                                 "days": [0, 1, 2, 3, 4, 5, 6],
                                 "start_hour": 0, "end_hour": 23})
     main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
@@ -557,6 +616,37 @@ def test_a_spring_forward_hour_that_does_not_exist_is_never_promised():
     assert opening == opening.astimezone(_tz.utc).astimezone(opening.tzinfo)
 
 
+def test_a_skipped_hour_is_normalized_on_the_default_no_timezone_setting():
+    """`timezone: ""` is the shipped default — "use this machine's clock" — so
+    a host in a DST zone takes the naive path every single time. Short-circuiting
+    _real_instant on naive input left the spring-forward hole open on precisely
+    the configuration most people run: next_opening would answer 02:00 on the
+    changeover Sunday, a wall time that never occurs, is_open would be False all
+    day, and the batch would wait another week.
+    """
+    import time as _time
+    if not hasattr(_time, "tzset"):
+        pytest.skip("no tzset on this platform")
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    _time.tzset()
+    try:
+        # Sunday 2026-03-08: the clock goes 01:59:59 EST -> 03:00:00 EDT.
+        w = _window(timezone="", days=[6], start_hour=2, end_hour=4)
+        saturday = datetime(2026, 3, 7, 12, 0)
+        opening = send_window.next_opening(w, saturday)
+        assert opening is not None
+        assert opening.hour != 2, f"promised an hour that never occurs: {opening}"
+        # ...and whatever it picked is a moment the window really is open at
+        assert send_window.is_open(w, opening), opening
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        _time.tzset()
+
+
 def test_the_detected_timezone_is_a_region_not_a_fixed_offset_alias(monkeypatch):
     """'EST' is a real tzdb entry — the legacy fixed UTC-05:00 zone that never
     observes DST — so accepting it left the suggestion an hour wrong for eight
@@ -580,11 +670,132 @@ def test_the_detected_timezone_is_a_region_not_a_fixed_offset_alias(monkeypatch)
 
     monkeypatch.setattr(_time, "tzname", ("America/New_York", "EDT"))
     assert send_window.local_timezone_name() == "America/New_York"
-
-    # ...and whatever this machine really reports must at least be usable
     monkeypatch.undo()
-    name = send_window.local_timezone_name()
-    assert name == "" or ("/" in name and send_window.resolve_timezone(name)), name
+
+    # The tzlocal branch itself, which the ImportError above never reaches —
+    # asserting only "" or a slash-name was satisfied by "", i.e. by the branch
+    # not existing at all.
+    fake = types.ModuleType("tzlocal")
+    fake.get_localzone = lambda: "Europe/Berlin"
+    monkeypatch.setitem(sys.modules, "tzlocal", fake)
+    monkeypatch.setattr(_time, "tzname", ("CET", "CEST"))
+    assert send_window.local_timezone_name() == "Europe/Berlin"
+
+    # tzlocal can answer 'local' on a machine with no zone configured; that is
+    # not a region name, so the abbreviation scan gets its turn.
+    fake.get_localzone = lambda: "local"
+    monkeypatch.setattr(_time, "tzname", ("Europe/Berlin", "CEST"))
+    assert send_window.local_timezone_name() == "Europe/Berlin"
+
+
+def test_moving_the_address_takes_the_queued_mail_out(api):
+    """A queued row resolves its recipient at send time, so correcting the
+    address re-aims already-approved mail at a different human, days later,
+    unattended. `force` does not cover it: nothing has been sent or attempted
+    on a queued row, so the has-been-emailed guard never fires."""
+    import asyncio
+    from models import ContactUpdate
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
+    assert main.db.get_email(draft["id"])["scheduled_at"] is not None
+
+    asyncio.run(main.update_contact(
+        contact["id"], ContactUpdate(email="zztestmoved@example.com"), force=True))
+
+    assert main.db.get_email(draft["id"])["scheduled_at"] is None
+
+
+def test_a_queued_batch_never_replays_a_resend_confirmation(api, monkeypatch):
+    """"Send it anyway" is a statement about the rows in front of the user at
+    that moment. Days later a different row in the same batch can have picked
+    up an unconfirmed attempt, and honouring the stored flag would hand that
+    person a second copy on the strength of a decision about someone else."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
+    main.send_emails(SendRequest(email_ids=[draft["id"]], confirm_resend=True,
+                                 schedule="next_window"))
+    # the row's delivery becomes unknown after it was queued
+    main.db.update_email(draft["id"], {"send_attempted_at": _recently(hours=2)})
+    main.db.execute("UPDATE emails SET scheduled_at=? WHERE id=?",
+                    (_recently(), draft["id"]))
+
+    job_id = main.scheduled_send_sweep()
+    if job_id:
+        _await(job_id)
+
+    assert sender.calls == []          # left for a human, not sent twice
+
+
+def test_a_queued_batch_keeps_the_resume_it_was_written_around(api, monkeypatch):
+    """Promoting a different default resume between queueing and sending used
+    to restaple a PDF the draft was never written around — invisibly, because
+    the row's own resume_id was NULL so the attachment check saw no change."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    monkeypatch.setattr(main.db, "get_default_resume", lambda: {"id": "resume-A"})
+    monkeypatch.setattr(main.resumes, "resolve_attachment_path",
+                        lambda rid: f"/tmp/{rid}.pdf" if rid else None)
+
+    main.send_emails(SendRequest(email_ids=[draft["id"]], attach_resume=True,
+                                 schedule="next_window"))
+    assert main.db.get_email(draft["id"])["resume_id"] == "resume-A"
+
+    # the user promotes a different default before the window opens
+    monkeypatch.setattr(main.db, "get_default_resume", lambda: {"id": "resume-B"})
+    monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
+    main.db.execute("UPDATE emails SET scheduled_at=? WHERE id=?",
+                    (_recently(), draft["id"]))
+
+    _await(main.scheduled_send_sweep())
+
+    assert sender.options[0]["resume_path"] == "/tmp/resume-A.pdf"
+
+
+def test_a_confirmed_attachment_change_survives_the_queue(api, monkeypatch):
+    """The mirror of the recheck: a conflict the user was warned about and
+    accepted must still go out, or the sweep silently unschedules mail they
+    explicitly approved."""
+    sender, contact, draft = api
+    main.db.update_send_window({"enabled": True, "days": [0, 1, 2, 3, 4],
+                                "start_hour": 8, "end_hour": 17})
+    monkeypatch.setattr(send_window, "is_open", lambda w, now=None: True)
+    main.db.execute("UPDATE emails SET body=? WHERE id=?",
+                    ("Hi there,\n\nMy resume is attached.", draft["id"]))
+
+    main.send_emails(SendRequest(email_ids=[draft["id"]], attach_resume=False,
+                                 confirm_attachment_change=True,
+                                 schedule="next_window"))
+    main.db.execute("UPDATE emails SET scheduled_at=? WHERE id=?",
+                    (_recently(), draft["id"]))
+
+    _await(main.scheduled_send_sweep())
+
+    assert sender.calls == [draft["id"]]
+
+
+def test_the_reported_next_opening_is_in_the_same_frame_as_the_queue(api):
+    """Two frames in one payload with no marker on either: the "Send at Mon
+    8:00" button and the "queued Sun 10:00 PM" chip named the same instant ten
+    hours apart, and a user who reads the button and closes the app cannot
+    tell which is the bug."""
+    import asyncio
+    sender, contact, draft = api
+    # A zone deliberately far from any plausible host, so the two frames differ.
+    main.db.update_send_window({"enabled": True, "timezone": "Pacific/Kiritimati",
+                                "days": [0, 1, 2, 3, 4, 5, 6],
+                                "start_hour": 8, "end_hour": 9})
+    reported = asyncio.run(main.get_send_window())
+    if reported["open_now"]:
+        return                                   # nothing to schedule against
+    main.send_emails(SendRequest(email_ids=[draft["id"]], schedule="next_window"))
+
+    stamp = main.db.get_email(draft["id"])["scheduled_at"]
+    assert reported["next_opening"] == stamp, (reported["next_opening"], stamp)
 
 
 def _await(job_id, timeout=10.0):

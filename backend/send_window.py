@@ -205,10 +205,16 @@ def next_opening(window: Dict[str, Any],
 
 
 def _real_instant(moment: datetime) -> datetime:
-    """Map a wall time onto the instant that actually occurs in its zone."""
-    if moment.tzinfo is None:
-        return moment
+    """Map a wall time onto the instant that actually occurs in its zone.
+
+    The naive branch matters most: `timezone: ""` is the shipped default, so a
+    machine set to a DST zone takes it every time. Short-circuiting on naive
+    input left the spring-forward hole open on exactly the configuration most
+    users run.
+    """
     try:
+        if moment.tzinfo is None:
+            return moment.astimezone().astimezone().replace(tzinfo=None)
         return moment.astimezone(timezone.utc).astimezone(moment.tzinfo)
     except Exception:
         return moment
