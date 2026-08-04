@@ -202,6 +202,8 @@ def merge_intel(runs: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]
 
 
 def _contact_summary(contact: Dict[str, Any]) -> Dict[str, Any]:
+    """Just enough to render a person and reach them. `seniority_rank`,
+    `matched_terms` and `criteria_match` also drive grouping and ordering."""
     notes = contact.get("notes")
     return {
         "id": contact.get("id"),
@@ -209,9 +211,7 @@ def _contact_summary(contact: Dict[str, Any]) -> Dict[str, Any]:
         "role": _clean(contact.get("role")) or None,
         "email": contact.get("email") or None,
         "linkedin_url": contact.get("linkedin_url") or None,
-        "status": contact.get("status"),
         "seniority_rank": contact.get("seniority_rank"),
-        "person_verified": bool(contact.get("person_verified")),
         "email_verified": bool(contact.get("email_verified")),
         "matched_terms": matched_terms_from_notes(notes),
         "criteria_match": contact_is_criteria_match(notes),
