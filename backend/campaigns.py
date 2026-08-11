@@ -8,9 +8,9 @@ the app could not answer it.
 Three rules, each of them a rule this codebase already follows elsewhere and
 which a campaign page is unusually good at breaking:
 
-**A rate needs a sample.** Reused verbatim from `analytics` — same MIN_SAMPLE,
-same `rate_of`. A campaign is exactly where "3 sent, 1 reply" wants to render
-as 33%, and a new campaign is *always* small.
+**A rate needs a sample.** Imported from `analytics`, never re-derived — same
+MIN_SAMPLE, same `rate_of`, same best/worst rule. A campaign is exactly where
+"3 sent, 1 reply" wants to render as 33%, and a new campaign is *always* small.
 
 **Only verified replies count.** The legacy checker counted bounces,
 auto-replies and the user's own messages; those are reported separately and
@@ -24,14 +24,7 @@ campaign totals are never mistaken for the whole database.
 """
 from typing import Any, Dict, List, Optional
 
-from analytics import MIN_SAMPLE, rate_of
-
-
-def _int(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
+from analytics import MIN_SAMPLE, best_and_worst, rate_of, to_int as _int
 
 
 def summarize(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -64,18 +57,12 @@ def summarize(row: Dict[str, Any]) -> Dict[str, Any]:
 def compare(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Best and worst campaign, or nothing.
 
-    Needs two campaigns that each cleared the floor. Naming a winner out of one
-    qualifying campaign restates that campaign; out of zero it is a guess. Same
-    rule as the analytics headline, for the same reason.
+    The analytics headline rule, applied to live campaigns: two of them must
+    each have cleared the sample floor. Naming a winner out of one qualifying
+    campaign restates that campaign; out of zero it is a guess. An archived
+    campaign is not a contender — it is over.
     """
-    scored = [s for s in summaries
-              if s["enough_data"] and not s["archived_at"]]
-    if len(scored) < 2:
-        return {"best": None, "worst": None, "spread": None}
-    ranked = sorted(scored, key=lambda s: s["rate"], reverse=True)
-    best, worst = ranked[0], ranked[-1]
-    return {"best": best, "worst": worst,
-            "spread": round(best["rate"] - worst["rate"], 1)}
+    return best_and_worst([s for s in summaries if not s["archived_at"]])
 
 
 def build(rows: List[Dict[str, Any]],

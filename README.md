@@ -95,7 +95,8 @@ Open **Settings** and fill in your name, email, school, past employers/communiti
 The React/Vite frontend calls a FastAPI backend backed by one local SQLite
 database. Long operations run as background jobs that the UI polls for progress.
 See [`docs/architecture.md`](docs/architecture.md) for component and dependency
-boundaries, and [`docs/repository-map.md`](docs/repository-map.md) to locate changes.
+boundaries, and [`docs/map.md`](docs/map.md) to locate changes. Working on this
+repo with a coding agent? [`AGENTS.md`](AGENTS.md) is the entry point.
 
 Data from the previous CSV/JSON version (`contacts.csv`, `generated_emails.json`, `company_cache.json`, root-level `resume*.pdf`) is imported automatically on first startup.
 

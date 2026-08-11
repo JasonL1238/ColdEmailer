@@ -373,6 +373,29 @@ _CONTACT_REPLY_UNVERIFIED_SQL = (
     "AND r.response_verified_at IS NULL)"
 )
 
+# Every email row the API returns, decorated with the contact and company facts
+# the Emails page needs. `get_email` and `list_emails` must select exactly the
+# same shape: the page renders one from a list view and then re-fetches it on
+# its own, and a column present in one and missing from the other reads as the
+# value having changed.
+_EMAIL_ROW_SQL = f"""
+    SELECT e.*, ct.name AS contact_name,
+           COALESCE(e.recipient_email, ct.email) AS contact_email,
+           ct.role AS contact_role,
+           ct.email_kind AS contact_email_kind,
+           ct.bounced_at AS contact_bounced_at,
+           c.name AS company_name,
+           {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
+           {_FOLLOW_UPS_SENT_SQL} AS follow_ups_sent,
+           {_FOLLOW_UP_PENDING_SQL} AS follow_up_pending,
+           {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
+           {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
+           {_CONTACT_REPLY_UNVERIFIED_SQL} AS contact_reply_unverified
+    FROM emails e
+    LEFT JOIN contacts ct ON e.contact_id = ct.id
+    LEFT JOIN companies c ON ct.company_id = c.id
+"""
+
 
 # Wording that promises the recipient a file. The composer decides once, while
 # writing, whether a real PDF will go out ("My resume is attached for
@@ -1462,24 +1485,7 @@ class Database:
 
     def get_email(self, email_id: str) -> Optional[Dict[str, Any]]:
         return self._annotate_email(self.query_one(
-            f"""SELECT e.*, ct.name AS contact_name,
-                   COALESCE(e.recipient_email, ct.email) AS contact_email,
-                      ct.role AS contact_role,
-                      ct.email_kind AS contact_email_kind,
-                      ct.bounced_at AS contact_bounced_at,
-                      c.name AS company_name,
-                      {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
-                      {_FOLLOW_UPS_SENT_SQL} AS follow_ups_sent,
-                      {_FOLLOW_UP_PENDING_SQL} AS follow_up_pending,
-                      {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
-                      {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
-                      {_CONTACT_REPLY_UNVERIFIED_SQL} AS contact_reply_unverified
-               FROM emails e
-               LEFT JOIN contacts ct ON e.contact_id = ct.id
-               LEFT JOIN companies c ON ct.company_id = c.id
-               WHERE e.id=?""",
-            (email_id,),
-        ))
+            _EMAIL_ROW_SQL + " WHERE e.id=?", (email_id,)))
 
     def update_email(self, email_id: str, updates: Dict[str, Any]):
         allowed = {
@@ -1548,22 +1554,7 @@ class Database:
         return cur.rowcount > 0
 
     def list_emails(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        sql = f"""
-            SELECT e.*, ct.name AS contact_name,
-                   COALESCE(e.recipient_email, ct.email) AS contact_email,
-                   ct.role AS contact_role, ct.email_kind AS contact_email_kind,
-                   ct.bounced_at AS contact_bounced_at,
-                   c.name AS company_name,
-                   {_HAS_FOLLOW_UP_SQL} AS has_follow_up,
-                   {_FOLLOW_UPS_SENT_SQL} AS follow_ups_sent,
-                   {_FOLLOW_UP_PENDING_SQL} AS follow_up_pending,
-                   {_CONTACT_HAS_REPLIED_SQL} AS contact_has_replied,
-                   {_REPLY_UNVERIFIED_SQL} AS reply_unverified,
-                   {_CONTACT_REPLY_UNVERIFIED_SQL} AS contact_reply_unverified
-            FROM emails e
-            LEFT JOIN contacts ct ON e.contact_id = ct.id
-            LEFT JOIN companies c ON ct.company_id = c.id
-        """
+        sql = _EMAIL_ROW_SQL
         params: tuple = ()
         if status:
             sql += " WHERE e.status=?"

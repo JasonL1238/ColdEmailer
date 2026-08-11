@@ -193,7 +193,27 @@ class CompanyUpdate(BaseModel):
         return validate_http_url(v)
 
 
-class ContactCreate(BaseModel):
+class _ContactAddressValidators(BaseModel):
+    """The two address checks every contact payload gets, create or update.
+
+    Declared once: a validator that exists on the create model and not the
+    update model is a hole, and that is exactly the shape the duplication kept
+    inviting.
+    """
+
+    # check_fields=False: the fields live on the subclasses, not here.
+    @field_validator("email", check_fields=False)
+    @classmethod
+    def _check_email(cls, v):
+        return validate_email_address(v)
+
+    @field_validator("linkedin_url", check_fields=False)
+    @classmethod
+    def _check_linkedin(cls, v):
+        return validate_linkedin_profile_url(v)
+
+
+class ContactCreate(_ContactAddressValidators):
     name: str = ""
     email: str = ""
     linkedin_url: Optional[str] = None
@@ -202,18 +222,8 @@ class ContactCreate(BaseModel):
     company_name: Optional[str] = None  # create/link company by name
     notes: Optional[str] = None
 
-    @field_validator("email")
-    @classmethod
-    def _check_email(cls, v):
-        return validate_email_address(v)
 
-    @field_validator("linkedin_url")
-    @classmethod
-    def _check_linkedin(cls, v):
-        return validate_linkedin_profile_url(v)
-
-
-class ContactUpdate(BaseModel):
+class ContactUpdate(_ContactAddressValidators):
     name: Optional[str] = None
     email: Optional[str] = None
     linkedin_url: Optional[str] = None
@@ -226,16 +236,6 @@ class ContactUpdate(BaseModel):
     # was write-only: one false positive retired a contact permanently, with
     # no route, repair or UI able to undo it.
     clear_bounce: Optional[bool] = None
-
-    @field_validator("email")
-    @classmethod
-    def _check_email(cls, v):
-        return validate_email_address(v)
-
-    @field_validator("linkedin_url")
-    @classmethod
-    def _check_linkedin(cls, v):
-        return validate_linkedin_profile_url(v)
 
 
 def validate_linkedin_profile_url(value: Optional[str]) -> Optional[str]:

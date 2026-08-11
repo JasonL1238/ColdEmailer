@@ -601,8 +601,13 @@ class TestUnattendedSendGate:
         api.post("/api/suppressions", json={"value": "dana@acme.com"})
 
         # A window that is open right now, and a row due a minute ago.
+        # `end_hour` is clamped to 23 and `_in_window` is a half-open range, so
+        # no stored config can cover the 23:00 hour — configuring one here made
+        # this test fail for an hour every night. The window is not what this
+        # test is about; the suppression gate below it is.
         database.update_send_window({"enabled": True, "days": list(range(7)),
                                      "start_hour": 0, "end_hour": 23})
+        monkeypatch.setattr(main.send_window, "is_open", lambda *a, **k: True)
         job = database.create_job("send", {"email_ids": [queued["id"]],
                                            "attach_resume": False})
         database.update_email(queued["id"], {
@@ -653,6 +658,7 @@ class TestUnattendedSendGate:
             body="b", status="approved", recipient_email="eve@other.example")
         database.update_send_window({"enabled": True, "days": list(range(7)),
                                      "start_hour": 0, "end_hour": 23})
+        monkeypatch.setattr(main.send_window, "is_open", lambda *a, **k: True)
         job = database.create_job("send", {"email_ids": [queued["id"]],
                                            "attach_resume": False})
         database.update_email(queued["id"], {

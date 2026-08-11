@@ -12,7 +12,8 @@ import suppression
 from db import Database
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
                             TemplateUnavailable)
-from discovery import discovery_scrape_status
+from discovery import research_updates
+import jobs
 from enrichment import EnrichmentService
 from rate_limiter import RateLimiter
 
@@ -67,17 +68,10 @@ class GenerationService:
         return job
 
     def cancel(self, job_id: str) -> bool:
-        """Only cancels generation jobs — the id comes from the URL, so without
-        the type check this route could kill a running discovery or send."""
-        job = self.db.get_job(job_id)
-        if job and job["type"] == "generation" and job["status"] == "running":
-            self.db.update_job(job_id, status="cancelled")
-            return True
-        return False
+        return jobs.cancel(self.db, job_id, "generation")
 
     def _cancelled(self, job_id: str) -> bool:
-        job = self.db.get_job(job_id)
-        return not job or job["status"] == "cancelled"
+        return jobs.is_cancelled(self.db, job_id)
 
     def _skip_entry(self, contact_id: str, reason: str) -> Dict:
         contact = self.db.get_contact(contact_id) or {}
@@ -141,21 +135,7 @@ class GenerationService:
             company["name"], company.get("url"),
             preferred_school=self.db.get_profile().get("school"),
         )
-        updates = {k: v for k, v in enriched.items()
-                   if k in ("url", "domain", "summary", "industry", "product",
-                            "hook", "recent_news", "why_care", "location",
-                            "scraped_at", "research_sources", "pages_scraped",
-                            "pages_attempted", "research_quality")
-                   and v is not None}
-        updates["scrape_status"] = discovery_scrape_status(enriched)
-        if updates["scrape_status"] == "wrong_site":
-            updates.update({
-                key: None for key in (
-                    "url", "domain", "summary", "industry", "product", "hook",
-                    "recent_news", "why_care", "location",
-                )
-            })
-        self.db.update_company(company["id"], updates)
+        self.db.update_company(company["id"], research_updates(enriched))
         return self.db.get_company(company["id"])
 
     def _run(self, job_id: str, payload: Dict):

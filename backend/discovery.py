@@ -10,7 +10,10 @@ import re
 import threading
 from typing import Dict, List, Optional
 
-from db import Database, normalize_linkedin_url
+from contact_ingest import (attach_candidate, find_existing,
+                            owned_elsewhere_note, verified_channels)
+from db import Database
+import jobs
 from ddg_search import ddg_text_search
 from enrichment import (EnrichmentService, registered_domain,
                         scrape_status_for, select_outreach_contacts)
@@ -68,75 +71,6 @@ def is_junk_site(url: Optional[str]) -> bool:
     return False
 
 
-def _guess_name_from_email(local: str) -> str:
-    """'jane.doe' -> 'Jane Doe'; generic/unparseable locals -> ''."""
-    generic = {"hello", "hi", "hey", "info", "contact", "team", "careers", "jobs",
-               "recruiting", "talent", "press", "sales", "support", "admin",
-               "office", "founders", "founder", "ceo", "general"}
-    if local.lower() in generic:
-        return ""
-    parts = re.split(r"[._-]", local)
-    words = [p for p in parts if p.isalpha() and len(p) > 1]
-    if len(words) >= 2:
-        return " ".join(w.capitalize() for w in words[:3])
-    return ""
-
-
-def _role_for_email(local: str) -> Optional[str]:
-    local = local.lower()
-    mapping = {
-        "careers": "Careers inbox", "jobs": "Careers inbox",
-        "recruiting": "Recruiting", "talent": "Recruiting",
-        "founders": "Founders", "founder": "Founders", "ceo": "CEO",
-        "hello": "General inbox", "hi": "General inbox", "hey": "General inbox",
-        "contact": "General inbox", "info": "General inbox", "team": "Team inbox",
-        "press": "Press", "sales": "Sales", "support": "Support",
-    }
-    return mapping.get(local)
-
-
-def contact_notes(candidate: Dict) -> Optional[str]:
-    """Human-readable provenance for affinity matches and risky addresses."""
-    notes = []
-    if candidate.get("school_match"):
-        school = candidate.get("school") or "your school"
-        notes.append(
-            f"Same-school match: {school} is mentioned in this person's "
-            "public company biography. Verify before referencing it.")
-    for affinity in candidate.get("affinity") or []:
-        if affinity and affinity not in (candidate.get("school") or ""):
-            notes.append(f"Warm match: {affinity}. Verify before referencing it.")
-    if candidate.get("email_verified"):
-        notes.append("Email verified as person-associated (name match + MX confirmed).")
-    elif candidate.get("email_person_match") and candidate.get("email_mx_ok") is None:
-        notes.append("Email local matches name; MX not confirmed yet.")
-    elif candidate.get("email_kind") == "generic":
-        notes.append("Company/role inbox — not a specific person.")
-    elif candidate.get("email") and not candidate.get("email_person_match"):
-        notes.append("Email local-part does not clearly match this person's name.")
-    if candidate.get("linkedin_verified"):
-        source = candidate.get("linkedin_source")
-        if source == "web_search":
-            notes.append("LinkedIn found via web search; slug matches this person's name.")
-        else:
-            notes.append("LinkedIn URL slug matches this person's name.")
-    elif candidate.get("linkedin_url") and not candidate.get("linkedin_person_match"):
-        notes.append("LinkedIn URL did not match this person's name — not stored as verified.")
-    if candidate.get("email_source") == "hunter":
-        notes.append("Email from Hunter.io finder — confirm before sending.")
-    if candidate.get("email_guess"):
-        notes.append(
-            f"Possible email pattern {candidate['email_guess']} "
-            f"(not verified — confirm before using).")
-    if candidate.get("source_url"):
-        notes.append(f"Source: {candidate['source_url']}")
-    if candidate.get("evidence"):
-        notes.append(f'Evidence: "{candidate["evidence"][:240]}"')
-    if candidate.get("warning"):
-        notes.append(candidate["warning"])
-    return " ".join(notes) or None
-
-
 def discovery_scrape_status(enriched: dict) -> str:
     """The status a freshly discovered company gets.
 
@@ -175,6 +109,36 @@ def discovery_scrape_status(enriched: dict) -> str:
     return "no_emails_found"
 
 
+# Columns a scrape may write. `scraped_at` and the crawl counters record the
+# attempt itself, so they survive a wrong-site verdict; the profile fields
+# describe a company and do not.
+RESEARCH_COLUMNS = (
+    "url", "domain", "summary", "industry", "product", "hook", "recent_news",
+    "why_care", "location", "scraped_at", "research_sources", "pages_scraped",
+    "pages_attempted", "research_quality",
+)
+PROFILE_COLUMNS = (
+    "url", "domain", "summary", "industry", "product", "hook", "recent_news",
+    "why_care", "location",
+)
+
+
+def research_updates(enriched: dict) -> Dict:
+    """The company columns a scrape result should write, status included.
+
+    On a wrong-site verdict the rejected URL and any older profile are cleared
+    rather than left in place: a later retry must search again instead of
+    scraping the same wrong company forever, and stale research must never
+    reach a draft.
+    """
+    updates = {k: v for k, v in enriched.items()
+               if k in RESEARCH_COLUMNS and v is not None}
+    updates["scrape_status"] = discovery_scrape_status(enriched)
+    if updates["scrape_status"] == "wrong_site":
+        updates.update({key: None for key in PROFILE_COLUMNS})
+    return updates
+
+
 class DiscoveryService:
     def __init__(self, db: Database, enrichment: EnrichmentService):
         self.db = db
@@ -205,19 +169,12 @@ class DiscoveryService:
         return {**job, "campaign_id": campaign_id}
 
     def cancel(self, job_id: str) -> bool:
-        """Only cancels discovery jobs — the id comes from the URL, so without
-        the type check this route could kill a running generation or send."""
-        job = self.db.get_job(job_id)
-        if job and job["type"] == "discovery" and job["status"] == "running":
-            self.db.update_job(job_id, status="cancelled")
-            return True
-        return False
+        return jobs.cancel(self.db, job_id, "discovery")
 
     # ---------- pipeline ----------
 
     def _cancelled(self, job_id: str) -> bool:
-        job = self.db.get_job(job_id)
-        return not job or job["status"] == "cancelled"
+        return jobs.is_cancelled(self.db, job_id)
 
     def _run_safe(self, job_id: str, query: str, count: int, mode: str = "full",
                   campaign_id: Optional[str] = None):
@@ -306,118 +263,30 @@ class DiscoveryService:
                     enriched.get("contacts") or [],
                     enriched.get("emails") or [], company.get("domain"),
                     limit=3, person_only=True):
-                addr = candidate.get("email") or ""
-                linkedin_url = candidate.get("linkedin_url") or ""
-                # Drop LinkedIn that failed person-slug verification
-                if linkedin_url and not candidate.get("linkedin_verified"):
-                    linkedin_url = ""
-                # Drop generic / unmatched emails — keep LinkedIn-only people
-                if addr and (
-                        candidate.get("email_kind") == "generic"
-                        or (candidate.get("name")
-                            and not candidate.get("email_person_match")
-                            and not candidate.get("email_verified"))):
-                    addr = ""
+                addr, linkedin_url = verified_channels(candidate)
                 if not addr and not linkedin_url:
                     continue
-                existing = (
-                    self.db.find_contact_by_email(addr) if addr else None
-                ) or (
-                    self.db.find_contact_by_linkedin(linkedin_url)
-                    if linkedin_url else None
-                )
+                existing = find_existing(self.db, addr, linkedin_url)
                 if existing:
+                    # Discovery only ever adds. Enriching a row it did not
+                    # create belongs to re-research, which knows whether the
+                    # person has already been emailed.
                     if existing.get("company_id") != company["id"]:
-                        other = (
-                            self.db.get_company(existing["company_id"])
-                            if existing.get("company_id") else None
-                        )
-                        other_name = (other or {}).get("name") or "another company"
-                        detail = (
-                            f"{addr or linkedin_url} already belongs to "
-                            f"{other_name} — not reassigned to {name}"
-                        )
+                        detail = owned_elsewhere_note(
+                            self.db, existing.get("company_id"),
+                            addr or linkedin_url, name)
                         contact_conflicts.append(detail)
                         self.db.log_event(
                             "company", company["id"], "contact_conflict", detail)
                     continue
-                local = addr.split("@", 1)[0] if addr else ""
-                created = self.db.create_contact(
-                    company_id=company["id"],
-                    # Stated, not inherited. `create_company` returns the
-                    # existing row when a candidate turns out to be a company
-                    # some earlier run already found — correctly leaving that
-                    # company with its original campaign. Falling back to the
-                    # company's campaign therefore credited people *this* run
-                    # discovered to a campaign that never went looking for
-                    # them, or to none at all. Inheritance is the floor for
-                    # callers that cannot know; this one knows.
-                    campaign_id=campaign_id,
-                    name=candidate.get("name") or _guess_name_from_email(local),
-                    email=addr,
-                    linkedin_url=linkedin_url,
-                    role=candidate.get("role") or _role_for_email(local),
-                    source="discovery",
-                    status="new",
-                    notes=contact_notes(candidate),
-                    source_url=candidate.get("source_url"),
-                    evidence=candidate.get("evidence"),
-                    affinity=", ".join(candidate.get("affinity") or []) or None,
-                    seniority_rank=candidate.get("seniority_rank", 20),
-                    email_kind=candidate.get("email_kind") or "unknown",
-                    email_verified=bool(candidate.get("email_verified")),
-                    linkedin_verified=bool(candidate.get("linkedin_verified")),
-                    person_verified=bool(candidate.get("person_verified")),
-                )
-                # IntegrityError fallback can return another company's row.
-                if created.get("company_id") and created["company_id"] != company["id"]:
-                    other = self.db.get_company(created["company_id"])
-                    other_name = (other or {}).get("name") or "another company"
-                    detail = (
-                        f"{addr or linkedin_url} already belongs to "
-                        f"{other_name} — not reassigned to {name}"
-                    )
-                    contact_conflicts.append(detail)
-                    self.db.log_event(
-                        "company", company["id"], "contact_conflict", detail)
-                    continue
-                # Same-company race: ensure LinkedIn actually landed on this row.
-                if linkedin_url:
-                    wanted = normalize_linkedin_url(linkedin_url)
-                    stored = normalize_linkedin_url(created.get("linkedin_url"))
-                    if wanted and wanted != stored:
-                        clash = self.db.find_contact_by_linkedin(linkedin_url)
-                        other = (
-                            self.db.get_company(clash.get("company_id"))
-                            if clash and clash.get("id") != created.get("id")
-                            and clash.get("company_id") else None
-                        )
-                        other_name = (
-                            (other or {}).get("name") or "another contact"
-                        )
-                        detail = (
-                            f"{linkedin_url} could not be attached to {name} — "
-                            f"already held by {other_name}"
-                            if clash and clash.get("id") != created.get("id") else
-                            f"{linkedin_url} could not be attached to {name} "
-                            f"(insert race)"
-                        )
-                        contact_conflicts.append(detail)
-                        self.db.log_event(
-                            "company", company["id"],
-                            "contact_conflict", detail)
-                # Count inserted outreach contacts (email and/or LinkedIn).
-                created_email = (created.get("email") or "").strip().lower()
-                created_li = (created.get("linkedin_url") or "").strip()
-                email_ok = bool(addr and created_email == addr.lower())
-                li_ok = bool(
-                    linkedin_url and created_li
-                    and normalize_linkedin_url(created_li)
-                    == normalize_linkedin_url(linkedin_url)
-                )
-                if email_ok:
+                attached = attach_candidate(
+                    self.db, company={"id": company["id"], "name": name},
+                    candidate=candidate, email=addr, linkedin_url=linkedin_url,
+                    source="discovery", campaign_id=campaign_id)
+                contact_conflicts.extend(attached.conflicts)
+                if attached.email_landed:
                     emails_this_company += 1
-                if (email_ok or li_ok) and created.get("_inserted", True):
+                if attached.is_new_outreach:
                     contacts_this_company += 1
                     contacts_added += 1
 

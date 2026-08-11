@@ -6,7 +6,7 @@ import {
   AlertTriangle,
 } from 'lucide-react'
 import { dashboardAPI, emailsAPI, errMessage } from '../api'
-import { Button, Chip, EmptyState, timeAgo, EMAIL_TYPE_META } from '../ui'
+import { Button, Chip, EmptyState, replyCheckNotes, timeAgo, EMAIL_TYPE_META } from '../ui'
 import { useApp } from '../App'
 
 const EVENT_ICONS = {
@@ -57,17 +57,12 @@ export default function Dashboard() {
     setChecking(true)
     try {
       const { data } = await emailsAPI.checkReplies(recheck)
-      const notes = []
-      if (data.cleared) notes.push(`${data.cleared} earlier "reply" was a bounce, an auto-reply, or your own message`)
-      if (data.confirmed) notes.push(`${data.confirmed} earlier "reply" confirmed as real`)
-      if (data.unverified_remaining) notes.push(`${data.unverified_remaining} still unverified`)
-      if (data.failed_checks) notes.push(`${data.failed_checks} couldn't be checked — try again shortly`)
-      const suffix = notes.length ? ` (${notes.join('; ')})` : ''
+      const { suffix, duration } = replyCheckNotes(data)
       toast.success(
         data.new_replies > 0
           ? `${data.new_replies} new ${data.new_replies === 1 ? 'reply' : 'replies'} found!${suffix}`
           : `Checked ${data.checked} emails — no new replies yet${suffix}`,
-        { duration: notes.length ? 6000 : 4000 }
+        { duration }
       )
       load()
     } catch (e) {

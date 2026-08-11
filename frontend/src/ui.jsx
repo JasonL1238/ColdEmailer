@@ -1,7 +1,8 @@
 /* Shared UI primitives + hooks */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
-import { jobsAPI } from './api'
+import toast from 'react-hot-toast'
+import { companiesAPI, errMessage, jobsAPI } from './api'
 
 export function Button({ variant = 'secondary', size, icon: Icon, children, className = '', ...props }) {
   return (
@@ -160,6 +161,56 @@ export function useJobPolling(onUpdate, interval = 1500, maxFailures = 8) {
 
   useEffect(() => stop, [stop])
   return { job, track }
+}
+
+/** The company drawer, opened from Discover, Deep dive, and the Database.
+ *
+ *  Each page decides what else happens when a company is edited — reload a
+ *  table, re-poll a run — but opening, re-reading after an edit, and closing
+ *  behave the same on all three, so they live here. */
+export function useCompanyDrawer() {
+  const [company, setCompany] = useState(null)
+
+  const open = useCallback(async (id) => {
+    try {
+      setCompany((await companiesAPI.get(id)).data)
+    } catch (e) {
+      toast.error(errMessage(e, 'Could not load company'))
+    }
+  }, [])
+
+  const close = useCallback(() => setCompany(null), [])
+
+  /** Re-read the open company after an edit inside the drawer. A row that has
+   *  since been deleted closes it rather than leaving a stale copy on screen. */
+  const refresh = useCallback(async () => {
+    if (!company?.id) return
+    try {
+      setCompany((await companiesAPI.get(company.id)).data)
+    } catch {
+      setCompany(null)
+    }
+  }, [company?.id])
+
+  return { company, open, close, refresh }
+}
+
+/** The caveats a reply check turned up, as a message suffix.
+ *
+ *  Cleared, confirmed, still-unverified, and failed checks are the honest part
+ *  of the result — the headline count alone reads as "N replies" when some of
+ *  those N were bounces the checker just retired. Every surface that runs a
+ *  check reports them the same way. */
+export function replyCheckNotes(data) {
+  const notes = []
+  if (data.cleared) notes.push(`${data.cleared} earlier "reply" was a bounce, an auto-reply, or your own message`)
+  if (data.confirmed) notes.push(`${data.confirmed} earlier "reply" confirmed as real`)
+  if (data.unverified_remaining) notes.push(`${data.unverified_remaining} still unverified`)
+  if (data.failed_checks) notes.push(`${data.failed_checks} couldn't be checked — try again shortly`)
+  return {
+    suffix: notes.length ? ` (${notes.join('; ')})` : '',
+    duration: notes.length ? 6000 : 4000,
+  }
 }
 
 /* ---------- utils ---------- */

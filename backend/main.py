@@ -21,7 +21,6 @@ if os.path.isfile(_root_env):
     load_dotenv(_root_env)
 
 from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
-                normalize_linkedin_url,
                 MAX_FOLLOW_UP_STEPS, MIN_FOLLOW_UP_GAP_DAYS,
                 MAX_FOLLOW_UP_GAP_DAYS,
                 repair_contact_email_kinds,
@@ -30,9 +29,11 @@ from db import (Database, body_claims_attachment, migrate_legacy_data, now_iso,
                 repair_offdomain_contact_warnings,
                 repair_speculative_company_summaries,
                 repair_unverified_legacy_replies)
+from contact_ingest import (attach_candidate, contact_notes, find_existing,
+                            owned_elsewhere_note, verified_channels)
 from deep_research import DeepResearchService
 from research_digest import consolidate, has_deep_research
-from discovery import DiscoveryService, discovery_scrape_status
+from discovery import DiscoveryService, research_updates
 from email_composer import (EmailComposer, EMAIL_TYPES, DEFAULT_TYPE,
                             TemplateUnavailable)
 from email_sender import EmailSender
@@ -402,28 +403,9 @@ def _enrich_company_async(company_id: str, mode: str = "full"):
             preferred_affiliations=db.get_profile().get("affiliations"),
             mode=mode or "full",
         )
-        research_fields = {
-            "url", "domain", "summary", "industry", "product", "hook",
-            "recent_news", "why_care", "location", "scraped_at",
-            "research_sources", "pages_scraped", "pages_attempted",
-            "research_quality",
-        }
-        updates = {k: v for k, v in enriched.items()
-                   if k in research_fields and v is not None}
-        updates["scrape_status"] = discovery_scrape_status(enriched)
-        if updates["scrape_status"] == "wrong_site":
-            # Do not leave the rejected URL or an older profile in place. A
-            # later retry must search again instead of scraping the same wrong
-            # company forever, and stale research must not reach a draft.
-            updates.update({
-                key: None for key in (
-                    "url", "domain", "summary", "industry", "product", "hook",
-                    "recent_news", "why_care", "location",
-                )
-            })
+        updates = research_updates(enriched)
         db.update_company(company_id, updates)
         # Add evidence-backed contacts, preferring same-school senior leaders.
-        from discovery import _guess_name_from_email, _role_for_email, contact_notes
         from enrichment import select_outreach_contacts
         domain = (db.get_company(company_id) or {}).get("domain")
         contact_conflicts = []
@@ -432,24 +414,10 @@ def _enrich_company_async(company_id: str, mode: str = "full"):
                 enriched.get("contacts") or [],
                 enriched.get("emails") or [], domain,
                 limit=3, person_only=True):
-            addr = candidate.get("email") or ""
-            linkedin_url = candidate.get("linkedin_url") or ""
-            if linkedin_url and not candidate.get("linkedin_verified"):
-                linkedin_url = ""
-            if addr and (
-                    candidate.get("email_kind") == "generic"
-                    or (candidate.get("name")
-                        and not candidate.get("email_person_match")
-                        and not candidate.get("email_verified"))):
-                addr = ""
+            addr, linkedin_url = verified_channels(candidate)
             if not addr and not linkedin_url:
                 continue
-            existing_contact = (
-                db.find_contact_by_email(addr) if addr else None
-            ) or (
-                db.find_contact_by_linkedin(linkedin_url)
-                if linkedin_url else None
-            )
+            existing_contact = find_existing(db, addr, linkedin_url)
             if existing_contact:
                 if existing_contact.get("company_id") == company_id:
                     richer = {}
@@ -530,85 +498,18 @@ def _enrich_company_async(company_id: str, mode: str = "full"):
                     if richer:
                         db.update_contact(existing_contact["id"], richer)
                 else:
-                    other = (
-                        db.get_company(existing_contact["company_id"])
-                        if existing_contact.get("company_id") else None
-                    )
-                    other_name = (other or {}).get("name") or "another company"
-                    label = addr or linkedin_url
-                    detail = (
-                        f"{label} already belongs to {other_name} — "
-                        f"not reassigned to {company['name']}"
-                    )
+                    detail = owned_elsewhere_note(
+                        db, existing_contact.get("company_id"),
+                        addr or linkedin_url, company["name"])
                     contact_conflicts.append(detail)
                     db.log_event(
                         "company", company_id, "contact_conflict", detail)
                 continue
-            local = addr.split("@", 1)[0] if addr else ""
-            created = db.create_contact(
-                company_id=company_id, email=addr,
-                linkedin_url=linkedin_url,
-                name=(candidate.get("name")
-                      or _guess_name_from_email(local)),
-                role=(candidate.get("role")
-                      or _role_for_email(local)),
-                source="discovery", status="new",
-                notes=contact_notes(candidate),
-                source_url=candidate.get("source_url"),
-                evidence=candidate.get("evidence"),
-                affinity=", ".join(
-                    candidate.get("affinity") or []) or None,
-                seniority_rank=candidate.get(
-                    "seniority_rank", 20),
-                email_kind=candidate.get("email_kind") or "unknown",
-                email_verified=bool(candidate.get("email_verified")),
-                linkedin_verified=bool(
-                    candidate.get("linkedin_verified")),
-                person_verified=bool(
-                    candidate.get("person_verified")))
-            # IntegrityError fallback can return another company's row
-            if created.get("company_id") and created["company_id"] != company_id:
-                other = db.get_company(created["company_id"])
-                other_name = (other or {}).get("name") or "another company"
-                label = addr or linkedin_url
-                detail = (
-                    f"{label} already belongs to {other_name} — "
-                    f"not reassigned to {company['name']}"
-                )
-                contact_conflicts.append(detail)
-                db.log_event("company", company_id, "contact_conflict", detail)
-                continue
-            # Same-company insert/race: still verify each identifier landed.
-            if linkedin_url:
-                wanted = normalize_linkedin_url(linkedin_url)
-                stored = normalize_linkedin_url(created.get("linkedin_url"))
-                if wanted and wanted != stored:
-                    clash = db.find_contact_by_linkedin(linkedin_url)
-                    other = (
-                        db.get_company(clash.get("company_id"))
-                        if clash and clash.get("id") != created.get("id")
-                        and clash.get("company_id") else None
-                    )
-                    other_name = (other or {}).get("name") or "another contact"
-                    detail = (
-                        f"{linkedin_url} could not be attached to "
-                        f"{company['name']} — already held by {other_name}"
-                        if clash and clash.get("id") != created.get("id") else
-                        f"{linkedin_url} could not be attached to "
-                        f"{company['name']} (insert race)"
-                    )
-                    contact_conflicts.append(detail)
-                    db.log_event(
-                        "company", company_id, "contact_conflict", detail)
-            created_email = (created.get("email") or "").strip().lower()
-            created_li = (created.get("linkedin_url") or "").strip()
-            email_ok = bool(addr and created_email == addr.lower())
-            li_ok = bool(
-                linkedin_url and created_li
-                and normalize_linkedin_url(created_li)
-                == normalize_linkedin_url(linkedin_url)
-            )
-            if (email_ok or li_ok) and created.get("_inserted", True):
+            attached = attach_candidate(
+                db, company=company, candidate=candidate, email=addr,
+                linkedin_url=linkedin_url, source="discovery")
+            contact_conflicts.extend(attached.conflicts)
+            if attached.is_new_outreach:
                 contacts_added += 1
         if contact_conflicts:
             db.update_company(company_id, {

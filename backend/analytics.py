@@ -32,6 +32,14 @@ from typing import Any, Dict, List, Optional
 MIN_SAMPLE = 10
 
 
+def to_int(value: Any) -> int:
+    """A count from SQL, coerced. NULL, "" and junk all mean zero here."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _verified_reply(row: Dict[str, Any]) -> bool:
     """A reply this app is willing to state as fact."""
     return bool(row.get("has_response")) and bool(row.get("response_verified_at"))

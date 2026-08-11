@@ -9,7 +9,7 @@ import {
 import { companiesAPI, contactsAPI, errMessage } from '../api'
 import {
   Button, Chip, EmptyState, Modal, Segmented,
-  initials, contactStatusMeta,
+  initials, contactStatusMeta, useCompanyDrawer,
 } from '../ui'
 import { useApp } from '../App'
 import ComposeModal from './ComposeModal'
@@ -28,7 +28,7 @@ export default function DatabasePage() {
   const [companies, setCompanies] = useState(null)
   const [contacts, setContacts] = useState(null)
   const [selected, setSelected] = useState(new Set())   // contact ids
-  const [drawerCompany, setDrawerCompany] = useState(null)
+  const drawer = useCompanyDrawer()
   const [showAddCompany, setShowAddCompany] = useState(false)
   const [showAddContact, setShowAddContact] = useState(false)
   const [composeIds, setComposeIds] = useState(null)
@@ -345,10 +345,7 @@ export default function DatabasePage() {
           {tab === 'companies' ? (
             <CompaniesTable
               companies={pagedCompanies}
-              onOpen={async (c) => {
-                try { setDrawerCompany((await companiesAPI.get(c.id)).data) }
-                catch (e) { toast.error(errMessage(e)) }
-              }}
+              onOpen={(c) => drawer.open(c.id)}
               onDiscover={() => navigate('discover')}
               anyData={(companies || []).length > 0}
             />
@@ -396,16 +393,15 @@ export default function DatabasePage() {
         </div>
       )}
 
-      {drawerCompany && (
+      {drawer.company && (
         <CompanyDrawer
-          company={drawerCompany}
-          onClose={() => setDrawerCompany(null)}
+          company={drawer.company}
+          onClose={drawer.close}
           onChanged={async () => {
             load()
-            try { setDrawerCompany((await companiesAPI.get(drawerCompany.id)).data) }
-            catch { setDrawerCompany(null) }
+            await drawer.refresh()
           }}
-          onDeleted={() => { setDrawerCompany(null); load() }}
+          onDeleted={() => { drawer.close(); load() }}
           onCompose={(ids) => setComposeIds(ids)}
         />
       )}

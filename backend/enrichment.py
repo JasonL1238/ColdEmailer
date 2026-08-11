@@ -355,6 +355,28 @@ def _affinity_matches(context: str, preferred_school: Optional[str],
     return list(dict.fromkeys(matches))
 
 
+def _provenance(context: str, page_url: Optional[str], seniority: int,
+                preferred_school: Optional[str],
+                preferred_affiliations: Optional[str]) -> Dict:
+    """Where a scraped person came from and why they rank where they do.
+
+    Shared by the two extraction paths — an address found on a page, and a
+    LinkedIn link found on one. They build different records but record their
+    evidence identically, and a field added to one and not the other is a
+    person the ranker sees differently depending on how they were found.
+    """
+    school_match = _school_match(context, preferred_school)
+    return {
+        "source_url": page_url,
+        "evidence": context[:500],
+        "school_match": school_match,
+        "school": preferred_school if school_match else None,
+        "affinity": _affinity_matches(
+            context, preferred_school, preferred_affiliations),
+        "seniority_rank": seniority,
+    }
+
+
 def _linkedin_profile_url(value: str, person_name: Optional[str] = None) -> Optional[str]:
     """Normalize a LinkedIn /in/ URL from a first-party page.
 
@@ -489,21 +511,14 @@ def extract_contact_candidates(
                 from_ctx = _infer_name(context, "")
                 if not from_ctx:
                     name_from_email = True
-            school_match = _school_match(context, preferred_school)
-            affinities = _affinity_matches(
-                context, preferred_school, preferred_affiliations)
             candidate = {
                 "email": addr,
                 "linkedin_url": None,
                 "name": name,
                 "name_from_email": name_from_email,
                 "role": role,
-                "source_url": page_url,
-                "evidence": context[:500],
-                "school_match": school_match,
-                "school": preferred_school if school_match else None,
-                "affinity": affinities,
-                "seniority_rank": seniority,
+                **_provenance(context, page_url, seniority,
+                              preferred_school, preferred_affiliations),
                 "on_domain": bool(
                     company_domain and registered_domain(domain) == company_domain),
             }
@@ -573,20 +588,13 @@ def extract_contact_candidates(
             linkedin_url = _linkedin_profile_url(raw_href, person_name=name)
             if not linkedin_url:
                 continue
-            school_match = _school_match(context, preferred_school)
-            affinities = _affinity_matches(
-                context, preferred_school, preferred_affiliations)
             person = {
                 "email": "",
                 "linkedin_url": linkedin_url,
                 "name": name,
                 "role": role,
-                "source_url": page_url,
-                "evidence": context[:500],
-                "school_match": school_match,
-                "school": preferred_school if school_match else None,
-                "affinity": affinities,
-                "seniority_rank": seniority,
+                **_provenance(context, page_url, seniority,
+                              preferred_school, preferred_affiliations),
                 "on_domain": True,
             }
             same_name = next((
@@ -599,8 +607,8 @@ def extract_contact_candidates(
                 if linkedin_matches_person(linkedin_url, same_name.get("name") or name):
                     same_name["linkedin_url"] = linkedin_url
                 same_name["affinity"] = list(dict.fromkeys(
-                    (same_name.get("affinity") or []) + affinities))
-                if school_match:
+                    (same_name.get("affinity") or []) + person["affinity"]))
+                if person["school_match"]:
                     same_name["school_match"] = True
                     same_name["school"] = preferred_school
             else:

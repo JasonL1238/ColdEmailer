@@ -1,11 +1,16 @@
-# Backend agent adapter
+# Backend
 
-Read [`../docs/agent-guidelines.md`](../docs/agent-guidelines.md), then the backend
-boundaries in [`../docs/architecture.md`](../docs/architecture.md) and validation in
-[`../docs/testing.md`](../docs/testing.md).
+Adds to the root [`AGENTS.md`](../AGENTS.md). Boundaries:
+[`../docs/architecture.md`](../docs/architecture.md).
 
-- Search for a route, service, or database symbol before opening `main.py` or `db.py`.
-- Run backend modules with `backend/` on `sys.path`; imports are intentionally bare.
-- Route new contact inputs through `contact_ingest.py` and preserve send/data guards.
-- Use the temp-database pytest suite. Never call live Gmail endpoints or mutate
-  `data/`; avoid paid AI by using template mode or mocks.
+- Imports are intentionally bare (`from db import ...`); modules run with
+  `backend/` on `sys.path`. Do not add package prefixes.
+- `main.py` (3k lines) and `db.py` (2.3k) are search targets, not read targets:
+  grep the route path, table, entity method, or `repair_*` symbol.
+- Scraped and imported contacts converge on `contact_ingest.py`. Attaching a
+  candidate to a company goes through `verified_channels()` then
+  `attach_candidate()`, so discovery, deep research, and re-research cannot
+  drift apart on which channels survive or how a collision is reported.
+- A scrape result becomes company columns through `discovery.research_updates()`.
+- Background jobs (`discovery`, `generation`, `deep_research`) share the
+  cancellation contract in `jobs.py`.

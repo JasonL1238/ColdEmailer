@@ -1,10 +1,15 @@
-# Frontend agent adapter
+# Frontend
 
-Read [`../docs/agent-guidelines.md`](../docs/agent-guidelines.md), then the frontend
-boundaries in [`../docs/architecture.md`](../docs/architecture.md) and validation in
-[`../docs/testing.md`](../docs/testing.md).
+Adds to the root [`AGENTS.md`](../AGENTS.md). Boundaries:
+[`../docs/architecture.md`](../docs/architecture.md).
 
-- Start in the affected page or component; keep HTTP request shapes in `src/api.js`.
-- Reuse `src/ui.jsx` primitives and `src/styles.css` tokens before adding patterns.
-- Search labels, handlers, or state names before opening the largest page files.
-- Run the focused Vitest file, then the frontend suite and production build as needed.
+- Start in the affected page or component. Search the rendered label, handler,
+  or state name before opening `Emails.jsx`, `DeepDive.jsx`, or `DatabasePage.jsx`.
+- HTTP shapes belong in `src/api.js`; primitives and job polling in `src/ui.jsx`;
+  design tokens in `src/styles.css`. Reuse before adding a pattern.
+- Tests are Vitest/jsdom in `tests/unit/`. A response-shape change normally needs
+  an `api.js` wrapper plus a focused page test.
+
+```bash
+npm test -- tests/unit/pipeline.test.jsx
+```

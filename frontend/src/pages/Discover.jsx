@@ -3,8 +3,11 @@ import toast from 'react-hot-toast'
 import {
   Search, Sparkles, X, ChevronRight, Globe, Users, AlertCircle, History, Compass,
 } from 'lucide-react'
-import { companiesAPI, discoveryAPI, errMessage } from '../api'
-import { Button, Chip, EmptyState, ProgressBar, Segmented, Spinner, initials, timeAgo } from '../ui'
+import { discoveryAPI, errMessage } from '../api'
+import {
+  Button, Chip, EmptyState, ProgressBar, Segmented, Spinner,
+  initials, timeAgo, useCompanyDrawer,
+} from '../ui'
 import { useApp } from '../App'
 import CompanyDrawer, { SCRAPE_STATUS } from '../components/CompanyDrawer'
 import ComposeModal from './ComposeModal'
@@ -26,7 +29,7 @@ export default function Discover() {
   const [run, setRun] = useState(null)         // active/last-viewed run (full detail)
   const [history, setHistory] = useState([])
   const [starting, setStarting] = useState(false)
-  const [drawerCompany, setDrawerCompany] = useState(null)
+  const drawer = useCompanyDrawer()
   const [composeIds, setComposeIds] = useState(null)
   const pollRef = useRef(null)
 
@@ -34,15 +37,6 @@ export default function Discover() {
     if (pollRef.current) clearInterval(pollRef.current)
     pollRef.current = null
   }, [])
-
-  const openCompany = async (id) => {
-    try {
-      const { data } = await companiesAPI.get(id)
-      setDrawerCompany(data)
-    } catch (e) {
-      toast.error(errMessage(e, 'Could not load company'))
-    }
-  }
 
   /** Watch a run. announce=false when merely opening a past search, so an
    *  old completed run doesn't fire a "search complete" toast on click. */
@@ -266,7 +260,7 @@ export default function Discover() {
                   key={c.id}
                   type="button"
                   className="card company-card"
-                  onClick={() => openCompany(c.id)}
+                  onClick={() => drawer.open(c.id)}
                   style={{ textAlign: 'left', cursor: 'pointer', width: '100%' }}
                 >
                   <div className="company-card-head">
@@ -336,17 +330,16 @@ export default function Discover() {
         </div>
       )}
 
-      {drawerCompany && (
+      {drawer.company && (
         <CompanyDrawer
-          company={drawerCompany}
-          onClose={() => setDrawerCompany(null)}
+          company={drawer.company}
+          onClose={drawer.close}
           onChanged={async () => {
-            try { setDrawerCompany((await companiesAPI.get(drawerCompany.id)).data) }
-            catch { setDrawerCompany(null) }
+            await drawer.refresh()
             if (run?.id) pollRun(run.id, { announce: false })
           }}
           onDeleted={() => {
-            setDrawerCompany(null)
+            drawer.close()
             if (run?.id) pollRun(run.id, { announce: false })
           }}
           onCompose={(ids) => setComposeIds(ids)}

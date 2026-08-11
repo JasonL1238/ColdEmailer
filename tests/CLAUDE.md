@@ -1,10 +1,17 @@
-# Test agent adapter
+# Backend tests
 
-Read [`../docs/agent-guidelines.md`](../docs/agent-guidelines.md) and
+Adds to the root [`AGENTS.md`](../AGENTS.md). Tiers:
 [`../docs/testing.md`](../docs/testing.md).
 
-- Start with the test matching the changed module and use `-k` or `-t` to narrow it.
-- Backend tests must keep `tests/conftest.py` isolation intact; never point at real data,
-  Gmail credentials, or network AI providers.
-- Add regression coverage beside the closest existing behavior, then run the relevant
-  package suite when a shared fixture or contract changes.
+Backend tests live in `unit/backend/`; frontend tests live in
+`../frontend/tests/unit/`. `conftest.py` points `COLD_DB_PATH` at a temporary
+database and stubs the Gmail credential paths — keep that isolation intact and
+never reach for real data, live credentials, or a network AI provider.
+
+Start at the test matching the changed module and narrow with `-k`. Add
+regression coverage beside the closest existing behavior, then run the package
+suite when a shared fixture or contract changed.
+
+```bash
+make test-backend TEST='unit/backend/test_db.py -k follow_up'
+```

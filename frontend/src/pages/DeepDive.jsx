@@ -4,9 +4,10 @@ import {
   AlertCircle, Building2, ChevronDown, ChevronRight, ExternalLink, History, Layers,
   Microscope, Search, Sparkles, Users, X,
 } from 'lucide-react'
-import { companiesAPI, deepResearchAPI, errMessage } from '../api'
+import { deepResearchAPI, errMessage } from '../api'
 import {
-  Button, Chip, EmptyState, ProgressBar, Segmented, Spinner, contactStatusMeta, timeAgo,
+  Button, Chip, EmptyState, ProgressBar, Segmented, Spinner,
+  contactStatusMeta, timeAgo, useCompanyDrawer,
 } from '../ui'
 import { useApp } from '../App'
 import CompanyDrawer from '../components/CompanyDrawer'
@@ -38,7 +39,7 @@ export default function DeepDive() {
   const [run, setRun] = useState(null)
   const [history, setHistory] = useState([])
   const [starting, setStarting] = useState(false)
-  const [drawerCompany, setDrawerCompany] = useState(null)
+  const drawer = useCompanyDrawer()
   const [composeIds, setComposeIds] = useState(null)
   const [historyLoaded, setHistoryLoaded] = useState(false)
   const [consolidated, setConsolidated] = useState([])
@@ -54,15 +55,6 @@ export default function DeepDive() {
     if (pollRef.current) clearInterval(pollRef.current)
     pollRef.current = null
   }, [])
-
-  const openCompany = async (id) => {
-    try {
-      const { data } = await companiesAPI.get(id)
-      setDrawerCompany(data)
-    } catch (e) {
-      toast.error(errMessage(e, 'Could not load company'))
-    }
-  }
 
   const pollRun = useCallback((id, { announce = true } = {}) => {
     stopPolling()
@@ -535,7 +527,7 @@ export default function DeepDive() {
                 {resultCompact ? 'Expand' : 'Compact'}
               </Button>
               {companyId && (
-                <Button size="sm" onClick={() => openCompany(companyId)}>
+                <Button size="sm" onClick={() => drawer.open(companyId)}>
                   Open company
                 </Button>
               )}
@@ -746,7 +738,7 @@ export default function DeepDive() {
                 entry={entry}
                 open={expanded.has(entry.company.id)}
                 onToggle={() => toggleExpanded(entry.company.id)}
-                onOpenCompany={() => openCompany(entry.company.id)}
+                onOpenCompany={() => drawer.open(entry.company.id)}
                 onCompose={(ids) => setComposeIds(ids)}
                 onRerun={(term) => {
                   setCompanyName(entry.company.name || '')
@@ -832,14 +824,12 @@ export default function DeepDive() {
         </div>
       )}
 
-      {drawerCompany && (
+      {drawer.company && (
         <CompanyDrawer
-          company={drawerCompany}
-          onClose={() => setDrawerCompany(null)}
-          onChanged={async () => {
-            if (drawerCompany?.id) openCompany(drawerCompany.id)
-          }}
-          onDeleted={() => setDrawerCompany(null)}
+          company={drawer.company}
+          onClose={drawer.close}
+          onChanged={drawer.refresh}
+          onDeleted={drawer.close}
           onCompose={(ids) => setComposeIds(ids)}
         />
       )}

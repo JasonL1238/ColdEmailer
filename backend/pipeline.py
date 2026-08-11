@@ -28,6 +28,8 @@ where it can be tested without a database.
 """
 from typing import Any, Dict, List, Optional
 
+from analytics import to_int as _int
+
 # Left to right, the order a contact actually moves through. `no_address` is a
 # stall rather than a step — it sits where the work is blocked, so it reads in
 # place rather than at the end.
@@ -50,13 +52,6 @@ STAGES = [
      "hint": "Set aside by you. No outreach."},
 ]
 STAGE_KEYS = [s["key"] for s in STAGES]
-
-
-def _int(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def stage_of(row: Dict[str, Any]) -> str:

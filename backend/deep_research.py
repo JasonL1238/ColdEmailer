@@ -26,13 +26,15 @@ from contact_verify import (
     linkedin_matches_person,
     name_tokens,
 )
-from db import Database, normalize_linkedin_url
-from discovery import (
-    _guess_name_from_email,
-    _role_for_email,
+from contact_ingest import (
+    attach_candidate,
     contact_notes,
-    discovery_scrape_status,
+    find_existing,
+    owned_elsewhere_note,
 )
+from db import Database, normalize_linkedin_url
+from discovery import discovery_scrape_status
+import jobs
 from enrichment import EnrichmentService, select_outreach_contacts
 from research_digest import append_run
 
@@ -942,19 +944,10 @@ class DeepResearchService:
         return job
 
     def cancel(self, job_id: str) -> bool:
-        job = self.db.get_job(job_id)
-        if not job or job.get("type") != "deep_research":
-            return False
-        if job.get("status") != "running":
-            return False
-        # CAS: never overwrite a worker that already finished done/failed.
         # Do not clear _running_job here — the worker thread still owns the
         # slot until _run_safe's finally block. Clearing early lets a second
         # dive start while the cancelled worker is still scraping.
-        return self.db.finish_job(
-            job_id, status="cancelled", error="Cancelled by user",
-            only_if_running=True,
-        )
+        return jobs.cancel_atomically(self.db, job_id, "deep_research")
 
     def list_jobs(self, limit: int = 30) -> List[Dict]:
         return self.db.list_jobs(job_type="deep_research", limit=limit)
@@ -966,8 +959,9 @@ class DeepResearchService:
         return job
 
     def _cancelled(self, job_id: str) -> bool:
-        job = self.db.get_job(job_id)
-        return not job or job.get("status") != "running"
+        # Deliberately broader than discovery/generation: a dive that already
+        # finished or failed must also stop scraping.
+        return jobs.is_finished(self.db, job_id)
 
     def _timed_out(self, deadline: float) -> bool:
         return time.monotonic() >= deadline
@@ -2241,12 +2235,7 @@ class DeepResearchService:
             if not addr and not linkedin_url:
                 continue
 
-            existing = (
-                self.db.find_contact_by_email(addr) if addr else None
-            ) or (
-                self.db.find_contact_by_linkedin(linkedin_url)
-                if linkedin_url else None
-            )
+            existing = find_existing(self.db, addr, linkedin_url)
             match_bits = []
             if candidate.get("criteria_match"):
                 terms = ", ".join(candidate.get("matched_terms") or [])
@@ -2276,43 +2265,24 @@ class DeepResearchService:
                         self.db.update_contact(existing["id"], richer)
                     saved_ids.append(existing["id"])
                     continue
-                other = (
-                    self.db.get_company(existing["company_id"])
-                    if existing.get("company_id") else None
-                )
-                other_name = (other or {}).get("name") or "another company"
-                detail = (
-                    f"{addr or linkedin_url} already belongs to "
-                    f"{other_name} — not reassigned to {company['name']}"
-                )
-                conflicts.append(detail)
+                conflicts.append(owned_elsewhere_note(
+                    self.db, existing.get("company_id"),
+                    addr or linkedin_url, company["name"]))
                 continue
 
-            local = addr.split("@", 1)[0] if addr else ""
-            created = self.db.create_contact(
-                company_id=company_id,
-                name=candidate.get("name") or _guess_name_from_email(local),
-                email=addr,
-                linkedin_url=linkedin_url or None,
-                role=candidate.get("role") or _role_for_email(local),
-                source=source,
-                status="new",
-                notes=notes,
-                source_url=candidate.get("source_url"),
-                evidence=candidate.get("evidence"),
-                affinity=", ".join(candidate.get("affinity") or []) or None,
-                seniority_rank=candidate.get("seniority_rank", 20),
-                email_kind=candidate.get("email_kind") or "unknown",
-                email_verified=bool(candidate.get("email_verified")),
-                linkedin_verified=bool(
-                    candidate.get("linkedin_verified") or li_ok),
-                person_verified=bool(candidate.get("person_verified")),
-            )
-            if created.get("company_id") and created["company_id"] != company_id:
-                conflicts.append(
-                    f"{addr or linkedin_url} already belongs to another company")
+            attached = attach_candidate(
+                self.db, company=company, candidate=candidate, email=addr,
+                linkedin_url=linkedin_url, source=source, notes=notes,
+                linkedin_verified=bool(candidate.get("linkedin_verified")
+                                       or li_ok),
+                # Deep research reports conflicts on the company row it is
+                # already updating; a second event stream would double-count
+                # them in the activity feed.
+                log_events=False)
+            conflicts.extend(attached.conflicts)
+            if not attached.contact:
                 continue
-            saved_ids.append(created["id"])
+            saved_ids.append(attached.contact["id"])
             added += 1
 
         if conflicts:
