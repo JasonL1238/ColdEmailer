@@ -10,6 +10,7 @@ const emails = [
     company_name: 'ZZTEST Corp', email_type: 'application',
     sent_at: '2026-02-17T18:17:16', gmail_message_id: '19c6de4ca8e06b84',
     created_at: '2026-02-17T18:00:00', has_response: 0, has_follow_up: 0,
+    follow_ups_sent: 0, follow_up_pending: 0,
   },
   {
     id: 'fresh', status: 'draft', subject: 'ZZTEST real draft', body: 'hello',
@@ -17,6 +18,7 @@ const emails = [
     company_name: 'ZZTEST Corp', email_type: 'application',
     sent_at: null, gmail_message_id: null,
     created_at: '2026-02-18T18:00:00', has_response: 0, has_follow_up: 0,
+    follow_ups_sent: 0, follow_up_pending: 0,
   },
   {
     id: 'followed', status: 'sent', subject: 'ZZTEST followed up', body: 'hello',
@@ -24,6 +26,7 @@ const emails = [
     company_name: 'ZZTEST Corp', email_type: 'application',
     sent_at: '2026-02-10T10:00:00', gmail_message_id: 'abc',
     created_at: '2026-02-10T09:00:00', has_response: 0, has_follow_up: 1,
+    follow_ups_sent: 0, follow_up_pending: 1,
   },
   // A legacy import: the JSON said "sent", so db.migrate_legacy_data set the
   // status, but there is no Gmail id and repair_delivered_email_status only
@@ -34,6 +37,7 @@ const emails = [
     company_name: 'ZZTEST Corp', email_type: 'application',
     sent_at: null, gmail_message_id: null,
     created_at: '2026-01-02T09:00:00', has_response: 0, has_follow_up: 0,
+    follow_ups_sent: 0, follow_up_pending: 0,
   },
 ]
 

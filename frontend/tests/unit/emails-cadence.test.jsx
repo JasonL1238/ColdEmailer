@@ -104,14 +104,10 @@ describe('followUpState', () => {
   it('treats a missing cadence as the default, not as off', () => {
     /* Settings load asynchronously. Reading "not here yet" as "switched off"
        blanked the follow-up control on every sent email until the request came
-       back — and permanently against a backend too old to send the field. */
+       back. */
     expect(followUpState({ follow_ups_sent: 0 }, undefined))
       .toEqual({ kind: 'ready', step: 1, total: 1 })
     expect(DEFAULT_CADENCE.steps.length).toBe(1)
-  })
-
-  it('falls back to has_follow_up when the row predates the new fields', () => {
-    expect(followUpState({ has_follow_up: 1 }, TWO_STEP)).toEqual({ kind: 'pending' })
   })
 })
 

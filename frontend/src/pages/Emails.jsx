@@ -103,9 +103,8 @@ export const DEFAULT_CADENCE = { enabled: true, steps: [7] }
 
 export const followUpState = (email, cadence) => {
   // No cadence at all means "/api/settings has not come back yet", not
-  // "switched off". Reading the two the same way blanked the follow-up control
-  // on every sent email until the settings request resolved — and left it
-  // blank for good against a backend too old to send the field.
+  // "switched off". Reading the two the same way blanks the follow-up control
+  // on every sent email until the settings request resolves.
   // A dead address outranks everything: the send path and both drafting
   // routes refuse it, so an enabled button here is one that can only ever
   // produce the same 409.
@@ -113,15 +112,7 @@ export const followUpState = (email, cadence) => {
   const c = cadence || DEFAULT_CADENCE
   const steps = (c.enabled && c.steps?.length) ? c.steps.length : 0
   if (!steps) return { kind: 'off' }
-  // A row carrying neither new field came from a backend that predates them;
-  // there, `has_follow_up` is the only thing that exists and "a follow-up
-  // exists" is the safe reading. Keyed on both fields being absent, because a
-  // row that has them and simply says "one sent, none pending" is the ordinary
-  // case for rung 2 — treating that as pending is what blocked the whole
-  // feature.
-  const legacyRow = email.follow_up_pending === undefined
-    && email.follow_ups_sent === undefined
-  if (email.follow_up_pending || (legacyRow && email.has_follow_up)) {
+  if (email.follow_up_pending) {
     return { kind: 'pending' }
   }
   const sent = Number(email.follow_ups_sent || 0)
@@ -1165,13 +1156,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
   useEffect(() => {
     resumesAPI.list().then(({ data }) => setResumeList(data || []))
       .catch(() => setResumeList([]))
-    // Guarded, not just catch()ed: against a backend that predates this
-    // endpoint the whole send dialog must still open. Losing the schedule
-    // button is a missing convenience; losing the dialog is losing the ability
-    // to send at all.
-    try {
-      sendWindowAPI.get().then(({ data }) => setSendWindow(data)).catch(() => {})
-    } catch { /* no sending window available — send-now only */ }
+    sendWindowAPI.get().then(({ data }) => setSendWindow(data)).catch(() => {})
   }, [])
 
   const send = async (schedule = null) => {

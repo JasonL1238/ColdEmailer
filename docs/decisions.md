@@ -71,11 +71,6 @@ Real, unresolved, and deliberately not acted on. Do not close one silently.
    **Owner's decision — do not act unilaterally.**
 2. **Commit `bcad104` is titled "email gen now with gemni key."** If a real key
    was ever committed it should be rotated. Not audited.
-3. **Legacy migration reads `backend/backend/data/`,** a nested duplicate path.
-   Harmless, but removable once nobody needs to re-migrate.
-4. **`google-generativeai` is deprecated upstream** in favour of `google-genai`.
-   It still works; the SDK will stop getting fixes. Migration touches only
-   `llm_client.py`.
-5. **Keyless discovery quality is mediocre.** Web search alone returns VC firms
+3. **Keyless discovery quality is mediocre.** Web search alone returns VC firms
    and startup directories alongside real companies. `discovery.AGGREGATOR_DOMAINS`
    and `discovery.is_junk_site()` filter these and could both be extended.

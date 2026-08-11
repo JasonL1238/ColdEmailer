@@ -9,7 +9,7 @@ reputation that decides whether the *good* emails arrive.
 import re
 from datetime import datetime
 from email.utils import parseaddr
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 # The postmaster told us the message could not be delivered.
 #
@@ -139,15 +139,6 @@ class ResponseChecker:
             # positive than silently dropping a real one. Never guess BOUNCE
             # here: that would mark a live address dead on a network blip.
             return REPLY
-
-    def check_response(self, gmail_message_id: str,
-                       gmail_thread_id: Optional[str] = None
-                       ) -> Tuple[Optional[bool], Optional[datetime]]:
-        """Returns (has_real_reply, reply_datetime). has_real_reply is None
-        when the check itself failed (network error, rate limit, ...) —
-        callers must treat that as 'unknown', never as 'no reply'."""
-        verdict = self.check_thread(gmail_message_id, gmail_thread_id)
-        return verdict["has_reply"], verdict["replied_at"]
 
     def check_thread(self, gmail_message_id: str,
                      gmail_thread_id: Optional[str] = None) -> Dict:

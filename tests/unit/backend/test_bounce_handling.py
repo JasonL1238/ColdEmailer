@@ -198,15 +198,6 @@ class TestCheckingAThread:
         assert verdict["has_reply"] is None
         assert verdict["bounced"] is False
 
-    def test_the_old_two_value_api_still_works(self):
-        service = _gmail(
-            [_msg("orig", labels=["SENT"]), _msg("reply", "1700000002000")],
-            {"reply": {"From": "Jane <jane@acme.com>", "Subject": "Re: Hi"}})
-        has_reply, when = ResponseChecker(service).check_response("orig", "t1")
-        assert has_reply is True
-        assert isinstance(when, datetime)
-
-
 class TestABouncedContactIsNotChased:
     def _sent(self, db, days_ago=30, **contact_kwargs):
         company = db.create_company(f"Acme {next(_seq)}")

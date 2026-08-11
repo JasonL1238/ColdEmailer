@@ -178,21 +178,6 @@ class CompanyCreate(BaseModel):
         return validate_http_url(v)
 
 
-class CompanyUpdate(BaseModel):
-    name: Optional[str] = None
-    url: Optional[str] = None
-    summary: Optional[str] = None
-    industry: Optional[str] = None
-    product: Optional[str] = None
-    hook: Optional[str] = None
-    location: Optional[str] = None
-
-    @field_validator("url")
-    @classmethod
-    def _check_url(cls, v):
-        return validate_http_url(v)
-
-
 class _ContactAddressValidators(BaseModel):
     """The two address checks every contact payload gets, create or update.
 

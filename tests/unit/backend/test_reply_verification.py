@@ -126,14 +126,11 @@ class _FakeChecker:
     def __call__(self, service, own_address=None):
         return self
 
-    def check_response(self, gmail_message_id, gmail_thread_id=None):
-        self.checked.append(gmail_message_id)
-        return self.verdicts.get(gmail_message_id, (False, None))
-
     def check_thread(self, gmail_message_id, gmail_thread_id=None):
         """The shape main consumes. Scripted verdicts stay (has_reply, when)
         so the existing cases read the same; bounce is opt-in per message."""
-        has_reply, when = self.check_response(gmail_message_id, gmail_thread_id)
+        self.checked.append(gmail_message_id)
+        has_reply, when = self.verdicts.get(gmail_message_id, (False, None))
         bounced_at = getattr(self, "bounces", {}).get(gmail_message_id)
         return {"has_reply": has_reply, "replied_at": when,
                 "bounced": bounced_at is not None, "bounced_at": bounced_at}

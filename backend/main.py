@@ -40,7 +40,7 @@ from email_sender import EmailSender
 from enrichment import EnrichmentService
 from generation import GenerationBusy, GenerationService
 from models import (
-    BulkIds, BulkStatus, CompanyCreate, CompanyUpdate,
+    BulkIds, BulkStatus, CompanyCreate,
     ContactCreate, ContactUpdate, DeepResearchRequest, DiscoveryRequest,
     CadenceUpdate, SendWindowUpdate, CampaignUpdate, SuppressionCreate,
     EmailUpdate, EnrichRequest, GenerateRequest, ProfileUpdate, ResumeUpdate,
@@ -599,14 +599,6 @@ async def enrich_company(company_id: str, payload: Optional[EnrichRequest] = Non
     return {"success": True, "message": "Research started", "mode": mode}
 
 
-@app.put("/api/companies/{company_id}")
-async def update_company(company_id: str, payload: CompanyUpdate):
-    if not db.get_company(company_id):
-        raise HTTPException(404, "Company not found")
-    db.update_company(company_id, payload.model_dump(exclude_none=True))
-    return db.get_company(company_id)
-
-
 @app.delete("/api/companies/{company_id}")
 async def delete_company(company_id: str, force: bool = Query(False)):
     """Deleting cascades companies -> contacts -> emails, delivered ones
@@ -1154,14 +1146,6 @@ async def get_resume_file(resume_id: str, download: bool = Query(False)):
     )
 
 
-# ---------- email types ----------
-
-@app.get("/api/email-types")
-async def list_email_types():
-    return [{"id": key, "label": spec["label"], "goal": spec["goal"]}
-            for key, spec in EMAIL_TYPES.items()]
-
-
 # ---------- email generation / review ----------
 
 @app.post("/api/emails/generate")
@@ -1212,14 +1196,6 @@ async def cancel_generation(job_id: str):
 @app.get("/api/emails")
 async def list_emails(status: Optional[str] = None):
     return db.list_emails(status=status)
-
-
-@app.get("/api/emails/{email_id}")
-async def get_email(email_id: str):
-    email = db.get_email(email_id)
-    if not email:
-        raise HTTPException(404, "Email not found")
-    return email
 
 
 def _domain_accepts_mail(recipient: str, cache: dict) -> bool:
@@ -1322,22 +1298,6 @@ async def bulk_email_status(payload: BulkStatus):
             db.update_email(email_id, {"status": payload.status})
             updated += 1
     return {"success": True, "updated": updated}
-
-
-@app.delete("/api/emails/{email_id}")
-async def delete_email(email_id: str):
-    email = db.get_email(email_id)
-    if not email:
-        raise HTTPException(404, "Email not found")
-    if email["status"] == "sent" or _already_delivered(email):
-        # Sent mail is the record of what a real person received. It also
-        # backs the duplicate-contact guard, so deleting it re-arms a second
-        # first-contact email to someone already emailed.
-        raise HTTPException(
-            409, "This email was already delivered. Its record is what stops "
-                 "the same person being emailed twice, so it can't be deleted.")
-    db.delete_email(email_id)
-    return {"success": True}
 
 
 @app.post("/api/emails/bulk-delete")
@@ -2891,19 +2851,7 @@ async def analytics(days: int = Query(90, ge=7, le=730)):
     return {**analytics_module.build(rows), "days": days}
 
 
-@app.get("/api/usage")
-async def usage():
-    return rate_limiter.get_usage_stats()
-
-
 # ---------- gmail ----------
-
-@app.get("/api/gmail/status")
-async def gmail_status():
-    return {
-        "connected": email_sender.is_connected(),
-        "credentials_present": os.path.isfile(email_sender.credentials_path),
-    }
 
 
 @app.post("/api/gmail/disconnect")

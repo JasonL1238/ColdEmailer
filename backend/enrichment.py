@@ -717,31 +717,6 @@ def select_outreach_contacts(candidates: List[Dict], emails: List[str],
     return annotated[:limit]
 
 
-def select_outreach_emails(emails: List[str], company_domain: Optional[str],
-                           limit: int = 2) -> List[Tuple[str, Optional[str]]]:
-    """Pick which scraped addresses actually become contacts.
-
-    A company page routinely lists other companies' addresses (vendors,
-    agencies, partners, an acquirer). Emailing those pitches the wrong
-    company, so prefer the company's own domain and only fall back to
-    off-domain addresses when the site exposed none — flagged, so the UI can
-    warn before the user sends.
-    Returns [(email, note_or_None)].
-    """
-    ranked = rank_outreach_emails(emails, company_domain)
-    if not ranked:
-        return []
-    if company_domain:
-        on_domain = [e for e in ranked
-                     if registered_domain(e.split("@")[-1]) == company_domain]
-        if on_domain:
-            return [(e, None) for e in on_domain[:limit]]
-    note = (f"Found on the site but not on {company_domain}. Verify this reaches "
-            f"the right company before sending." if company_domain else
-            "Company domain unknown — verify this address before sending.")
-    return [(e, note) for e in ranked[:1]]
-
-
 def heuristic_metadata(company_name: str, text: str) -> Dict[str, Optional[str]]:
     """No-LLM fallback: first meaningful sentences become the summary."""
     if not text:

@@ -1799,20 +1799,14 @@ def migrate_legacy_data(db: Database, backend_dir: str) -> Dict[str, int]:
     stats = {"companies": 0, "contacts": 0, "emails": 0}
 
     # 1. Company cache → companies table
-    cache_candidates = [
-        os.path.join(backend_dir, "data", "company_cache.json"),
-        os.path.join(backend_dir, "backend", "data", "company_cache.json"),
-    ]
+    cache_path = os.path.join(backend_dir, "data", "company_cache.json")
     company_meta: Dict[str, Dict] = {}
-    for path in cache_candidates:
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for key, meta in json.load(f).items():
-                        if key not in company_meta:
-                            company_meta[key] = meta
-            except Exception:
-                pass
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                company_meta = json.load(f)
+        except Exception:
+            pass
 
     def _get_or_create_company(name: str) -> Optional[str]:
         name = (name or "").strip()
@@ -1840,17 +1834,12 @@ def migrate_legacy_data(db: Database, backend_dir: str) -> Dict[str, int]:
         return row["id"]
 
     # 2. contacts.csv → contacts (+ companies)
-    csv_candidates = [
-        os.path.join(backend_dir, "data", "contacts.csv"),
-        os.path.join(backend_dir, "backend", "data", "contacts.csv"),
-    ]
+    csv_path = os.path.join(backend_dir, "data", "contacts.csv")
     legacy_status_map = {"pending": "new", "sent": "sent", "trashed": "archived"}
-    for path in csv_candidates:
-        if not os.path.isfile(path):
-            continue
+    if os.path.isfile(csv_path):
         try:
             import csv as _csv
-            with open(path, "r", encoding="utf-8-sig") as f:
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
                 for row in _csv.DictReader(f):
                     email = (row.get("email") or "").strip()
                     if email and db.find_contact_by_email(email):
@@ -1868,8 +1857,7 @@ def migrate_legacy_data(db: Database, backend_dir: str) -> Dict[str, int]:
                     )
                     stats["contacts"] += 1
         except Exception as e:
-            print(f"[migrate] contacts.csv import failed for {path}: {e}")
-        break  # only first existing file
+            print(f"[migrate] contacts.csv import failed for {csv_path}: {e}")
 
     # 3. generated_emails.json → emails
     emails_path = os.path.join(backend_dir, "data", "generated_emails.json")

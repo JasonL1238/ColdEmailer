@@ -151,19 +151,21 @@ class TestReplyCheckFailuresAreUnknown:
         service = MagicMock()
         service.users.return_value.threads.return_value.get.return_value.execute.side_effect = \
             Exception("429 rate limit exceeded")
-        has_reply, when = ResponseChecker(service).check_response("msg1", "thread1")
-        assert has_reply is None   # not False — caller must not clear a reply
-        assert when is None
+        verdict = ResponseChecker(service).check_thread("msg1", "thread1")
+        assert verdict["has_reply"] is None  # caller must not clear a reply
+        assert verdict["replied_at"] is None
 
     def test_genuine_absence_of_replies_returns_false(self):
         service = MagicMock()
         service.users.return_value.threads.return_value.get.return_value.execute.return_value = \
             {"messages": [{"id": "msg1", "internalDate": "1700000000000"}]}
-        has_reply, _ = ResponseChecker(service).check_response("msg1", "thread1")
-        assert has_reply is False
+        verdict = ResponseChecker(service).check_thread("msg1", "thread1")
+        assert verdict["has_reply"] is False
 
     def test_missing_message_id_returns_false(self):
-        assert ResponseChecker(MagicMock()).check_response("") == (False, None)
+        verdict = ResponseChecker(MagicMock()).check_thread("")
+        assert verdict["has_reply"] is False
+        assert verdict["replied_at"] is None
 
 
 class TestOwnMessagesAreNotReplies:
@@ -195,17 +197,17 @@ class TestOwnMessagesAreNotReplies:
             {"id": "orig", "internalDate": "1700000000000", "labelIds": ["SENT"]},
             {"id": "mine", "internalDate": "1700000900000", "labelIds": ["SENT"]},
         ])
-        has_reply, _ = ResponseChecker(service).check_response("orig", "thread1")
-        assert has_reply is False
+        verdict = ResponseChecker(service).check_thread("orig", "thread1")
+        assert verdict["has_reply"] is False
 
     def test_a_genuine_inbound_reply_still_counts(self):
         service = self._service([
             {"id": "orig", "internalDate": "1700000000000", "labelIds": ["SENT"]},
             {"id": "theirs", "internalDate": "1700000900000", "labelIds": ["INBOX"]},
         ], {"theirs": {"From": "jane@acme.com", "Subject": "Re: hello"}})
-        has_reply, when = ResponseChecker(service).check_response("orig", "thread1")
-        assert has_reply is True
-        assert when is not None
+        verdict = ResponseChecker(service).check_thread("orig", "thread1")
+        assert verdict["has_reply"] is True
+        assert verdict["replied_at"] is not None
 
     def test_message_from_our_own_address_is_not_a_reply(self):
         """Belt and braces for threads where labelIds are missing."""
@@ -214,5 +216,5 @@ class TestOwnMessagesAreNotReplies:
             {"id": "mine", "internalDate": "1700000900000"},
         ], {"mine": {"From": "Ada <ada@cam.ac.uk>", "Subject": "Re: hello"}})
         checker = ResponseChecker(service, own_address="ada@cam.ac.uk")
-        has_reply, _ = checker.check_response("orig", "thread1")
-        assert has_reply is False
+        verdict = checker.check_thread("orig", "thread1")
+        assert verdict["has_reply"] is False
