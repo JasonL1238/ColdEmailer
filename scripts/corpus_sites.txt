@@ -1,0 +1,49 @@
+# Measurement corpus for the scraping experiment.
+#   archetype <tab> Name=https://url
+# One polite pass per site (0.6s between requests, 40 pages max).
+# Chosen for archetype coverage, not for any relationship to real prospects.
+
+# --- JS shells / SPAs: exercise Playwright escalation (H1) and API probing (H10)
+spa	Vercel=https://vercel.com
+spa	Linear=https://linear.app
+spa	Retool=https://retool.com
+spa	Ramp=https://ramp.com
+spa	Supabase=https://supabase.com
+
+# --- Professional services: the /professionals, /attorneys, /our-people
+#     vocabulary that H8 says the crawler cannot currently see
+prosvc	Wilson Sonsini=https://www.wsgr.com
+prosvc	Cooley=https://www.cooley.com
+prosvc	Fenwick=https://www.fenwick.com
+prosvc	Bain=https://www.bain.com
+prosvc	Sequoia Capital=https://www.sequoiacap.com
+
+# --- WordPress: /wp-json is the only one of H10's 14 guesses that ever hits
+wordpress	Automattic=https://automattic.com
+wordpress	TechCrunch=https://techcrunch.com
+wordpress	The Markup=https://themarkup.org
+wordpress	404 Media=https://www.404media.co
+
+# --- Static HTML: the baseline where every probe should be pure waste
+static	SQLite=https://sqlite.org
+static	Berkshire Hathaway=https://www.berkshirehathaway.com
+static	Nginx=https://nginx.org
+static	Django=https://www.djangoproject.com
+
+# --- JS-rendered team grids: people exist but only after hydration
+jsgrid	Stripe=https://stripe.com
+jsgrid	Figma=https://www.figma.com
+jsgrid	Airtable=https://www.airtable.com
+
+# --- Likely bot-walled: H4's whole payoff depends on these behaving as predicted
+walled	Cloudflare=https://www.cloudflare.com
+walled	Discord=https://discord.com
+walled	Zscaler=https://www.zscaler.com
+
+# --- Small tech companies: closest to what this app actually emails
+startup	Plausible=https://plausible.io
+startup	Tailscale=https://tailscale.com
+startup	Fly.io=https://fly.io
+startup	Val Town=https://www.val.town
+startup	Hex=https://hex.tech
+startup	Modal=https://modal.com

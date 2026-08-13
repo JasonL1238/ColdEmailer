@@ -74,3 +74,27 @@ backend/venv/bin/python scripts/evaluate_scraping.py --live …  # hits real sit
 ```
 
 `stress/` needs a running backend. See [`../stress/README.md`](../stress/README.md).
+
+## Measuring a scraping change against real sites
+
+Claims about extraction quality or crawl cost are settled by replaying a capture
+of ~30 real sites, not by reasoning about the code — several confident readings
+of it turned out to be wrong (see the scraping section of
+[`decisions.md`](decisions.md)). The corpus is gitignored and regenerable:
+
+```bash
+backend/venv/bin/python scripts/scrape_corpus.py capture   # ~300MB, one polite pass
+```
+
+Then diff the working tree against any baseline. The measurement runs each
+version in its own subprocess, so the two copies of the module cannot collide:
+
+```bash
+git archive HEAD backend | tar -x -C /tmp/base
+backend/venv/bin/python scripts/measure_shipped.py /tmp/base/backend
+```
+
+It reports addresses extracted, machine-generated addresses rejected, MX lookups
+per refresh pass, links discovered, and sitemap people-page coverage. No network,
+no AI quota, no database. Regressions for everything it measures live in
+`tests/unit/backend/test_scraping_efficiency.py`.

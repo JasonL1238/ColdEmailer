@@ -39,7 +39,7 @@ Enter the smallest relevant area before searching broadly.
 |---|---|
 | `tests/unit/backend/` | Safe backend unit and route tests |
 | `frontend/tests/unit/` | Vitest/jsdom tests |
-| `scripts/` | `check_agent_docs.py` (doc integrity), `evaluate_scraping.py` (benchmark) |
+| `scripts/` | `check_agent_docs.py` (doc integrity), `evaluate_scraping.py` (benchmark), `scrape_corpus.py` + `measure_shipped.py` (offline scraping measurement) |
 | `stress/` | Opt-in load probes; needs a live backend. See `stress/README.md` |
 
 ## Search, do not open

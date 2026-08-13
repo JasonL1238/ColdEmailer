@@ -68,6 +68,39 @@ _LINK_PRIORITY = {
     "culture": 3, "values": 3, "mission": 3, "policy": 3, "policies": 3,
     "diversity": 3, "inclusion": 3, "esg": 4, "sustainability": 4,
 }
+# Vocabulary for ranking *sitemap* URLs, matched against whole path segments.
+#
+# The table above is matched as a substring, which is right for the handful of
+# anchors on a page but catastrophic against a 16,000-URL sitemap: "team"
+# selects val.town/u/fuckyouscratchteam and linear.app/changelog/team-documents,
+# "management" selects vercel.com/changelog/spend-management. Requiring the
+# segment to *equal* a term rejects all three while keeping
+# wsgr.com/en/people/holly-hafford.html and zscaler.com/company/leadership.
+#
+# People pages only: /about and /company are deliberately absent because they
+# are already in preferred_fallbacks, and including them spent the whole budget
+# on /company/aup and /company/cookie-policy for sites publishing no people
+# page at all.
+_SITEMAP_PEOPLE_SEGMENTS = {
+    "people": 0, "our-people": 0, "team": 0, "teams": 0, "our-team": 0,
+    "leadership": 0, "leadership-team": 0, "management-team": 0,
+    "executive-team": 0, "staff": 0, "our-staff": 0, "founders": 0,
+    "attorneys": 0, "professionals": 0, "lawyers": 0, "principals": 0,
+    "board": 0, "board-of-directors": 0, "directors": 0, "advisors": 0,
+    "bios": 0, "profiles": 0,
+}
+
+
+def _path_segments(path: str) -> List[str]:
+    """['en', 'people', 'index'] for '/en/people/index.html'."""
+    segments = []
+    for raw in (path or "").lower().split("/"):
+        if not raw:
+            continue
+        segments.append(raw.rsplit(".", 1)[0] if "." in raw else raw)
+    return segments
+
+
 _SKIP_PATH_WORDS = {
     "login", "signin", "sign-in", "signup", "sign-up", "privacy", "terms",
     "legal", "cookies", "cart", "checkout", "account", "docs", "documentation",
@@ -80,7 +113,18 @@ _BAD_LOCAL = {"noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemo
               "postmaster", "abuse", "privacy", "legal", "unsubscribe", "spam"}
 _BAD_DOMAINS = {"example.com", "sentry.io", "wixpress.com", "sentry.wixpress.com",
                 "godaddy.com", "domain.com", "yourdomain.com", "email.com",
-                "company.com", "sentry-next.wixpress.com", "mysite.com"}
+                "company.com", "sentry-next.wixpress.com", "mysite.com",
+                "errors.stripe.com"}
+# Error-tracker ingest hosts publish their DSN in client-side JS, and the DSN's
+# shape is indistinguishable from an address. The real hosts are always
+# subdomains (o415358.ingest.us.sentry.io), so exact-match never caught them.
+# Suffix-matched separately from _BAD_DOMAINS because the parent of a bad host
+# is not always bad — errors.stripe.com is junk, stripe.com is a real employer.
+_BAD_DOMAIN_SUFFIXES = ("sentry.io", "wixpress.com", "ingest.sentry.io")
+# A Sentry DSN public key is 32 hex characters. No human picks that as a local
+# part, and across a 30-site corpus every one of the 270 machine-generated
+# addresses matched this while none of the 162 real ones did.
+_MACHINE_LOCAL_RE = re.compile(r"[0-9a-f]{16,}")
 _IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
 
 # Preference order for picking the best outreach address
@@ -164,13 +208,36 @@ def page_mentions_company(company_name: str, text: str) -> bool:
     return all(re.search(rf"\b{re.escape(t)}\b", haystack) for t in tokens)
 
 
+def _decode_js_escapes(text: str) -> str:
+    r"""Turn \uXXXX / \xXX escapes into the characters they stand for.
+
+    Sites that embed markup inside a JSON payload write `>` as `>`. The
+    backslash is not in EMAIL_RE's character class but `u003e` is alphanumeric,
+    so matching started at the `u` and produced `u003ekbrooks@wsgr.com` — which
+    passes _is_valid_outreach_email, and (because the domain is real) passes the
+    MX check too, giving a sendable address that duplicates a real person.
+    Decoding first puts the `>` back, and `>` cannot be part of an address.
+    """
+    if "\\" not in text:
+        return text
+
+    def _sub(match: "re.Match") -> str:
+        code = int(match.group(1) or match.group(2), 16)
+        # Lone surrogates are unencodable; a space is a safe address separator.
+        if 0xD800 <= code <= 0xDFFF:
+            return " "
+        return chr(code)
+
+    return re.sub(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})", _sub, text)
+
+
 def extract_emails_from_html(html: str) -> List[str]:
     """All plausible addresses, including common public obfuscation schemes."""
     if not html:
         return []
     found = []
     seen = set()
-    decoded = html_lib.unescape(html)
+    decoded = _decode_js_escapes(html_lib.unescape(html))
 
     # Cloudflare's email-protection markup stores an XOR-encoded address.
     for encoded in re.findall(
@@ -217,11 +284,11 @@ def extract_emails_from_html(html: str) -> List[str]:
             seen.add(addr.lower())
             found.append(addr)
     out = []
+    out_keys = set()
     for addr in found:
         key = addr.lower()
-        if key not in seen:
-            seen.add(key)
-        if _is_valid_outreach_email(addr) and key not in {a.lower() for a in out}:
+        if key not in out_keys and _is_valid_outreach_email(addr):
+            out_keys.add(key)
             out.append(addr)
     return out
 
@@ -261,6 +328,45 @@ def discover_internal_links(html: str, base_url: str,
     return [url for _, _, url in ranked[:limit]]
 
 
+def rank_sitemap_pages(urls: List[str], company_domain: Optional[str],
+                       limit: int = 12) -> List[str]:
+    """People-bearing sitemap URLs, best first. Everything else is dropped.
+
+    The sitemap exists here to reach pages the nav does not link and the
+    guessed /team, /people, ... paths cannot spell — a firm's real bios are
+    /en/people/<name>.html, and on the captured corpus none of them is
+    reachable by crawling. Matching is segment-exact (see
+    _SITEMAP_PEOPLE_SEGMENTS); a sitemap is far too large for the substring
+    rules that suit a page's handful of anchors.
+    """
+    ranked = []
+    seen = set()
+    for order, absolute in enumerate(urls):
+        if not absolute:
+            continue
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if company_domain and registered_domain(absolute) != company_domain:
+            continue
+        segments = _path_segments(parsed.path)
+        if any(word in (parsed.path or "").lower() for word in _SKIP_PATH_WORDS):
+            continue
+        scores = [_SITEMAP_PEOPLE_SEGMENTS[seg] for seg in segments
+                  if seg in _SITEMAP_PEOPLE_SEGMENTS]
+        if not scores:
+            continue
+        normalized = absolute.rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        # Shallower paths first within a tier, so an index page outranks the
+        # individual bios beneath it and gets crawled before the budget runs out.
+        ranked.append((min(scores), len(segments), order, normalized))
+    ranked.sort()
+    return [url for _, _, _, url in ranked[:limit]]
+
+
 def _is_valid_outreach_email(addr: str) -> bool:
     addr = addr.lower()
     local, _, domain = addr.partition("@")
@@ -271,6 +377,11 @@ def _is_valid_outreach_email(addr: str) -> bool:
     if local in _BAD_LOCAL or any(b in local for b in ("noreply", "no-reply", "donotreply")):
         return False
     if domain in _BAD_DOMAINS:
+        return False
+    if any(domain == suffix or domain.endswith("." + suffix)
+           for suffix in _BAD_DOMAIN_SUFFIXES):
+        return False
+    if _MACHINE_LOCAL_RE.fullmatch(local):
         return False
     if len(addr) > 80 or addr.count("@") != 1:
         return False
@@ -442,18 +553,52 @@ def _infer_name(context: str, local: str) -> str:
     return ""
 
 
+# A crawl re-runs contact extraction over *every* accumulated page each time it
+# refreshes (up to four times, and once per loop iteration in fast mode), so
+# page k was parsed k times. This memoizes the per-page parse for the life of
+# one crawl. Keyed on the html itself as well as the URL so a re-fetch that
+# changed the body can never be served a stale tree.
+_PAGE_PARSE_CACHE_MAX = 128
+
+
+def _parsed_page(page_url: str, html: str,
+                 cache: Optional[Dict] = None) -> Tuple[object, str, List[str]]:
+    """(soup, page_text, emails) for one page, parsed at most once per crawl.
+
+    Safe to share: every consumer below treats the tree as read-only — it is
+    only ever walked (`find_all`, `get_text`, `.parent`, `.previous_siblings`).
+    The dicts built from it are new objects on each call, so callers that
+    mutate a candidate cannot reach back into the cache.
+    """
+    key = (page_url, hash(html))
+    if cache is not None:
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+    soup = BeautifulSoup(html_lib.unescape(html), "html.parser")
+    entry = (soup, soup.get_text(" ", strip=True), extract_emails_from_html(html))
+    if cache is not None:
+        if len(cache) >= _PAGE_PARSE_CACHE_MAX:
+            cache.clear()   # only costs a re-parse; never returns a wrong answer
+        cache[key] = entry
+    return entry
+
+
 def extract_contact_candidates(
         pages: List[Dict[str, str]], company_domain: Optional[str],
         preferred_school: Optional[str] = None,
-        preferred_affiliations: Optional[str] = None) -> List[Dict]:
-    """Build evidence-backed people from emails and first-party profile links."""
+        preferred_affiliations: Optional[str] = None,
+        cache: Optional[Dict] = None) -> List[Dict]:
+    """Build evidence-backed people from emails and first-party profile links.
+
+    Pass `cache` (any dict, owned by the caller and scoped to one crawl) to
+    reuse the per-page parse across repeated calls. See `_parsed_page`.
+    """
     merged: Dict[str, Dict] = {}
     for page in pages:
         html = page.get("html") or ""
         page_url = page.get("url") or ""
-        soup = BeautifulSoup(html_lib.unescape(html), "html.parser")
-        page_text = soup.get_text(" ", strip=True)
-        page_emails = extract_emails_from_html(html)
+        soup, page_text, page_emails = _parsed_page(page_url, html, cache)
         for addr in page_emails:
             local, _, domain = addr.lower().partition("@")
             contexts = []
@@ -1018,6 +1163,12 @@ class EnrichmentService:
         # Fast mode early-exits too often for prefetching to pay off.
         prefetch = (None if fast or PREFETCH_WORKERS < 2
                     else _PagePrefetcher(self.scraper))
+        # Scoped to this crawl and dropped with it, so nothing leaks between
+        # companies. See _parsed_page for why sharing the tree is safe.
+        page_cache: Dict = {}
+        # Speculative /api/... guesses that answered 404 on this crawl's origin.
+        if hasattr(self.scraper, "reset_dead_api_probes"):
+            self.scraper.reset_dead_api_probes()
 
         def timed_out() -> bool:
             return budget is not None and (time.monotonic() - started) >= budget
@@ -1042,11 +1193,12 @@ class EnrichmentService:
 
             all_emails = []
             for page in page_records:
-                all_emails.extend(extract_emails_from_html(page["html"]))
+                all_emails.extend(
+                    _parsed_page(page["url"], page["html"], page_cache)[2])
             result["emails"] = rank_outreach_emails(all_emails, result["domain"])[:12]
             contacts = extract_contact_candidates(
                 page_records, result["domain"], preferred_school,
-                preferred_affiliations)
+                preferred_affiliations, cache=page_cache)
             if combined:
                 meta = None
                 llm_contacts = []
@@ -1194,6 +1346,29 @@ class EnrichmentService:
             attempted = 0
             fallback_failures = 0
             max_fast_fallback_failures = 2
+            sitemap_seeded = False
+
+            def seed_from_sitemap() -> None:
+                """Put real people URLs ahead of the blind path guesses.
+
+                Costs one request, and only when the crawl has run out of
+                linked pages and is about to start guessing — so a site whose
+                nav already led somewhere never pays for it.
+                """
+                nonlocal sitemap_seeded
+                if sitemap_seeded or fast:
+                    return
+                if not hasattr(self.scraper, "fetch_sitemap_urls"):
+                    return
+                sitemap_seeded = True
+                try:
+                    found = self.scraper.fetch_sitemap_urls(url)
+                except Exception:
+                    return
+                for candidate in reversed(rank_sitemap_pages(found, domain)):
+                    if candidate.rstrip("/") in queued:
+                        continue
+                    fallback_pages.insert(0, candidate)
             while queue and attempted < max_attempts \
                     and len(page_records) < max_pages and not timed_out():
                 page_url = queue.pop(0)
@@ -1221,6 +1396,7 @@ class EnrichmentService:
                                 or about_page_present(page_records)):
                             pass
                         else:
+                            seed_from_sitemap()
                             for fallback in fallback_pages:
                                 key = fallback.rstrip("/")
                                 if key not in queued:
@@ -1254,6 +1430,7 @@ class EnrichmentService:
                     if not (fast and (
                             fallback_failures >= max_fast_fallback_failures
                             or _has_fast_success(page_records, []))):
+                        seed_from_sitemap()
                         for fallback in fallback_pages:
                             key = fallback.rstrip("/")
                             if key not in queued:

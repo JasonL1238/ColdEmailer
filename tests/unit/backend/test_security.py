@@ -24,6 +24,31 @@ class TestSSRFGuard:
         assert is_safe_public_url(url) is False
 
     @pytest.mark.parametrize("url", [
+        "http://[64:ff9b::a00:1]/",      # RFC 6052 NAT64 wrapping 10.0.0.1
+        "http://[::ffff:10.0.0.1]/",     # IPv4-mapped
+        "http://[::ffff:127.0.0.1]/",
+        "http://[2002:a00:1::]/",        # 6to4 wrapping 10.0.0.1
+    ])
+    def test_rejects_private_ipv4_wearing_an_ipv6_coat(self, url):
+        """A globally-routable IPv6 address can still name a private IPv4 one.
+
+        This is not hypothetical: on a DNS64/NAT64 network getaddrinfo answers
+        "10.0.0.1" with a synthesized *global* IPv6 address, so resolving an IP
+        literal instead of reading it defeated the guard entirely.
+        """
+        assert is_safe_public_url(url) is False
+
+    def test_an_ip_literal_is_never_resolved(self, monkeypatch):
+        import web_scraper
+
+        def explode(*a, **kw):
+            raise AssertionError("literal was handed to the resolver")
+
+        monkeypatch.setattr(web_scraper.socket, "getaddrinfo", explode)
+        assert is_safe_public_url("http://10.0.0.1/") is False
+        assert is_safe_public_url("http://8.8.8.8/") is True
+
+    @pytest.mark.parametrize("url", [
         "file:///etc/passwd", "ftp://example.com/", "gopher://example.com/",
         "javascript:alert(1)", "",
     ])

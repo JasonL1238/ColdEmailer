@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -44,6 +44,18 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_REDIRECTS = 8
 FETCH_RETRIES = 3
 MAX_API_FETCHES = 8
+# Ceiling on remembered 404 endpoints per crawl. A crawl visits tens of pages
+# across a handful of origins, so this is slack, not a real limit; it exists so
+# a pathological site cannot grow the set without bound.
+MAX_DEAD_API_PROBES = 512
+# Memory backstop only — MAX_RESPONSE_BYTES is the binding limit, since 2MB of
+# sitemap XML holds roughly 25k URLs. This must not bind first: people pages
+# sit at raw index 3,853 in Zscaler's sitemap and 16,427 in Val Town's, so an
+# earlier cap of 2,000 silently threw away every page the feature exists to
+# find. A site whose sitemap exceeds 2MB is read only as far as the truncation.
+SITEMAP_MAX_URLS = 50_000
+SITEMAP_MAX_INDEX_CHILDREN = 3
+_SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.IGNORECASE)
 # Leave headroom so Playwright-harvested XHR people are not dropped after
 # eight identical info@ stubs fill the merge budget.
 MAX_API_BEFORE_BROWSER = 4
@@ -95,6 +107,33 @@ _SPA_MARKERS = (
 )
 
 
+# RFC 6052 well-known prefix: a DNS64 resolver embeds the IPv4 address in the
+# low 32 bits, so 64:ff9b::a00:1 is 10.0.0.1 wearing a globally-routable coat.
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _embedded_ipv4(ip: ipaddress._BaseAddress):
+    """The IPv4 address an IPv6 address stands for, or None."""
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return None
+    if ip.ipv4_mapped:
+        return ip.ipv4_mapped
+    if ip.sixtofour:
+        return ip.sixtofour
+    if ip.teredo:
+        return ip.teredo[1]
+    if ip in _NAT64_WELL_KNOWN:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
+def _address_is_public(ip: ipaddress._BaseAddress) -> bool:
+    embedded = _embedded_ipv4(ip)
+    if embedded is not None and not embedded.is_global:
+        return False
+    return bool(ip.is_global)
+
+
 def is_safe_public_url(url: str) -> bool:
     """True only for http(s) URLs on standard ports whose host resolves
     exclusively to public IP addresses. Blocks SSRF against loopback,
@@ -113,6 +152,18 @@ def is_safe_public_url(url: str) -> bool:
     host = parsed.hostname
     if not host:
         return False
+
+    # A literal is judged as written, never handed to the resolver. On a
+    # DNS64/NAT64 network getaddrinfo answers "10.0.0.1" with a synthesized
+    # global IPv6 address (measured here: 2607:7700:0:2:0:2:a00:1), which
+    # sails through the is_global check below and defeats the whole guard.
+    try:
+        literal = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return _address_is_public(literal)
+
     try:
         infos = socket.getaddrinfo(
             host, port or (443 if parsed.scheme == "https" else 80),
@@ -126,7 +177,7 @@ def is_safe_public_url(url: str) -> bool:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
             return False
-        if not ip.is_global:
+        if not _address_is_public(ip):
             return False
     return True
 
@@ -369,6 +420,16 @@ class WebScraper:
         # thread that started it, so this can never be shared across threads.
         self._pw_state = threading.local()
         self._ua_lock = threading.Lock()
+        # Exact JSON endpoint URLs that answered a definitive 404/410 during the
+        # current crawl. discover_api_endpoints re-derives the same 8 guessed
+        # /api/... paths on every JS-shell page of a site, so without this a
+        # 40-page SPA pays the same 8 404s (plus 8 DNS lookups and 8 politeness
+        # sleeps) forty times over. Reset per crawl by reset_dead_api_probes()
+        # rather than kept process-wide: EnrichmentService is a module-level
+        # singleton, so a persistent cache would let one company's verdicts
+        # suppress another's endpoints.
+        self._dead_api_probes: Set[str] = set()
+        self._dead_api_lock = threading.Lock()
         self.last_request_time: Dict[str, float] = {}
         self._client = httpx.Client(
             follow_redirects=False,
@@ -607,10 +668,90 @@ class WebScraper:
                 return None
         return None
 
+    def reset_dead_api_probes(self) -> None:
+        """Forget which JSON endpoints 404'd. Call once per crawl."""
+        with self._dead_api_lock:
+            self._dead_api_probes.clear()
+
+    def _sitemap_locs(self, url: str, origin: str) -> List[str]:
+        """<loc> values from one sitemap document. [] if it is not one."""
+        try:
+            response = self._safe_get(
+                url, timeout=6.0, stay_origin=origin,
+                headers=self._browser_headers(
+                    accept="application/xml, text/xml, */*;q=0.1"))
+        except Exception:
+            return []
+        if response is None or response.status_code >= 400:
+            return []
+        text = response.text or ""
+        if "<loc" not in text.lower():
+            return []
+        return [html_lib.unescape(m.group(1)) for m in _SITEMAP_LOC_RE.finditer(text)]
+
+    def fetch_sitemap_urls(self, base_url: str,
+                           limit: int = SITEMAP_MAX_URLS) -> List[str]:
+        """Same-origin page URLs advertised by /sitemap.xml. [] when absent.
+
+        Two thirds of sites publish one, and it names real pages — including
+        the locale-prefixed, .html-suffixed people pages that no guessed path
+        (/team, /people, ...) can reach. Follows a sitemap index one level,
+        because large sites publish an index rather than a flat list.
+        """
+        if not is_safe_public_url(base_url):
+            return []
+        parsed = urlparse(base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return []
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        root = urljoin(origin + "/", "sitemap.xml")
+
+        out: List[str] = []
+        seen: Set[str] = set()
+        children: List[str] = []
+
+        def _absorb(locs: List[str], relative_to: str) -> None:
+            for loc in locs:
+                if len(out) >= limit:
+                    return
+                try:
+                    absolute = urljoin(relative_to, loc.strip()).split("#", 1)[0]
+                except ValueError:
+                    continue
+                if not _same_origin(origin, absolute):
+                    continue
+                if not is_safe_public_url(absolute):
+                    continue
+                path = (urlparse(absolute).path or "").lower()
+                if path.endswith(".gz"):
+                    continue          # compressed: _safe_get hands back bytes
+                if path.endswith(".xml"):
+                    children.append(absolute)
+                    continue
+                key = absolute.rstrip("/")
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(absolute)
+
+        _absorb(self._sitemap_locs(root, origin), root)
+        for child in children[:SITEMAP_MAX_INDEX_CHILDREN]:
+            if len(out) >= limit:
+                break
+            _absorb(self._sitemap_locs(child, origin), child)
+        return out[:limit]
+
     def fetch_json(self, url: str) -> Optional[object]:
         """GET a JSON endpoint (API-first path). None on failure/non-JSON."""
         if not is_safe_public_url(url):
             return None
+        # A 404 earlier in this crawl means the same 404 now, and fetch_json
+        # returns None either way. Only 404/410 are recorded (see below), so a
+        # 403/429/5xx/timeout still gets retried on the next page. The key is
+        # the exact URL, so /api/team never speaks for /api/team/.
+        with self._dead_api_lock:
+            if url in self._dead_api_probes:
+                return None
         self._rate_limit(url)
         headers = self._browser_headers(
             accept="application/json, text/json, */*;q=0.1")
@@ -624,6 +765,14 @@ class WebScraper:
             response = self._safe_get(
                 url, timeout=6.0, headers=headers, stay_origin=url)
             if response is None or response.status_code >= 400:
+                # 404/410 mean "this path is not here", which will not change
+                # mid-crawl. Every other error is a state a server leaves, and
+                # blacklisting a live endpoint over one unlucky request would
+                # cost real contacts.
+                if response is not None and response.status_code in (404, 410):
+                    with self._dead_api_lock:
+                        if len(self._dead_api_probes) < MAX_DEAD_API_PROBES:
+                            self._dead_api_probes.add(url)
                 return None
             if (not _same_origin(url, response.final_url)
                     or not is_safe_public_url(response.final_url)):

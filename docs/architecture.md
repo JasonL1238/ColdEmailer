@@ -101,3 +101,13 @@ read as bugs is in [`decisions.md`](decisions.md).
 - Keyless operation uses a supported template or an explicit refusal; it never
   pretends AI output exists.
 - Startup `repair_*` calls are idempotent and must stay safe to rerun.
+- Scraping caches are scoped to one crawl, never to the process. `EnrichmentService`
+  is a module-level singleton, so a cache that outlived a crawl would let one
+  company's results decide another's: `enrich()` creates the page-parse cache and
+  calls `reset_dead_api_probes()` at the top of every run. The MX cache is the one
+  exception — it is keyed by domain and time-bounded, because the answer is a
+  property of the domain rather than of the crawl.
+- A cache miss must only ever cost work, never change an answer. The page-parse
+  cache is keyed on the html as well as the URL, the dead-API-probe cache on the
+  exact URL (so `/api/team` cannot speak for `/api/team/`) and only for 404/410 —
+  never for a refusal a server can recover from.

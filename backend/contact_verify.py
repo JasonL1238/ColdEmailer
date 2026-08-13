@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 import socket
+import threading
+import time
 import unicodedata
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -113,6 +115,21 @@ def email_matches_person(email: str, name: Optional[str],
     return len(local_parts) == 1 and local_parts[0] == first
 
 
+# Answered MX lookups, keyed by domain. A crawl annotates every contact on
+# every refresh pass, so one 30-page site asked the resolver 275 times about 4
+# distinct domains — 271 of them redundant. MX records are stable on a scale of
+# hours, far longer than the minutes a crawl lasts, so a short TTL keeps the
+# answer honest while removing the amplification.
+_MX_CACHE: Dict[str, Tuple[float, Optional[bool]]] = {}
+_MX_CACHE_TTL = 900.0
+_MX_CACHE_MAX = 2048
+# "Unknown" is a transient state (timeout, SERVFAIL, VPN flap), so it expires
+# much sooner than a real answer — caching it for the full TTL would freeze a
+# recoverable failure in place for the rest of the run.
+_MX_CACHE_TTL_UNKNOWN = 30.0
+_MX_CACHE_LOCK = threading.Lock()
+
+
 def domain_has_mx(domain: str, timeout: float = 2.0) -> Optional[bool]:
     """True / False / None for "can this domain receive mail?".
 
@@ -125,10 +142,38 @@ def domain_has_mx(domain: str, timeout: float = 2.0) -> Optional[bool]:
     False is reserved for positive evidence of the opposite: the domain does
     not exist, or it publishes RFC 7505 null MX ("."), which is an explicit
     declaration that it accepts no mail.
+
+    Answers are memoized for `_MX_CACHE_TTL` seconds; see `_MX_CACHE`.
     """
     domain = (domain or "").strip().lower().rstrip(".")
     if not domain or "." not in domain:
         return False
+    now = time.monotonic()
+    with _MX_CACHE_LOCK:
+        hit = _MX_CACHE.get(domain)
+        if hit is not None:
+            expires_at, value = hit
+            if now < expires_at:
+                return value
+            del _MX_CACHE[domain]
+    answer = _resolve_mx(domain, timeout)
+    ttl = _MX_CACHE_TTL_UNKNOWN if answer is None else _MX_CACHE_TTL
+    with _MX_CACHE_LOCK:
+        if len(_MX_CACHE) >= _MX_CACHE_MAX:
+            # Dropping the cache only costs re-resolution. Never wrong, just slow.
+            _MX_CACHE.clear()
+        _MX_CACHE[domain] = (now + ttl, answer)
+    return answer
+
+
+def clear_mx_cache() -> None:
+    """Drop every memoized MX answer. For tests and long-lived processes."""
+    with _MX_CACHE_LOCK:
+        _MX_CACHE.clear()
+
+
+def _resolve_mx(domain: str, timeout: float) -> Optional[bool]:
+    """The uncached lookup. `domain` is already normalized and non-empty."""
     try:
         import dns.resolver  # type: ignore
     except ImportError:
