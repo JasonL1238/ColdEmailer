@@ -250,6 +250,30 @@ the user to assert ownership. Verification is off by default
 contact list sent to a vendor — is not something the user can undo, unlike
 `EMAIL_PATTERN_INFERENCE`, whose worst case is a sentence in a notes field.
 
+**Autonomous, name-only recovery on ordinary engineers is ~70%, and 0% wrong.**
+Measured end to end on 10 random engineers who publish an address in their
+commits (ground truth harvested from real commits, then the login thrown away
+and only the human name fed back in): 4/10 unauthenticated, **7/10 with a
+GITHUB_TOKEN**, and in every run **0 addresses belonged to the wrong person**.
+It fails silently rather than guessing. That floor excludes the URL-discovery
+stage the app runs first, which independently recovered 4 of 5 name-only
+failures, so in-app yield is higher. No LLM is involved in any of it.
+
+**Search outranks a guessed login, and the order is load-bearing.** With a
+token, probing candidate logins (`firstlast`, `f+last`, `first-middle`…) and
+verifying each against the profile is cheap and recovers people the search API
+misses. But running guesses *first* cost a real recovery: `jkoston` exists, its
+profile name passes the check, and it hijacked "J. Nick Koston" from `bdraco`,
+whom search had already ranked and verified. Guesses are the weakest evidence
+and speak last.
+
+**Profile-name matching accepts shortenings but not namesakes.** People commit
+under less than their full name — "Lucas Mindêllo de Andrade" as "Lucas
+Mindêllo", "J. Nick Koston" as "Nick Koston" — so the surname must match with
+the given name matching in full or by initial, or the shorter name must be
+wholly contained in the longer with the given names agreeing. "Jane Johansson"
+never matches "G Johansson", and a surname alone is never enough.
+
 **Email discovery is capped by the population, not the code.** A live probe
 across GitHub, arXiv, EDGAR, personal sites, company team pages and open web
 found a self-published address for **0 of 30** saved contacts — while the same

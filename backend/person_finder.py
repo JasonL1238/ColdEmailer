@@ -70,10 +70,14 @@ TEAM_PAGE_FETCH_CAP = 1
 CHANNEL_FETCH_CAP = 2
 # Plain text/JSON GETs, counted separately: a .patch is ~4KB, a fetch_html can
 # be 100x its cost, so one budget must not crowd out the other.
-MAX_CHEAP_GETS = 24
-MAX_GITHUB_API_CALLS = 12
-MAX_GITHUB_SEARCH_CALLS = 3
-FOUND_SOURCES_TOP_N = 2
+# Sized for a GITHUB_TOKEN (5,000 core/hour, 30 search/min). Without one the
+# adapter still runs, just against the 60/hour ceiling. Finding the person is
+# the binding constraint, not quota, so the resolver is allowed to try many
+# candidate logins and read many commits before giving up.
+MAX_CHEAP_GETS = 60
+MAX_GITHUB_API_CALLS = 40
+MAX_GITHUB_SEARCH_CALLS = 6
+FOUND_SOURCES_TOP_N = 3
 MAX_CANDIDATES = 6
 EMAIL_DISCOVERY_TOP_N = 3
 MAX_EMAILS_PER_CANDIDATE = 6

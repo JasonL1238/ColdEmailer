@@ -352,3 +352,72 @@ class TestRouter:
             urls=["https://github.com/janedoe"],
             company_name="Goldman Sachs", edgar_enabled=True)
         assert len(chosen) <= fe.MAX_SOURCES_PER_CANDIDATE
+
+
+class TestLoginResolutionLadder:
+    """Measured end-to-end on 10 ordinary engineers, name-only: 40% -> 70%
+    exact recovery with a token, and 0 wrong addresses throughout."""
+
+    def test_search_outranks_a_guessed_login(self):
+        """The ordering bug this pins cost a real recovery.
+
+        `jkoston` exists and its profile name passes the name check, so a
+        guess-first ladder answered "J. Nick Koston" with the wrong account and
+        never reached `bdraco`, whom search had already ranked and verified.
+        """
+        getter = http_router({
+            "search/users": _Resp(json_data={"items": [{"login": "bdraco"}]}),
+            "api.github.com/users/bdraco": _Resp(json_data={
+                "login": "bdraco", "type": "User", "name": "J. Nick Koston"}),
+            "api.github.com/users/jkoston": _Resp(json_data={
+                "login": "jkoston", "type": "User", "name": "J Koston"}),
+        })
+        got = fe.github_resolve_login("J. Nick Koston", http_get=getter)
+        assert got["login"] == "bdraco"
+        assert got["how"] == "search"
+
+    def test_guesses_still_answer_when_search_finds_nobody(self):
+        getter = http_router({
+            "search/users": _Resp(json_data={"items": []}),
+            "api.github.com/users/janedoe": _Resp(json_data={
+                "login": "janedoe", "type": "User", "name": "Jane Doe"}),
+        })
+        got = fe.github_resolve_login("Jane Doe", http_get=getter)
+        assert got["login"] == "janedoe"
+        assert got["how"] == "login_guess"
+
+
+class TestProfileNameMatching:
+    @pytest.mark.parametrize("target,profile", [
+        ("G Johansson", "G Johansson"),            # bare initial survives
+        ("J. Nick Koston", "Nick Koston"),         # dropped initial
+        ("Lucas Mindêllo de Andrade", "Lucas Mindêllo"),  # dropped surname
+        ("Maria Garcia Lopez", "Maria Garcia"),
+    ])
+    def test_real_shortenings_match(self, target, profile):
+        assert fe.profile_name_matches(target, profile) is True
+
+    @pytest.mark.parametrize("target,profile", [
+        ("Jane Johansson", "G Johansson"),   # same surname, different person
+        ("Bob Smith", "Alice Smith"),
+        ("Jane Doe", "Jane Roe"),
+        ("Jane Doe", "Doe"),                 # surname alone is never enough
+        ("Carlos Garcia Lopez", "Maria Garcia"),
+    ])
+    def test_strangers_are_rejected(self, target, profile):
+        assert fe.profile_name_matches(target, profile) is False
+
+
+class TestBotFiltering:
+    @pytest.mark.parametrize("identity", [
+        "Balloob Bot", "dependabot[bot]", "github-actions[bot]",
+        "renovate[bot]", "someone+bot@users.example.com",
+    ])
+    def test_bots_are_rejected(self, identity):
+        assert fe.is_bot_identity(identity) is True
+
+    @pytest.mark.parametrize("identity", [
+        "Allen Porter", "Robert Botha", "Christian Lackas",
+    ])
+    def test_humans_survive(self, identity):
+        assert fe.is_bot_identity(identity) is False

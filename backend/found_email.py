@@ -221,7 +221,10 @@ PLACEHOLDER_LOCALS = frozenset({
 _NOREPLY_HOSTS = ("users.noreply.github.com", "noreply.github.com")
 _BOT_RE = re.compile(
     r"\[bot\]|\bdependabot\b|\bgithub-actions\b|\brenovate\b|\bgreenkeeper\b|"
-    r"\bsemantic-release\b|\bactions@github\.com\b|\bcodecov\b|-ci\b",
+    r"\bsemantic-release\b|\bactions@github\.com\b|\bcodecov\b|-ci\b|"
+    # "Balloob Bot" slipped a marker-only rule: the bare word at the end of
+    # an author name, or tagged into the local part, is the real signal.
+    r"\bbot\b|\+bot@",
     re.I)
 
 
@@ -350,6 +353,127 @@ def _github_json(url: str, *, token, http_get, budget) -> Optional[Any]:
     return fetched.data
 
 
+def name_parts(name: str) -> List[str]:
+    """Name tokens, keeping a leading single-letter initial.
+
+    `name_tokens` drops tokens under two characters, which silently erases the
+    "G" in "G Johansson" and leaves one token — so candidate generation and the
+    name check both gave up on a perfectly findable person.
+    """
+    tokens = name_tokens(name)
+    raw = [t for t in re.split(r"[^A-Za-z0-9]+", name or "") if t]
+    if raw and len(raw[0]) == 1 and raw[0].isalpha():
+        initial = raw[0].lower()
+        if not tokens or tokens[0] != initial:
+            tokens = [initial] + tokens
+    return tokens
+
+
+def _login_candidates(name: str) -> List[str]:
+    """Plausible logins for a human name, cheapest-first.
+
+    With a token a profile lookup costs one of 5,000 hourly calls, so guessing
+    a handful of shapes and *verifying each against the profile's real name* is
+    far cheaper than the search API — which measured 1/6 on real people. An
+    unverified guess is never returned; this only generates candidates.
+    """
+    tokens = name_parts(name)
+    if len(tokens) < 2:
+        return []
+    first, last = tokens[0], tokens[-1]
+    shapes = [
+        f"{first}{last}", f"{first}-{last}", f"{first}_{last}",
+        f"{first[0]}{last}", f"{first}{last[0]}", f"{last}{first}",
+        first, last, f"{first}.{last}",
+    ]
+    # Middle names carry the login as often as the surname does: Lucas Mindêllo
+    # de Andrade is `lucasmindello`, not `lucasandrade`.
+    for middle in tokens[1:-1]:
+        if len(middle) < 3:
+            continue
+        shapes += [f"{first}{middle}", f"{first}-{middle}", middle]
+    seen, out = set(), []
+    for shape in shapes:
+        if shape not in seen and _GITHUB_LOGIN_RE.match(shape):
+            seen.add(shape)
+            out.append(shape)
+    return out
+
+
+def profile_name_matches(target: str, profile_name: Optional[str]) -> bool:
+    """Does a GitHub profile's display name denote the person we want?
+
+    Stricter than a substring check, looser than demanding every token. People
+    shorten themselves — "Lucas Mindêllo de Andrade" commits as "Lucas
+    Mindêllo" — and abbreviate — "G Johansson", "J. Nick Koston". So the
+    surname must match exactly, and the given name must match either in full or
+    as an initial. Surname alone is never enough; that is how you reach a
+    different Johansson.
+    """
+    want, got = name_parts(target), name_parts(profile_name)
+    if len(want) < 2 or len(got) < 2:
+        return False
+    if want[-1] != got[-1]:
+        # A dropped trailing surname, which is routine in Portuguese and
+        # Spanish names: "Lucas Mindêllo de Andrade" commits as "Lucas
+        # Mindêllo". Only accepted when the shorter name is wholly contained in
+        # the longer one and the given names agree, so a stranger sharing one
+        # surname still fails.
+        return (set(got) <= set(want) and got[0] == want[0])
+    heads_want, heads_got = set(want[:-1]), set(got[:-1])
+    if heads_want & heads_got:
+        return True
+    return bool({h[0] for h in heads_want} & {h[0] for h in heads_got})
+
+
+def _verify_login(login: str, name: str, company: Optional[str], *, token,
+                  http_get, budget) -> Optional[Dict]:
+    """A login is only accepted when the profile itself corroborates it."""
+    profile = _github_json(f"{GITHUB_API}/users/{login}",
+                           token=token, http_get=http_get, budget=budget)
+    if not isinstance(profile, dict) or profile.get("type") != "User":
+        return None
+    if profile_name_matches(name, profile.get("name")):
+        return profile
+    if (company and profile.get("company")
+            and str(company).lower().split()[0]
+            in str(profile["company"]).lower()
+            and name_appears_in(name, profile.get("login", "").replace("-", " "))):
+        return profile
+    return None
+
+
+def github_search_logins(name: str, *, token=None, http_get=None,
+                         budget=None) -> List[str]:
+    """Search shapes beyond `in:name`, which alone measured 1/6."""
+    # name_tokens, not name_parts: a bare initial makes a *worse* query.
+    # Searching "j koston" loses the person that "nick koston" finds, measured
+    # as a regression when this used name_parts.
+    tokens = name_tokens(name)
+    if len(tokens) < 2:
+        tokens = name_parts(name)
+    if len(tokens) < 2:
+        return []
+    queries = [
+        f'"{name}" in:name',
+        f"{tokens[0]} {tokens[-1]} in:name",   # accent-folded tokens
+        f"{tokens[0]}{tokens[-1]} in:login",
+        f"{tokens[0]}-{tokens[-1]} in:login",
+    ]
+    out: List[str] = []
+    for query in queries:
+        data = _github_json(
+            f"{GITHUB_API}/search/users?q={quote(query)}&per_page=5",
+            token=token, http_get=http_get, budget=budget)
+        for item in (data or {}).get("items", []):
+            login = item.get("login")
+            if login and login not in out:
+                out.append(login)
+        if len(out) >= 8:
+            break
+    return out
+
+
 def github_resolve_login(name: str, *, urls: Sequence[str] = (),
                          company: Optional[str] = None, token=None,
                          http_get=None, budget=None) -> Optional[Dict]:
@@ -373,38 +497,66 @@ def github_resolve_login(name: str, *, urls: Sequence[str] = (),
             return {"login": login, "how": "url",
                     "source_url": f"https://github.com/{login}"}
 
-    for login in list(strong) + list(weak):
-        profile = _github_json(f"{GITHUB_API}/users/{login}",
-                               token=token, http_get=http_get, budget=budget)
-        if not isinstance(profile, dict) or profile.get("type") != "User":
-            continue
-        if (name_appears_in(name, profile.get("name"))
-                or (company and profile.get("company")
-                    and company.lower().split()[0]
-                    in str(profile["company"]).lower())):
-            return {"login": profile.get("login") or login,
-                    "how": "url_verified",
-                    "source_url": f"https://github.com/{login}"}
+    def _accept(login, how):
+        profile = _verify_login(login, name, company, token=token,
+                                http_get=http_get, budget=budget)
+        if profile is None:
+            return None
+        return {"login": profile.get("login") or login, "how": how,
+                "profile": profile,
+                "source_url": f"https://github.com/{login}"}
 
-    query = quote(f'"{name}" in:name')
-    results = _github_json(
-        f"{GITHUB_API}/search/users?q={query}&per_page=5",
-        token=token, http_get=http_get, budget=budget)
-    for item in (results or {}).get("items", [])[:3]:
-        login = item.get("login")
-        if not login:
-            continue
-        profile = _github_json(f"{GITHUB_API}/users/{login}",
-                               token=token, http_get=http_get, budget=budget)
-        if not isinstance(profile, dict) or profile.get("type") != "User":
-            continue
-        if name_appears_in(name, profile.get("name")):
-            return {"login": login, "how": "search",
-                    "source_url": f"https://github.com/{login}"}
+    for login in list(strong) + list(weak):
+        got = _accept(login, "url_verified")
+        if got:
+            return got
+
+    # Search before guessing, and the ordering is load-bearing. A guessed
+    # login is the weakest evidence in the ladder: `jkoston` exists, its
+    # profile name passes the check, and letting it answer first hijacked
+    # "J. Nick Koston" from `bdraco` — whom search had ranked first and
+    # verified. Guesses only get to speak when nothing better did.
+    for login in github_search_logins(name, token=token, http_get=http_get,
+                                      budget=budget):
+        got = _accept(login, "search")
+        if got:
+            return got
+
+    for login in _login_candidates(name):
+        got = _accept(login, "login_guess")
+        if got:
+            return got
     return None
 
 
-def github_push_heads(login: str, *, limit: int = 5, token=None,
+def github_repo_commits(login: str, *, limit: int = 8, token=None,
+                        http_get=None, budget=None) -> List[Tuple[str, str]]:
+    """Fallback for people with no recent public pushes.
+
+    The events feed only covers ~90 days, so an occasional contributor looks
+    silent there while their commits sit in their own repositories.
+    """
+    repos = _github_json(
+        f"{GITHUB_API}/users/{login}/repos?sort=pushed&per_page=10",
+        token=token, http_get=http_get, budget=budget)
+    out: List[Tuple[str, str]] = []
+    for repo in (repos or [])[:6]:
+        full = repo.get("full_name")
+        if not full or repo.get("fork"):
+            continue
+        commits = _github_json(
+            f"{GITHUB_API}/repos/{full}/commits?author={login}&per_page=5",
+            token=token, http_get=http_get, budget=budget)
+        for commit in commits or []:
+            sha = commit.get("sha")
+            if sha:
+                out.append((full, sha))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def github_push_heads(login: str, *, limit: int = 20, token=None,
                       http_get=None, budget=None) -> List[Tuple[str, str]]:
     """[(repo_full_name, head_sha)] from the person's own public pushes.
 
@@ -482,7 +634,7 @@ def _attributed_to(author: Dict, *, login: str, target_name: str) -> bool:
 
 def github_emails_for(name: str, *, urls: Sequence[str] = (), company=None,
                       token=None, http_get=None, budget=None,
-                      max_commits: int = 5) -> List[Dict]:
+                      max_commits: int = 20) -> List[Dict]:
     """Self-published addresses from the person's own public commits."""
     token = token if token is not None else os.getenv("GITHUB_TOKEN", "").strip()
     token = token or None
@@ -494,8 +646,12 @@ def github_emails_for(name: str, *, urls: Sequence[str] = (), company=None,
     login = resolved["login"]
     out: List[Dict] = []
     seen: Set[str] = set()
-    for repo, sha in github_push_heads(login, limit=max_commits, token=token,
-                                       http_get=http_get, budget=budget):
+    commits = github_push_heads(login, limit=max_commits, token=token,
+                                http_get=http_get, budget=budget)
+    if not commits:
+        commits = github_repo_commits(login, token=token, http_get=http_get,
+                                      budget=budget)
+    for repo, sha in commits:
         author = github_commit_author(repo, sha, token=token,
                                       http_get=http_get, budget=budget)
         if not author:
@@ -516,6 +672,40 @@ def github_emails_for(name: str, *, urls: Sequence[str] = (), company=None,
             email, author["source_url"], "github_commit",
             f"Commit {sha[:7]} in {repo}, pushed by {login} and authored by "
             f"{author.get('author_name') or login}"))
+
+    if not out:
+        # Their profile links a site they declared as their own, so an address
+        # published there is theirs. Only consulted when commits gave nothing,
+        # since a commit header is the stronger evidence.
+        out.extend(profile_site_emails(
+            resolved.get("profile") or {}, name,
+            http_get=http_get, budget=budget))
+    return out
+
+
+def profile_site_emails(profile: Dict, name: str, *, http_get=None,
+                        budget=None) -> List[Dict]:
+    """Addresses on the personal site a GitHub profile points at."""
+    site = (profile.get("blog") or "").strip()
+    if not site:
+        return []
+    if not site.startswith(("http://", "https://")):
+        site = f"https://{site}"
+    fetched = guarded_get_text(site, http_get=http_get, budget=budget)
+    if not fetched or fetched.status_code != 200:
+        return []
+    addresses = extract_emails_from_html(fetched.text)
+    surname = (name_tokens(name) or [""])[-1]
+    if len(addresses) > 1:
+        addresses = _scoped_addresses(fetched.text, surname) or addresses[:1]
+    out: List[Dict] = []
+    for address in addresses[:2]:
+        email = normalize_email(address)
+        if not _acceptable(email, attributed=True):
+            continue
+        out.append(_found(email, site, "personal_site",
+                          f"Published on {site}, the site linked from "
+                          f"{profile.get('login')}'s GitHub profile"))
     return out
 
 
