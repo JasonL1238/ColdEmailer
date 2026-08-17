@@ -44,7 +44,11 @@ os.environ.setdefault('TOKEN_JSON_PATH', os.path.join(_tmp_data, "no-token.json"
 # load_dotenv() at module level, and load_dotenv does not overwrite a key that
 # is already present — but it will happily repopulate one that was deleted,
 # handing the suite the real keys back.
+# GITHUB_TOKEN / SEC_CONTACT_EMAIL / MAILBOX_VERIFY belong here for the same
+# reason: with a developer's real .env loaded, a missed stub would send the
+# suite at live GitHub, at sec.gov, or at a stranger's mail server.
 for _key in ('GOOGLE_AI_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY',
              'EMAIL_LLM_PROVIDER', 'EMAIL_LLM_MODEL', 'HUNTER_API_KEY',
-             'OLLAMA_BASE_URL'):
+             'OLLAMA_BASE_URL', 'GITHUB_TOKEN', 'SEC_CONTACT_EMAIL',
+             'MAILBOX_VERIFY', 'SMTP_PROBE_HELO', 'SMTP_PROBE_FROM'):
     os.environ[_key] = ''

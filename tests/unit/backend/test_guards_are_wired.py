@@ -224,3 +224,36 @@ class TestWhichModelWroteTheDraftIsRecorded:
                               subject=out["subject"], body=out["body"],
                               llm_model=out["llm_model"])
         assert db.get_email(row["id"])["llm_model"] == "gemini-2.5-flash-lite"
+
+
+class TestPersonFinderApprovalCrossesTheContactBoundary:
+    def test_attach_candidate_is_the_write_path(self, db, monkeypatch):
+        """Approving a person-finder candidate with a company must persist
+        through contact_ingest.attach_candidate — a rewrite that inserts the
+        row directly would keep every visible behavior and silently drop the
+        conflict/race handling the boundary exists for."""
+        import asyncio
+
+        from models import PersonApproveRequest
+        from tests.unit.backend.test_person_finder import (
+            FakeEnrichment, _staged_job)
+        from person_finder import PersonFinderService
+
+        monkeypatch.setattr(main, "person_finder",
+                            PersonFinderService(db, FakeEnrichment()))
+        monkeypatch.setattr(
+            "contact_verify.domain_has_mx", lambda d, timeout=2.0: True)
+        called = {"n": 0}
+        real = main.attach_candidate
+
+        def spying(*args, **kwargs):
+            called["n"] += 1
+            return real(*args, **kwargs)
+        monkeypatch.setattr(main, "attach_candidate", spying)
+        job_id = _staged_job(db)
+        out = asyncio.run(main.approve_person_candidate(
+            job_id,
+            PersonApproveRequest(candidate_id="c1",
+                                 email="jane.doe@acme.com")))
+        assert called["n"] == 1
+        assert out["contact"]["email"] == "jane.doe@acme.com"

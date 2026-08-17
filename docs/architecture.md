@@ -49,11 +49,19 @@ Both are local user data and are gitignored.
 - `jobs.py`: the cancellation contract shared by every background service —
   `cancel(db, job_id, job_type)` refuses to kill a job of the wrong type, and
   `is_cancelled(db, job_id)` treats a vanished job as cancelled.
-- `discovery.py`, `deep_research.py`, `generation.py`: background job orchestration.
-  `discovery.research_updates()` is the single mapping from a scrape result to
-  company columns, including how a wrong-site verdict clears stale research.
+- `discovery.py`, `deep_research.py`, `person_finder.py`, `generation.py`:
+  background job orchestration. `discovery.research_updates()` is the single
+  mapping from a scrape result to company columns, including how a wrong-site
+  verdict clears stale research. Person-finder candidates are staged in the
+  job's `result` JSON and enter `contacts` only through
+  `verified_channels()`/`attach_candidate()` at the approve route; a
+  user-confirmed non-matching address follows the contact-edit
+  reclassification semantics and never gains verified flags.
 - `enrichment.py`, `web_scraper.py`, `text_cleaner.py`, `ddg_search.py`: untrusted
   web acquisition, cleanup, identity checks, evidence extraction.
+- `found_email.py`, `mailbox_verify.py`: pure adapters with no `Database`, no
+  FastAPI and no `WebScraper`. `person_finder` is their only caller and injects
+  the HTTP getter / SMTP connector, which is what makes them testable offline.
 - `contact_ingest.py`, `contact_verify.py`, `contact_enrich.py`: the contact
   boundary. Every scraped or imported contact converges here before persistence,
   and `attach_candidate()` is the one place that decides which scraped channels
@@ -88,7 +96,16 @@ read as bugs is in [`decisions.md`](decisions.md).
 
 - Scraped text is untrusted data: fenced in prompts and injection-filtered.
 - Every scraped URL and every redirect hop must resolve to a public IP — no SSRF
-  into localhost or cloud metadata endpoints.
+  into localhost or cloud metadata endpoints. `found_email.guarded_get_*` is the
+  second place that re-checks every hop; it exists because `fetch_json` pins
+  same-origin and cannot carry an auth header.
+- The mailbox probe never issues `DATA`/`BDAT` — `mailbox_verify.ALLOWED_VERBS`
+  makes it structurally impossible — and a verification result never writes
+  `email_verified`, which asserts the stronger "this address is this person's".
+- The placeholder-address filter applies to the found path only. The
+  mail-domain harvest is fed by a separate, unfiltered query pool
+  (`search(..., pool=False)`) — see decisions.md for the measurement that
+  forbids merging them.
 - Contact addresses are validated at ingest and again before send, so a comma or
   newline can never add a recipient or a `Bcc:` header.
 - State-changing requests from a non-allowlisted `Origin` are rejected, so another

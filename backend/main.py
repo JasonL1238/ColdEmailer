@@ -44,8 +44,9 @@ from models import (
     ContactCreate, ContactUpdate, DeepResearchRequest, DiscoveryRequest,
     CadenceUpdate, SendWindowUpdate, CampaignUpdate, SuppressionCreate,
     EmailUpdate, EnrichRequest, GenerateRequest, ProfileUpdate, ResumeUpdate,
-    SendRequest, LinkedInDraftRequest,
+    SendRequest, LinkedInDraftRequest, PersonApproveRequest, PersonFindRequest,
 )
+from person_finder import PersonFinderService
 from rate_limiter import RateLimiter
 from resume_service import ResumeService
 import analytics as analytics_module
@@ -102,6 +103,7 @@ composer = EmailComposer(db, resumes)
 rate_limiter = RateLimiter(db)
 discovery = DiscoveryService(db, enrichment)
 deep_research = DeepResearchService(db, enrichment)
+person_finder = PersonFinderService(db, enrichment)
 generation = GenerationService(db, composer, enrichment, rate_limiter)
 email_sender = EmailSender(
     credentials_path=os.getenv("CREDENTIALS_JSON_PATH") or os.path.join(_PROJECT_ROOT, "credentials.json"),
@@ -353,6 +355,333 @@ async def cancel_deep_research(job_id: str):
     if not deep_research.cancel(job_id):
         raise HTTPException(409, "That deep research already finished")
     return {"success": True}
+
+
+# ---------- person finder ----------
+
+@app.post("/api/person-finder")
+async def start_person_finder(payload: PersonFindRequest):
+    can, err = rate_limiter.can_research_company()
+    if not can:
+        raise HTTPException(429, err)
+    try:
+        job = person_finder.start(
+            name=payload.name,
+            company_name=payload.company_name,
+            company_url=payload.company_url,
+            school=payload.school,
+            school_dates=payload.school_dates,
+            past_companies=payload.past_companies,
+            role_hint=payload.role_hint,
+            location=payload.location,
+            notes=payload.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    rate_limiter.record_company_research()
+    return _parse_job(db.get_job(job["id"]))
+
+
+@app.get("/api/person-finder")
+async def list_person_finder_jobs():
+    return [_parse_job(j) for j in person_finder.list_jobs(limit=20)]
+
+
+@app.get("/api/person-finder/{job_id}")
+async def get_person_finder_job(job_id: str):
+    job = person_finder.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Person search not found")
+    return _parse_job(job)
+
+
+@app.post("/api/person-finder/{job_id}/cancel")
+async def cancel_person_finder(job_id: str):
+    job = person_finder.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Person search not found")
+    if not person_finder.cancel(job_id):
+        raise HTTPException(409, "That search already finished")
+    return {"success": True}
+
+
+@app.post("/api/person-finder/{job_id}/approve")
+async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
+    """The one path from staged person-finder candidates into `contacts`.
+
+    Crosses the standard contact boundary: annotate → verified_channels →
+    attach_candidate. A user-confirmed address that failed the name match is
+    applied afterwards with the same honest reclassification the contact-edit
+    route uses — email_verified stays 0, nothing guessed becomes sendable.
+    """
+    from contact_verify import annotate_contact, is_generic_inbox, verify_email
+
+    job = person_finder.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Person search not found")
+    if job.get("status") == "running":
+        raise HTTPException(409, "That search is still running")
+    if job.get("status") != "done":
+        raise HTTPException(409, "That search did not finish — run it again")
+    parsed = _parse_job(job)
+    result = parsed.get("result") or {}
+    candidates = result.get("candidates") or []
+    cand = next(
+        (c for c in candidates if c.get("id") == payload.candidate_id), None)
+    if not cand:
+        raise HTTPException(400, "Unknown candidate for this search")
+    if cand.get("approved_contact_id"):
+        row = db.get_contact(cand["approved_contact_id"])
+        if row:
+            return {"contact": row, "conflicts": [], "already_existed": True}
+
+    selected = None
+    selected_email = (payload.email or "").strip().lower()
+    if selected_email:
+        selected = next(
+            (e for e in cand.get("emails") or []
+             if (e.get("email") or "").lower() == selected_email), None)
+        if not selected:
+            raise HTTPException(
+                400, "That address is not one of this candidate's "
+                     "discovered emails")
+        if selected.get("origin") == "guessed":
+            # A guess becomes savable only when a mail server confirmed the
+            # mailbox exists AND the user takes responsibility for identity.
+            # Both are required: the server can say a mailbox is there, but
+            # only a human can say it is *this person's* — john.smith@gs.com
+            # may accept mail and belong to a different John Smith. Anything
+            # the finder can produce without a verification transport still
+            # lands on this refusal.
+            confirmed = (selected.get("smtp_status") == "deliverable"
+                         and selected.get("email_person_match"))
+            if not confirmed:
+                raise HTTPException(
+                    400, "Pattern guesses can't be saved as a sendable "
+                         "address — they're recorded as a note instead.")
+            if not payload.confirm_email_ownership:
+                raise HTTPException(
+                    400, "confirm_email_ownership: a mail server confirmed "
+                         "this mailbox exists, but not that it belongs to "
+                         "this person. Confirm that, then approve again.")
+        if is_generic_inbox(selected_email):
+            raise HTTPException(
+                400, "That looks like a company inbox, not this person")
+        if suppression.match(selected_email, db.list_suppressions()):
+            raise HTTPException(
+                400, "That address is on your do-not-contact list. Remove it "
+                     "in Settings first if you meant to add this person.")
+
+    # Company find-or-create happens here, at approval — abandoned hunts must
+    # not litter the companies table.
+    company_info = result.get("company") or {}
+    company = None
+    created_company_id = None
+    if payload.company_id:
+        company = db.get_company(payload.company_id)
+        if not company:
+            raise HTTPException(404, "That company no longer exists")
+    else:
+        company_name = (
+            payload.company_name or company_info.get("name") or "").strip()
+        if company_name:
+            company = db.find_company_by_name(company_name)
+            if not company:
+                before = {r["id"] for r in db.query("SELECT id FROM companies")}
+                company = db.create_company(
+                    company_name,
+                    url=company_info.get("url"),
+                    domain=company_info.get("domain"),
+                    source="person_finder")
+                if company["id"] not in before:
+                    created_company_id = company["id"]
+
+    def cleanup_company():
+        if created_company_id:
+            # Atomic: only delete if still empty (mirrors the manual path).
+            db.execute(
+                "DELETE FROM companies WHERE id=? AND NOT EXISTS "
+                "(SELECT 1 FROM contacts WHERE company_id=?)",
+                (created_company_id, created_company_id),
+            )
+
+    best_evidence = (cand.get("evidence") or [{}])[0]
+    # A confirmed guess is deliberately kept OUT of the boundary candidate.
+    # Its local part is built from the person's name, so annotate_contact
+    # would compute email_person_match + MX and hand back email_verified=True
+    # — laundering an inference into a verification. It goes in afterwards
+    # through the user-assertion path, which records honestly.
+    is_guess = bool(selected and selected.get("origin") == "guessed")
+    boundary = {
+        "name": cand.get("name") or "",
+        "email": "" if is_guess else (selected["email"] if selected else ""),
+        "linkedin_url": (cand.get("linkedin_url") or None)
+        if payload.include_linkedin else None,
+        "role": cand.get("role"),
+        "source_url": ((selected or {}).get("source_url")
+                       or best_evidence.get("source_url")
+                       or cand.get("source_url")),
+        "evidence": (best_evidence.get("snippet") or "")[:240],
+        "name_from_email": False,
+        "on_domain": bool(selected
+                          and selected.get("domain_kind") == "company"),
+        "seniority_rank": 12,
+        "affinity": [],
+    }
+    annotated = annotate_contact(boundary, check_mx=bool(selected))
+    email0, linkedin0 = verified_channels(annotated)
+
+    confirmed_email = None
+    if is_guess:
+        # Already gated above on smtp_status == deliverable + ownership.
+        confirmed_email = selected["email"]
+    elif selected and not email0:
+        # verified_channels stripped it: the local part doesn't contain the
+        # person's name. Only the user can assert ownership of that mailbox.
+        if not payload.confirm_email_ownership:
+            cleanup_company()
+            raise HTTPException(
+                400, "confirm_email_ownership: that address doesn't contain "
+                     "this person's name. Confirm you verified it belongs to "
+                     "them, then approve again.")
+        confirmed_email = selected["email"]
+
+    if not email0 and not linkedin0 and not confirmed_email:
+        cleanup_company()
+        raise HTTPException(
+            400, "Nothing verifiable to save — select an address or include "
+                 "a verified LinkedIn profile.")
+
+    existing = find_existing(db, email0 or confirmed_email or "", linkedin0)
+    if existing:
+        cleanup_company()
+        if (company and existing.get("company_id")
+                and existing["company_id"] != company["id"]):
+            raise HTTPException(409, owned_elsewhere_note(
+                db, existing["company_id"],
+                email0 or confirmed_email or linkedin0,
+                company.get("name") or "this company"))
+        _mark_candidate_approved(parsed, payload.candidate_id, existing["id"])
+        return {"contact": existing, "conflicts": [], "already_existed": True}
+
+    notes_candidate = dict(annotated)
+    guessed = next(
+        (e for e in cand.get("emails") or [] if e.get("origin") == "guessed"),
+        None)
+    if guessed:
+        notes_candidate["email_guess"] = guessed["email"]
+    if selected and selected.get("origin") == "hunter":
+        notes_candidate["email_source"] = "hunter"
+    notes_parts = [contact_notes(notes_candidate) or ""]
+    signals = [s.get("signal") for s in cand.get("matched_signals") or []]
+    if signals:
+        notes_parts.append(
+            "Found via person search: matched "
+            + ", ".join(str(s) for s in signals if s) + ".")
+    if selected and selected.get("domain_kind") == "personal":
+        host = selected["email"].split("@", 1)[-1]
+        where = selected.get("source_url")
+        notes_parts.append(
+            f"Personal address ({host})"
+            + (f" found at {where}." if where else "."))
+    for channel in cand.get("channels") or []:
+        if channel.get("url"):
+            notes_parts.append(
+                f"{(channel.get('kind') or 'link').capitalize()}: "
+                f"{channel['url']}")
+    notes = " ".join(p for p in notes_parts if p).strip() or None
+
+    conflicts: List[str] = []
+    if company:
+        attached = attach_candidate(
+            db, company=company, candidate=annotated, email=email0,
+            linkedin_url=linkedin0, source="person_finder", notes=notes)
+        if not attached.contact:
+            cleanup_company()
+            raise HTTPException(
+                409, "; ".join(attached.conflicts)
+                or "Could not attach this contact")
+        contact = attached.contact
+        conflicts = attached.conflicts
+    else:
+        # No company known — save unattached, like the manual path allows.
+        # Validation already happened above (annotate + verified_channels).
+        contact = db.create_contact(
+            company_id=None,
+            name=annotated.get("name") or "",
+            email=email0,
+            linkedin_url=linkedin0 or None,
+            role=annotated.get("role"),
+            source="person_finder",
+            status="new",
+            notes=notes,
+            source_url=annotated.get("source_url"),
+            evidence=annotated.get("evidence"),
+            seniority_rank=annotated.get("seniority_rank", 20),
+            email_kind=annotated.get("email_kind") or "unknown",
+            email_verified=bool(annotated.get("email_verified")),
+            linkedin_verified=bool(annotated.get("linkedin_verified")),
+            person_verified=bool(annotated.get("person_verified")),
+        )
+        if not contact.get("_inserted", True):
+            raise HTTPException(
+                409, "That contact already exists "
+                     "(possible concurrent create)")
+
+    if confirmed_email:
+        clash = db.find_contact_by_email(confirmed_email)
+        if clash and clash["id"] != contact["id"]:
+            conflicts.append(
+                f"{confirmed_email} already belongs to another contact — "
+                "not saved")
+        else:
+            # Same semantics as editing a contact's address by hand: honest
+            # reclassification, never a verified flag the evidence can't back.
+            verdict = verify_email(
+                confirmed_email, contact.get("name") or cand.get("name"),
+                check_mx=False)
+            if is_guess:
+                note_add = (
+                    f"Pattern-inferred address. A mail server confirmed a "
+                    f"mailbox exists here and rejected a random address on "
+                    f"the same domain, so the mailbox is real — that does not "
+                    f"prove it belongs to {cand.get('name')}. You confirmed "
+                    f"ownership.")
+            else:
+                note_add = (
+                    f"You confirmed this address belongs to "
+                    f"{cand.get('name')} (found at "
+                    f"{(selected or {}).get('source_url') or 'unknown source'}).")
+            db.update_contact(contact["id"], {
+                "email": confirmed_email,
+                "email_kind": verdict["email_kind"],
+                "email_verified": 0,
+                "person_verified": 0,
+                "notes": f"{contact.get('notes') or ''} {note_add}".strip(),
+            })
+            db.log_event("contact", contact["id"], "email_user_confirmed",
+                         confirmed_email)
+            if is_guess:
+                db.log_event("contact", contact["id"], "mailbox_confirmed",
+                             confirmed_email)
+            contact = db.get_contact(contact["id"])
+
+    _mark_candidate_approved(parsed, payload.candidate_id, contact["id"])
+    return {"contact": contact, "conflicts": conflicts,
+            "already_existed": False}
+
+
+def _mark_candidate_approved(parsed_job: dict, candidate_id: str,
+                             contact_id: str):
+    """Write approved_contact_id back into the staged result so a revisit
+    renders the saved state instead of offering a second approval."""
+    result = parsed_job.get("result") or {}
+    for cand in result.get("candidates") or []:
+        if cand.get("id") == candidate_id:
+            cand["approved_contact_id"] = contact_id
+    db.update_job(parsed_job["id"], result=result)
 
 
 # ---------- jobs (generic polling) ----------

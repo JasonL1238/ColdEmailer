@@ -34,6 +34,14 @@ export const deepResearchAPI = {
   cancel: (id) => api.post(`/deep-research/${id}/cancel`),
 }
 
+export const personFinderAPI = {
+  start: (payload) => api.post('/person-finder', payload),
+  list: () => api.get('/person-finder'),
+  get: (id) => api.get(`/person-finder/${id}`),
+  cancel: (id) => api.post(`/person-finder/${id}/cancel`),
+  approve: (id, payload) => api.post(`/person-finder/${id}/approve`, payload),
+}
+
 export const jobsAPI = {
   get: (id) => api.get(`/jobs/${id}`),
 }

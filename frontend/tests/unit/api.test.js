@@ -18,7 +18,7 @@ vi.mock('axios', () => ({
 import {
   discoveryAPI, companiesAPI, contactsAPI, resumesAPI, emailsAPI,
   settingsAPI, dashboardAPI, cadenceAPI, pipelineAPI, campaignsAPI,
-  suppressionsAPI, errMessage,
+  suppressionsAPI, personFinderAPI, errMessage,
 } from '../../src/api.js'
 
 beforeEach(() => {
@@ -176,5 +176,34 @@ describe('errMessage', () => {
   })
   it('falls back gracefully', () => {
     expect(errMessage({}, 'fallback')).toBe('fallback')
+  })
+})
+
+describe('personFinderAPI', () => {
+  it('starts a person search with the form payload untouched', () => {
+    const payload = { name: 'Jane Doe', company_name: 'Acme', school: 'Penn' }
+    personFinderAPI.start(payload)
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/person-finder', payload)
+  })
+
+  it('polls the typed endpoint by job id', () => {
+    personFinderAPI.get('j1')
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/person-finder/j1')
+  })
+
+  it('cancels by job id', () => {
+    personFinderAPI.cancel('j1')
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/person-finder/j1/cancel')
+  })
+
+  it('approves one candidate with the chosen channels', () => {
+    personFinderAPI.approve('j1', {
+      candidate_id: 'c1', email: 'jane.doe@acme.com',
+      include_linkedin: true, confirm_email_ownership: false,
+    })
+    expect(mockAxiosInstance.post).toHaveBeenCalledWith('/person-finder/j1/approve', {
+      candidate_id: 'c1', email: 'jane.doe@acme.com',
+      include_linkedin: true, confirm_email_ownership: false,
+    })
   })
 })

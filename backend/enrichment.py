@@ -214,7 +214,7 @@ def _decode_js_escapes(text: str) -> str:
     Sites that embed markup inside a JSON payload write `>` as `>`. The
     backslash is not in EMAIL_RE's character class but `u003e` is alphanumeric,
     so matching started at the `u` and produced `u003ekbrooks@wsgr.com` — which
-    passes _is_valid_outreach_email, and (because the domain is real) passes the
+    passes is_valid_outreach_email, and (because the domain is real) passes the
     MX check too, giving a sendable address that duplicates a real person.
     Decoding first puts the `>` back, and `>` cannot be part of an address.
     """
@@ -287,7 +287,7 @@ def extract_emails_from_html(html: str) -> List[str]:
     out_keys = set()
     for addr in found:
         key = addr.lower()
-        if key not in out_keys and _is_valid_outreach_email(addr):
+        if key not in out_keys and is_valid_outreach_email(addr):
             out_keys.add(key)
             out.append(addr)
     return out
@@ -367,7 +367,7 @@ def rank_sitemap_pages(urls: List[str], company_domain: Optional[str],
     return [url for _, _, _, url in ranked[:limit]]
 
 
-def _is_valid_outreach_email(addr: str) -> bool:
+def is_valid_outreach_email(addr: str) -> bool:
     addr = addr.lower()
     local, _, domain = addr.partition("@")
     if not local or not domain:

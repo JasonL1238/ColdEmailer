@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useState } from 'rea
 import { Toaster } from 'react-hot-toast'
 import {
   LayoutDashboard, Compass, Database, FileText, Mail, Microscope,
-  Settings as SettingsIcon, Send, BarChart3, KanbanSquare, Layers,
+  Settings as SettingsIcon, Send, BarChart3, KanbanSquare, Layers, UserSearch,
 } from 'lucide-react'
 import { settingsAPI } from './api'
 import Dashboard from './pages/Dashboard'
@@ -11,6 +11,7 @@ import Pipeline from './pages/Pipeline'
 import Campaigns from './pages/Campaigns'
 import Discover from './pages/Discover'
 import DeepDive from './pages/DeepDive'
+import FindPerson from './pages/FindPerson'
 import DatabasePage from './pages/DatabasePage'
 import Resumes from './pages/Resumes'
 import Emails from './pages/Emails'
@@ -23,6 +24,7 @@ const PAGES = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, section: null },
   { id: 'discover', label: 'Discover', icon: Compass, section: 'Pipeline' },
   { id: 'deep-dive', label: 'Deep Dive', icon: Microscope, section: 'Pipeline' },
+  { id: 'find-person', label: 'Find Person', icon: UserSearch, section: 'Pipeline' },
   { id: 'database', label: 'Database', icon: Database, section: 'Pipeline' },
   { id: 'emails', label: 'Emails', icon: Mail, section: 'Pipeline' },
   { id: 'pipeline', label: 'Pipeline', icon: KanbanSquare, section: 'Pipeline' },
@@ -145,6 +147,7 @@ export default function App() {
           {page === 'dashboard' && <Dashboard />}
           {page === 'discover' && <Discover />}
           {page === 'deep-dive' && <DeepDive />}
+          {page === 'find-person' && <FindPerson />}
           {page === 'database' && <DatabasePage />}
           {page === 'emails' && <Emails />}
           {page === 'pipeline' && <Pipeline />}

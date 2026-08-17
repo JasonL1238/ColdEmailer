@@ -168,6 +168,50 @@ class DeepResearchRequest(BaseModel):
         return v.strip() or None
 
 
+class PersonFindRequest(BaseModel):
+    """Everything the user knows about one specific person."""
+    name: str = Field(..., min_length=2, max_length=120)
+    company_name: Optional[str] = Field(None, max_length=120)
+    company_url: Optional[str] = None
+    school: Optional[str] = Field(None, max_length=200)
+    school_dates: Optional[str] = Field(
+        None, max_length=60,
+        description="Attendance years, e.g. '2018-2022' or 'class of 2020'")
+    past_companies: Optional[str] = Field(None, max_length=500)
+    role_hint: Optional[str] = Field(None, max_length=120)
+    location: Optional[str] = Field(None, max_length=120)
+    notes: Optional[str] = Field(None, max_length=1000)
+
+    @field_validator("company_url")
+    @classmethod
+    def _check_url(cls, v):
+        return validate_http_url(v)
+
+    @field_validator("company_name")
+    @classmethod
+    def _strip_name(cls, v):
+        if v is None:
+            return v
+        return v.strip() or None
+
+
+class PersonApproveRequest(BaseModel):
+    """Save one reviewed person-finder candidate as a contact."""
+    candidate_id: str = Field(..., min_length=1, max_length=32)
+    email: Optional[str] = None
+    include_linkedin: bool = True
+    # Required to save a found address whose local part does not contain the
+    # person's name (e.g. a handle-style gmail from their GitHub profile).
+    confirm_email_ownership: bool = False
+    company_id: Optional[str] = None
+    company_name: Optional[str] = Field(None, max_length=120)
+
+    @field_validator("email")
+    @classmethod
+    def _check_email(cls, v):
+        return validate_email_address(v)
+
+
 class CompanyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     url: Optional[str] = None

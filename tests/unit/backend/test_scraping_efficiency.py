@@ -10,7 +10,7 @@ import pytest
 from web_scraper import _Fetched, WebScraper
 from contact_verify import clear_mx_cache, domain_has_mx
 from enrichment import (
-    _is_valid_outreach_email,
+    is_valid_outreach_email,
     discover_internal_links,
     extract_contact_candidates,
     extract_emails_from_html,
@@ -27,24 +27,24 @@ class TestMachineGeneratedAddresses:
         "02746a65b3e745ba983cb91f83688cbc@errors.stripe.com",
     ])
     def test_error_tracker_dsn_is_not_a_contact(self, address):
-        assert _is_valid_outreach_email(address) is False
+        assert is_valid_outreach_email(address) is False
         assert extract_emails_from_html(f"<p>{address}</p>") == []
 
     def test_sentry_subdomain_is_rejected_not_just_the_apex(self):
         # _BAD_DOMAINS held "sentry.io" but matched exactly, while every real
         # ingest host is a subdomain — so the filter never fired.
-        assert _is_valid_outreach_email("a@sentry.io") is False
-        assert _is_valid_outreach_email("a@o415358.ingest.us.sentry.io") is False
+        assert is_valid_outreach_email("a@sentry.io") is False
+        assert is_valid_outreach_email("a@o415358.ingest.us.sentry.io") is False
 
     def test_a_real_person_at_a_flagged_parent_domain_survives(self):
         # errors.stripe.com is junk; stripe.com is a real employer.
-        assert _is_valid_outreach_email("jane.diaz@stripe.com") is True
+        assert is_valid_outreach_email("jane.diaz@stripe.com") is True
 
     @pytest.mark.parametrize("local", ["deadbeef", "abc123", "cafe"])
     def test_short_hex_locals_are_still_people(self, local):
         # The rule keys on 16+ hex characters. Real short locals that happen to
         # be hex ("cafe@", "abc123@") must not be swept up with the DSNs.
-        assert _is_valid_outreach_email(f"{local}@acme.com") is True
+        assert is_valid_outreach_email(f"{local}@acme.com") is True
 
 
 class TestEscapedMarkupArtifacts:

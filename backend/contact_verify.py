@@ -67,6 +67,20 @@ def name_tokens(name: Optional[str]) -> List[str]:
     return [t for t in tokens if len(t) >= 2 and t not in _NAME_STOP]
 
 
+def name_appears_in(name: Optional[str], text: Optional[str]) -> bool:
+    """True when both the first and last name token appear in `text`.
+
+    The weakest useful identity check, and it was written three times over —
+    once for SERP titles, once for GitHub commit authors, once for paper author
+    blocks. One copy, beside the tokenizer it depends on.
+    """
+    want = name_tokens(name)
+    if len(want) < 2:
+        return False
+    got = set(name_tokens(text))
+    return want[0] in got and want[-1] in got
+
+
 def email_matches_person(email: str, name: Optional[str],
                          *, name_from_email: bool = False) -> bool:
     """True when the local-part is a strong match for the person name.
