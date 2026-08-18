@@ -20,6 +20,10 @@ Opens the app at **http://localhost:5173** (API docs at http://localhost:8000/do
 
 **Discover** — Type what you're looking for in plain English ("seed-stage fintech startups in New York"). Reach asks the LLM for real matching companies, cross-checks with a web search, finds each company's website, follows its real first-party navigation (leadership, team, about, contact, careers, press, news, and blog pages), and extracts a structured company profile plus public contact addresses. It keeps evidence-backed CEO/COO/CTO, hiring, recruiting, and engineering leads when a company page publishes either an email or a LinkedIn member link. It records every source page and crawl count so you can audit the research. Runs in the background with live progress.
 
+**Deep Dive** — Interview-grade research on one company you already care about. It crawls further than Discover (news, press, blog, careers, policy pages), pulls recent external news, and extracts key changes and differentiating policies alongside contacts that match criteria you type ("VP Engineering", "Penn alumni"). Optionally keep hunting until a target number of matches is found. Every run hard-stops at 30 minutes and saves whatever it already had.
+
+**Find Person** — The one person-first screen. Give a full name plus whatever else you know (company, school and years, past employers, role, location, free text) and Reach searches the public web, scores the evidence to tell same-named people apart, and collects addresses for review. Nothing reaches your database until you approve a candidate. A pattern-guessed address (`first.last@company.com`) can only be saved as sendable when the address matches the person **and** either a mail server confirmed the mailbox or a public corpus shows that address in use under their name — and you still have to confirm ownership yourself. Otherwise it is recorded as a note. Runs hard-stop at 10 minutes.
+
 **Database** — Every company and contact in one place. Drill into a company to see its scraped research, its contacts, and the full email history with that company. Warm matches are ranked from your configured school and past employers/communities. For a contact with a verified LinkedIn URL, Reach can draft and copy a message, then open the profile for you to review and send manually. Import a Reach CSV (`name, company` plus `email` and/or `linkedin_url`) or your LinkedIn Connections CSV export; imported LinkedIn rows are marked as direct connections. Re-run research on any company at any time.
 
 **Resumes** — Upload multiple PDF versions ("ML research", "Full-stack", "2029 general"). Reach extracts the text so the AI can weave your real projects into emails, and attaches the PDF you pick when sending. One is marked default. PDFs preview inline in the app, with separate open-in-tab and download actions.
@@ -35,7 +39,7 @@ Opens the app at **http://localhost:5173** (API docs at http://localhost:8000/do
 
 Add free-text instructions to any type ("mention I saw their Show HN post"). Review drafts side by side, edit subject and body inline, rewrite with AI, approve, then send in a batch.
 
-**Tracking** — The dashboard shows the funnel (companies → contacts → drafts → sent → replied), a 30-day sent/reply chart, per-type reply rates, and a live activity feed. "Check replies" scans your Gmail threads for genuine responses, ignoring bounces, out-of-office auto-replies, and your own follow-ups in the same thread. Contacts who go quiet surface for follow-up on the cadence you set in Settings — up to four nudges, each measured from the last message that person actually received. Draft one at a time or the whole due list at once; nothing sends itself. A reply, a bounce, or trashing the draft ends the sequence, and follow-ups are threaded onto the original conversation.
+**Tracking** — The dashboard shows the funnel (companies → contacts → drafts → sent → replied), a 30-day sent/reply chart, per-type reply rates, and a live activity feed. "Check replies" scans your Gmail threads for genuine responses, ignoring bounces, out-of-office auto-replies, and your own follow-ups in the same thread. Contacts who go quiet surface for follow-up on the cadence you set in Settings — up to four nudges, each measured from the last message that person actually received. Draft one at a time or the whole due list at once; no draft sends itself unless you turn on scheduled sending in Settings and opt that batch in. A reply, a bounce, or trashing the draft ends the sequence, and follow-ups are threaded onto the original conversation.
 
 ## Guardrails
 
@@ -46,6 +50,7 @@ Cold outreach is easy to get wrong in ways that are embarrassing rather than mer
 - **The website has to actually be the company's.** A search result is only accepted if the domain matches the name or the page names the company; otherwise the row is marked *Wrong site found* instead of inventing a profile. Existing bad rows are cleaned up on first startup.
 - **Emails don't claim attachments they don't have.** The "resume is attached" line only appears when a real PDF will be attached, and sales emails never attach one.
 - **Affinity never overrides address safety.** Public same-school matches (including UPenn/Wharton when that is your configured school) and senior leaders rank first, but only addresses actually found in the scraped evidence are accepted; a personal/off-domain address never displaces a company-domain address.
+- **Unattended sending is double-gated.** Scheduled sending needs both a Settings toggle and a per-batch opt-in; it ships off.
 - **Sent mail is not deletable.** It is the record of what a real person received, and it is what prevents double-contacting.
 - **Addresses are validated twice** — on the way in and again at send time — so a comma or newline can never add a recipient or a `Bcc:` header.
 - **Archive, don't delete.** Archiving keeps the history and stops future outreach.
@@ -76,7 +81,7 @@ The app works keyless, with a narrower feature set. Nothing silently degrades �
 | Custom emails | ✅ | ✗ refused rather than ignoring your instructions |
 | Send, attachments, reply tracking, follow-ups | ✅ | ✅ identical |
 
-Keyless discovery depends on the `ddgs` package. If searches return nothing, check it is installed (`pip install -r requirements.txt`) — the older `duckduckgo-search` package is deprecated and silently returns zero results.
+Keyless discovery depends on the `ddgs` package. If searches return nothing, check it is installed (`backend/venv/bin/pip install -r backend/requirements.txt`) — the older `duckduckgo-search` package is deprecated and silently returns zero results.
 
 ### 2. Gmail (required for sending)
 
@@ -114,6 +119,12 @@ All optional, set in `.env`:
 | `EMAIL_LLM_MODEL` | provider default | Override the model |
 | `CORS_ORIGINS` | localhost:5173,3000 | Allowed frontend origins |
 | `COLD_DB_PATH` | `backend/data/coldemailer.db` | Database location |
+| `MAILBOX_VERIFY` | `0` (off) | SMTP mailbox probe — opens connections from your IP |
+| `ADDRESS_CORROBORATION` | `1` (on) | Read-only public-corpus lookups on a guessed address |
+
+Optional keys and finer knobs (`GITHUB_TOKEN`, `SEC_CONTACT_EMAIL`,
+`HUNTER_API_KEY`, `EMAIL_PATTERN_INFERENCE`, scheduler timings, paths) are
+documented with their rationale in [`.env.example`](.env.example).
 
 ## Tests
 

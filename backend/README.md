@@ -13,9 +13,9 @@ venv/bin/python -m uvicorn main:app --reload --port 8000
 
 API on http://localhost:8000, interactive docs at http://localhost:8000/docs.
 
-Everything persists to `data/coldemailer.db` (SQLite, WAL): companies, contacts,
-resumes, emails, campaigns, suppressions, jobs, settings, events. Uploaded resume
-PDFs live in `data/resumes/`. Both are gitignored real user data.
+Everything persists to `data/coldemailer.db` (SQLite, WAL) and uploaded resume
+PDFs to `data/resumes/` — both gitignored real user data. The table inventory is
+in [`../docs/architecture.md`](../docs/architecture.md#data-flow).
 
 Module responsibilities and the security invariants this API enforces are in
 [`../docs/architecture.md`](../docs/architecture.md); where to make a given change

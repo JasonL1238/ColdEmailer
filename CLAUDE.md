@@ -28,7 +28,7 @@ reference you open only when a row applies.
 | locating code, or about to open a 1,000-line file | [`docs/map.md`](docs/map.md) |
 | crossing a module boundary or touching an invariant | [`docs/architecture.md`](docs/architecture.md) |
 | deciding what to run before you claim done | [`docs/testing.md`](docs/testing.md) |
-| about to "fix" something that looks wrong | [`docs/decisions.md`](docs/decisions.md) |
+| about to "fix" something that looks wrong, or checking the known gaps | [`docs/decisions.md`](docs/decisions.md) |
 
 `backend/`, `frontend/`, and `tests/` each add a short local `AGENTS.md`.
 
@@ -47,6 +47,7 @@ reference you open only when a row applies.
 
 ## Do not read unless the task names them
 
-`backend/venv/`, `*/node_modules/`, `frontend/dist/`, `stress/`, caches and logs,
-`backend/data/`, `.env`, `credentials.json`, `token.json`, `resume*.pdf`, and
-`skills.md` — which is the owner's personal bio, not an agent-skills file.
+This list is stated here only. `backend/venv/`, `*/node_modules/`,
+`frontend/dist/`, `stress/`, caches, logs, coverage output, `backend/data/`,
+`.env`, `credentials.json`, `token.json`, `resume*.pdf`, and `skills.md` — which
+is the owner's personal bio, not an agent-skills file.

@@ -4,6 +4,11 @@ Each of these has been reported as broken and is not. Read the entry before
 "fixing" the behavior; if you still think it is wrong, change the entry in the
 same commit so the next reader inherits the new reasoning rather than the old.
 
+Sections: [Safety and gating](#safety-and-gating) ·
+[Reporting honestly](#reporting-honestly) · [Scraping](#scraping) ·
+[Person finder](#person-finder) · [Address corroboration](#address-corroboration) ·
+[Runtime](#runtime) · [Known gaps](#known-gaps)
+
 ## Safety and gating
 
 **The do-not-contact list is the only check that fails closed.** Every other
@@ -63,8 +68,9 @@ private address can still be synthesized into a *provider-specific* NAT64
 prefix, which no static rule can enumerate.
 
 Every claim below is a number from replaying a 30-site / 1,169-page capture
-through the real extractor. Rebuild it with `scripts/scrape_corpus.py capture`
-and re-measure with `scripts/measure_shipped.py` before revisiting any of them.
+through the real extractor. Rebuild and re-measure before revisiting any of
+them — see
+[`testing.md`](testing.md#measuring-a-scraping-change-against-real-sites).
 
 **An address whose local part is 16+ hex characters is thrown away.** It is a
 Sentry DSN public key, not a person. These were **270 of the 444 contacts** the
@@ -304,6 +310,83 @@ the very signal. Do not "unify" them.
 ladder for one person; promising a deep-dive-length window in the UI would be
 an over-claim.
 
+## Address corroboration
+
+**Corroboration is a second axis, not a replacement for mailbox verification.**
+A corpus can name a *human*; a mail server can only say the mailbox accepts (see
+"What a mailbox check can and cannot prove"). With TCP/25 blocked `smtp_status`
+is usually `None`, so this is often the only evidence that exists.
+
+**A miss is not evidence of absence, and the code must never treat it as such.**
+Every oracle is a literal string lookup, so it can confirm presence and never
+absence. Two real, published mailboxes — `psf@python.org` and `press@meta.com` —
+return nothing from GitHub commit search, output identical to an invented
+address.
+
+**Measured, over 40 real addresses and 12 invented ones on the same real
+domains** (so an MX check cannot separate them — MX returned True for 40/40 and
+12/12, a 100% false-positive rate, which is why it is not an oracle):
+
+| Source | Real hit | False positives |
+|---|---|---|
+| GitHub commit search (`author-email:`) | 40/40 (see below) | 0/12 |
+| GitHub profile search (`in:email`) | 15/40 | 0/12 |
+| Gravatar profile JSON | 10/40 | 0/12 |
+| Package registries (union) | 9/40 | 0/12 |
+| lore.kernel.org | 7/40 | 0/20 (12 invented + 8 adversarial) |
+| PGP keyservers (union of two) | 7/40 | 0/12 |
+
+lore also took the 8 adversarial invented addresses used against
+mail-archive.com and lists.debian.org, hence the larger denominator. What ships
+is `address_corroborate.ORACLES` — the five sources above other than package
+registries, which were measured and never built.
+
+**The GitHub commit 40/40 is circular and must not be quoted as a coverage
+rate.** The ground truth was harvested from git commit author headers, so that
+oracle was asked about addresses drawn from its own index. What generalises is
+the 0/12. Zero false positives held under adversarial probing: proper
+substrings and one-character truncations of real addresses all return nothing.
+
+**Sources measured and deliberately rejected.** Re-adding any of these needs a
+new measurement, not an argument:
+- **Codeberg / Gitea avatar endpoints** — 100% false positive. They synthesise
+  an identicon for any hash and ignore `?d=404`, so every address ever asked
+  about returns 200. They look like drop-in Gravatar replacements.
+- **`ecosyste.ms` `?email=`** — the parameter is silently ignored; four
+  different invented addresses each returned an identical 100-maintainer body.
+- **npm full-text search on an address** — tokenises it, so an invented Gmail
+  address matches 11,048 packages on `gmail`/`com`.
+- **mail-archive.com and lists.debian.org** — 3 false positives out of 8
+  adversarial invented addresses each; they match name tokens, not the address.
+- **crt.sh / Certificate Transparency** — structural zero (0/40). CT logs carry
+  TLS server certs, whose SANs are DNS names; addresses appear only in S/MIME
+  certs, which are largely not logged.
+- **Have I Been Pwned** — its Terms of Use prohibit querying addresses "in a way
+  that would… be construed as solicitation", which is exactly this use. Beyond
+  the contract, the signal is "this person was the victim of a crime" repurposed
+  as a marketing quality score. Not built.
+- **Provider account-enumeration endpoints** (Google accounts lookup, Microsoft
+  `GetCredentialType`, Slack/Figma invite probes) — these are enumeration
+  attacks against the account holder. Not built.
+
+**Three call-shape traps that produce confident wrong answers.** Each has a test:
+- lore's Atom feed echoes the query inside `<title>`, so "the address appears in
+  the response body" is true for *every* query. Only `<entry>` content counts.
+- GitHub's `total_count` is an estimate, not a count — one real address reports
+  1,206,871. Hits are confirmed per item.
+- Gravatar's v3 profile API is sha256-only and silently 404s an md5 hash, which
+  reads as "no coverage" rather than "you asked wrong".
+
+**Corroboration defaults ON while `MAILBOX_VERIFY` defaults off.** Verification's
+worst case is undoable (see "What a mailbox check can and cannot prove");
+corroboration issues read-only GETs to public search endpoints, and Gravatar
+only ever sees a hash.
+
+**lore contributes no name on purpose.** Only 8 of 199 matching entries carried
+the address in a `From:` header; the rest are body mentions, so a name lifted
+from the entry usually belongs to whoever quoted the address. That leaves
+`name_match` as `None`, which correctly fails the approval gate.
+
 ## Runtime
 
 **Startup runs idempotent repairs.** `main.py` calls the `repair_*` functions in
@@ -313,15 +396,34 @@ an over-claim.
 per-batch opt-in before any mail leaves unattended — the only path where a
 message goes out with nobody watching.
 
-# Known gaps
+**A rule with two implementations has one that is wrong, and you will not know
+which.** Four cases were found and collapsed onto a single leaf module each;
+each had already drifted, and in two of them the shadow copy was the one being
+used. `contact_ingest` carried a 19-word generic-inbox list that shadowed
+`contact_verify.GENERIC_LOCALS` (46 words, and it splits on separators), so
+`sales.support@` became a contact named "Sales Support". `contact_enrich` had a
+second `registered_domain` that took the last two labels, so `acme.co.uk` and
+`other.co.uk` both reduced to `co.uk` and every `.co.uk` address classified as
+the company's own. `find_website` re-listed 22 aggregator domains that
+`is_junk_site` already rejects — and matched them by *substring*, silently
+discarding `netflix.com`, `matrix.com`, `equinix.com` and `citrix.com` because
+they contain `x.com`. The rules now live in `domain_names.py`, `phrase_match.py`
+and `ttl_cache.py`, which import nothing from this app. Add to the leaf rather
+than re-deriving a rule locally, and if a caller genuinely needs a different
+rule, pass it as an argument — `phrase_match.phrase_in` takes its separator
+class for exactly that reason (`contact_enrich` counts `.` and `,` as
+separators inside a company name; `deep_research` does not).
+
+## Known gaps
 
 Real, unresolved, and deliberately not acted on. Do not close one silently.
 
-1. **`resume28.pdf` and `resume29.pdf` are committed to a public repo** and carry
-   the owner's phone number and email. They predate the `*.pdf` gitignore rule
-   (`bcad104`), so the rule never applied to them. `skills.md` is tracked and
-   carries the same details. Untracking leaves all of it in history; a real purge
+1. **`resume28.pdf` and `resume29.pdf` remain in the public git history** with
+   the owner's phone number and email. They were untracked in `295c296`
+   (2026-08-01) and both files are still present locally, ignored only by an
+   untracked `.gitignore` — a fresh clone gets no `*.pdf` rule. A real purge
    needs `git filter-repo` and a force push, or making the repo private.
+   `skills.md` is still tracked and carries the same details.
    **Owner's decision — do not act unilaterally.**
 2. **Commit `bcad104` is titled "email gen now with gemni key."** If a real key
    was ever committed it should be rotated. Not audited.

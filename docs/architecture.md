@@ -48,7 +48,12 @@ Both are local user data and are gitignored.
   Keep SQL out of routes when a reusable database operation exists.
 - `jobs.py`: the cancellation contract shared by every background service —
   `cancel(db, job_id, job_type)` refuses to kill a job of the wrong type, and
-  `is_cancelled(db, job_id)` treats a vanished job as cancelled.
+  `is_cancelled(db, job_id)` treats a vanished job as cancelled. `SingleSlotJob`
+  adds the one-at-a-time discipline for `person_finder` and `deep_research`:
+  claim an in-process slot, refuse a second start, and hold the slot until the
+  worker thread exits — past a cancel, because the worker is still scraping.
+  `discovery` and `generation` deliberately stay off it; their crash handlers
+  omit `only_if_running`, so adopting it would change the cancel/finish race.
 - `discovery.py`, `deep_research.py`, `person_finder.py`, `generation.py`:
   background job orchestration. `discovery.research_updates()` is the single
   mapping from a scrape result to company columns, including how a wrong-site
@@ -59,9 +64,14 @@ Both are local user data and are gitignored.
   reclassification semantics and never gains verified flags.
 - `enrichment.py`, `web_scraper.py`, `text_cleaner.py`, `ddg_search.py`: untrusted
   web acquisition, cleanup, identity checks, evidence extraction.
-- `found_email.py`, `mailbox_verify.py`: pure adapters with no `Database`, no
-  FastAPI and no `WebScraper`. `person_finder` is their only caller and injects
-  the HTTP getter / SMTP connector, which is what makes them testable offline.
+- `found_email.py`, `mailbox_verify.py`, `address_corroborate.py`: pure adapters
+  with no `Database`, no FastAPI and no `WebScraper`. `person_finder` calls all
+  three and `address_corroborate` reuses `found_email.guarded_get_*`; every
+  caller injects the HTTP getter / SMTP connector, which is what makes them
+  testable offline. The last two answer different questions about the same
+  address and neither subsumes the other: `mailbox_verify` asks a mail server
+  whether the mailbox accepts mail, `address_corroborate` asks public corpora
+  whether the address has ever been used and by whom.
 - `contact_ingest.py`, `contact_verify.py`, `contact_enrich.py`: the contact
   boundary. Every scraped or imported contact converges here before persistence,
   and `attach_candidate()` is the one place that decides which scraped channels
@@ -70,6 +80,11 @@ Both are local user data and are gitignored.
   draft, send, reply, and thread duties. Sending and Gmail reads are live I/O.
 - `campaigns.py`, `pipeline.py`, `analytics.py`, `suppression.py`, `send_window.py`,
   `research_digest.py`: focused domain calculations; keep them framework-independent.
+- `domain_names.py`, `phrase_match.py`, `ttl_cache.py`: stdlib-only leaves that
+  import nothing from this app, so anything may import them. They exist because
+  the rule each holds had been written out three or four times and had drifted —
+  a second `registered_domain` that did not know two-part TLDs made unrelated
+  `.co.uk` employers compare equal. Add to the leaf; never re-derive the rule.
 - `llm_client.py`: provider-neutral interface for Gemini, OpenAI, and OpenRouter.
   Callers own honest template or refusal fallbacks.
 
@@ -100,8 +115,18 @@ read as bugs is in [`decisions.md`](decisions.md).
   second place that re-checks every hop; it exists because `fetch_json` pins
   same-origin and cannot carry an auth header.
 - The mailbox probe never issues `DATA`/`BDAT` — `mailbox_verify.ALLOWED_VERBS`
-  makes it structurally impossible — and a verification result never writes
-  `email_verified`, which asserts the stronger "this address is this person's".
+  makes it structurally impossible.
+- Neither the mailbox probe nor corroboration writes `email_verified` or changes
+  `origin`: both answer a question about the address, not about who owns it.
+- Corroboration is positive-only. A hit means the address exists in a public
+  corpus; a miss means nothing and must never be reported as evidence the
+  address is fake.
+- A guessed address becomes sendable only through the approve route, and only
+  when all of: a mailbox probe returned `deliverable` OR corroboration returned
+  `name_match is True`; the address matches the person (`email_person_match`);
+  and the caller sent `confirm_email_ownership`. `name_match` is tri-state —
+  `None` (no source gave a name) never qualifies, and is not `False` (a source
+  gave someone else's name).
 - The placeholder-address filter applies to the found path only. The
   mail-domain harvest is fed by a separate, unfiltered query pool
   (`search(..., pool=False)`) — see decisions.md for the measurement that

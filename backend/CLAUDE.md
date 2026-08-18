@@ -5,8 +5,8 @@ Adds to the root [`AGENTS.md`](../AGENTS.md). Boundaries:
 
 - Imports are intentionally bare (`from db import ...`); modules run with
   `backend/` on `sys.path`. Do not add package prefixes.
-- `main.py` (3k lines) and `db.py` (2.3k) are search targets, not read targets:
-  grep the route path, table, entity method, or `repair_*` symbol.
+- `main.py` and `db.py` are large: search targets, not read targets. Grep the
+  route path, table, entity method, or `repair_*` symbol.
 - Scraped and imported contacts converge on `contact_ingest.py`. Attaching a
   candidate to a company goes through `verified_channels()` then
   `attach_candidate()`, so discovery, deep research, and re-research cannot
