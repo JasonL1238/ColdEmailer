@@ -149,3 +149,19 @@ class TestSelectVerified:
         assert out["email_person_match"] is True
         assert out["email_verified"] is False
         assert out["person_verified"] is False
+
+
+def test_classify_email_domain_respects_two_part_tlds():
+    """Two unrelated .co.uk employers must not compare equal.
+
+    The old private `_email_registered_domain` took the last two labels, so
+    `other.co.uk` and `acme.co.uk` both reduced to `co.uk` and every .co.uk
+    address was classified as the company's own.
+    """
+    from person_finder import classify_email_domain
+
+    assert classify_email_domain("jane@acme.co.uk", "acme.co.uk") == "company"
+    assert classify_email_domain("bob@other.co.uk", "acme.co.uk") == "other"
+    assert classify_email_domain("jane@acme.com", "acme.com") == "company"
+    # No host on either side must never read as "company".
+    assert classify_email_domain("nobody", "acme.com") == "other"

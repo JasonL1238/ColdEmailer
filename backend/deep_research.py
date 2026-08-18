@@ -17,10 +17,12 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from contact_enrich import (
+    _company_mentioned,
     enrich_contacts_outreach,
     extract_linkedin_urls,
     find_linkedin_via_search,
 )
+from phrase_match import all_tokens_in, phrase_in
 from contact_verify import (
     annotate_contact,
     linkedin_matches_person,
@@ -412,17 +414,14 @@ def score_criteria_match(contact: Dict, criteria_terms: List[str]) -> Dict[str, 
                 matched.append(term)
                 alumni_hit = True
             continue
-        phrase = re.escape(t).replace(r"\ ", r"[\s\-_/]+")
-        if re.search(rf"(?<![a-z0-9]){phrase}(?![a-z0-9])", role_blob):
+        if phrase_in(t, role_blob):
             matched.append(term)
             continue
         bits = [
             b for b in re.split(r"[^a-z0-9]+", t)
             if b and (len(b) >= 3 or b in _SHORT_ROLE_TOKENS)
         ]
-        if bits and all(
-                re.search(rf"(?<![a-z0-9]){re.escape(b)}(?![a-z0-9])", role_blob)
-                for b in bits):
+        if all_tokens_in(bits, role_blob):
             matched.append(term)
     score = len(matched) / max(len(criteria_terms), 1)
     return {
@@ -474,7 +473,6 @@ def should_require_contact_floor(
 def _looks_like_employee_snippet(
         company_name: str, title: str, body: str) -> bool:
     """Require company mention + employment cue; reject job-ad / former noise."""
-    from contact_enrich import _company_mentioned
 
     blob = f"{title or ''} {body or ''}"
     if not _company_mentioned(company_name, title, body):
@@ -802,7 +800,6 @@ def heuristic_deep_intel(
         *,
         company_name: str = "") -> Dict:
     """No-LLM fallback: pull sentences that look like changes / policies."""
-    from contact_enrich import _company_mentioned
 
     blob = f"{site_text}\n" + "\n".join(news_snippets)
     sentences = re.split(r"(?<=[.!?])\s+", blob)
@@ -847,14 +844,17 @@ def heuristic_deep_intel(
     }
 
 
-class DeepResearchService:
+class DeepResearchService(jobs.SingleSlotJob):
     """Background deep dive for one company at a time."""
+
+    JOB_TYPE = "deep_research"
+    JOB_LABEL = "deep research job"
+    LIST_LIMIT = 30
 
     def __init__(self, db: Database, enrichment: EnrichmentService):
         self.db = db
         self.enrichment = enrichment
-        self._lock = threading.Lock()
-        self._running_job: Optional[str] = None
+        self._init_slot()
 
     def start(
             self,
@@ -905,84 +905,27 @@ class DeepResearchService:
                 "target_criteria_matches requires contact_criteria "
                 "(who to keep searching for).")
 
-        with self._lock:
-            # Slot is held until the worker thread exits (_run_safe finally),
-            # even after cancel CAS flips the DB row off "running".
-            if self._running_job is not None:
-                raise RuntimeError(
-                    "A deep research job is already running or winding down. "
-                    "Cancel it or wait.")
-            running = [
-                j for j in self.db.list_jobs("deep_research", limit=5)
-                if j.get("status") == "running"
-            ]
-            if running:
-                raise RuntimeError(
-                    "A deep research job is already running. "
-                    "Cancel it or wait.")
-            job = self.db.create_job("deep_research", {
-                "company_name": name,
-                "company_id": company_id,
-                "url": url,
-                "contact_criteria": contact_criteria,
-                "min_contacts": min_contacts,
-                "target_criteria_matches": target_n,
-                "continue_mode": mode,
-                "hard_stop_sec": HARD_STOP_SEC,
-            })
-            self._running_job = job["id"]
-
+        job = self._claim_slot({
+            "company_name": name,
+            "company_id": company_id,
+            "url": url,
+            "contact_criteria": contact_criteria,
+            "min_contacts": min_contacts,
+            "target_criteria_matches": target_n,
+            "continue_mode": mode,
+            "hard_stop_sec": HARD_STOP_SEC,
+        })
         thread = threading.Thread(
-            target=self._run_safe,
-            args=(
-                job["id"], name, company_id, url, contact_criteria,
-                min_contacts, mode, target_n,
-            ),
+            target=self.run_guarded,
+            args=(job["id"], self._run, name, company_id, url, contact_criteria,
+                  min_contacts, mode, target_n),
             daemon=True,
         )
         thread.start()
         return job
 
-    def cancel(self, job_id: str) -> bool:
-        # Do not clear _running_job here — the worker thread still owns the
-        # slot until _run_safe's finally block. Clearing early lets a second
-        # dive start while the cancelled worker is still scraping.
-        return jobs.cancel_atomically(self.db, job_id, "deep_research")
-
-    def list_jobs(self, limit: int = 30) -> List[Dict]:
-        return self.db.list_jobs(job_type="deep_research", limit=limit)
-
-    def get_job(self, job_id: str) -> Optional[Dict]:
-        job = self.db.get_job(job_id)
-        if job and job.get("type") != "deep_research":
-            return None
-        return job
-
-    def _cancelled(self, job_id: str) -> bool:
-        # Deliberately broader than discovery/generation: a dive that already
-        # finished or failed must also stop scraping.
-        return jobs.is_finished(self.db, job_id)
-
     def _timed_out(self, deadline: float) -> bool:
         return time.monotonic() >= deadline
-
-    def _run_safe(
-            self, job_id, name, company_id, url, criteria, min_contacts,
-            continue_mode=None, target_criteria_matches=None):
-        try:
-            self._run(
-                job_id, name, company_id, url, criteria, min_contacts,
-                continue_mode=continue_mode,
-                target_criteria_matches=target_criteria_matches)
-        except Exception as exc:  # pragma: no cover
-            self.db.finish_job(
-                job_id, status="failed", error=str(exc)[:500],
-                only_if_running=True,
-            )
-        finally:
-            with self._lock:
-                if self._running_job == job_id:
-                    self._running_job = None
 
     def _run(
             self,
@@ -1001,11 +944,9 @@ class DeepResearchService:
             if target_criteria_matches is not None else None
         )
         mode = (continue_mode or "").strip().lower() or None
+        # Contacts-only continue skips the heavy site crawl.
         do_crawl = mode is None or mode in {"research", "both"}
         do_contacts = mode is None or mode in {"contacts", "both"}
-        # Contacts-only continue: skip the heavy site crawl.
-        if mode == "contacts":
-            do_crawl = False
         deadline = time.monotonic() + HARD_STOP_SEC
         timed_out = False
 
@@ -1120,27 +1061,25 @@ class DeepResearchService:
                 )
         else:
             # Contacts-only: reuse the stored company identity.
+            prior = existing_company or {}
             enriched = {
-                "url": (existing_company or {}).get("url") or url,
-                "domain": (existing_company or {}).get("domain"),
-                "summary": (existing_company or {}).get("summary"),
-                "product": (existing_company or {}).get("product"),
-                "hook": (existing_company or {}).get("hook"),
-                "recent_news": (existing_company or {}).get("recent_news"),
-                "why_care": (existing_company or {}).get("why_care"),
-                "industry": (existing_company or {}).get("industry"),
-                "location": (existing_company or {}).get("location"),
+                "url": prior.get("url") or url,
+                "domain": prior.get("domain"),
+                "summary": prior.get("summary"),
+                "product": prior.get("product"),
+                "hook": prior.get("hook"),
+                "recent_news": prior.get("recent_news"),
+                "why_care": prior.get("why_care"),
+                "industry": prior.get("industry"),
+                "location": prior.get("location"),
                 "contacts": [],
                 "emails": [],
                 "page_texts": [],
-                "research_sources": (existing_company or {}).get(
-                    "research_sources") or [],
-                "pages_scraped": (existing_company or {}).get("pages_scraped"),
-                "pages_attempted": (existing_company or {}).get(
-                    "pages_attempted"),
-                "research_quality": (existing_company or {}).get(
-                    "research_quality") or "medium",
-                "scraped_at": (existing_company or {}).get("scraped_at"),
+                "research_sources": prior.get("research_sources") or [],
+                "pages_scraped": prior.get("pages_scraped"),
+                "pages_attempted": prior.get("pages_attempted"),
+                "research_quality": prior.get("research_quality") or "medium",
+                "scraped_at": prior.get("scraped_at"),
                 "ok": True,
                 "identity_verified": True,
             }
@@ -1450,7 +1389,6 @@ class DeepResearchService:
                 + (" (timed out)" if timed_out else ""))
 
     def _gather_news(self, company_name: str, domain: Optional[str]) -> List[str]:
-        from contact_enrich import _company_mentioned
         from ddg_search import ddg_text_search
         queries = [
             f'"{company_name}" (launch OR funding OR announces OR partnership)',
@@ -1730,11 +1668,8 @@ class DeepResearchService:
                 # Until-N: any user criteria term counts (role or alumni).
                 # Alumni-only floor (no until-N): require alumni_match so we
                 # don't pad with random VPs.
-                if until_mode:
-                    return bool(match.get("criteria_match"))
-                if want_alum:
-                    return bool(match.get("alumni_match"))
-                return bool(match.get("criteria_match"))
+                key = "alumni_match" if (want_alum and not until_mode) else "criteria_match"
+                return bool(match.get(key))
             return True
 
         def persistable_count() -> int:
@@ -2236,13 +2171,11 @@ class DeepResearchService:
                 continue
 
             existing = find_existing(self.db, addr, linkedin_url)
-            match_bits = []
+            notes = contact_notes(candidate)
             if candidate.get("criteria_match"):
                 terms = ", ".join(candidate.get("matched_terms") or [])
-                match_bits.append(f"Criteria match: {terms}" if terms else "Criteria match")
-            notes = contact_notes(candidate)
-            if match_bits:
-                notes = ("; ".join(match_bits) + (f"; {notes}" if notes else ""))
+                prefix = f"Criteria match: {terms}" if terms else "Criteria match"
+                notes = prefix + (f"; {notes}" if notes else "")
 
             if existing:
                 if existing.get("company_id") == company_id:

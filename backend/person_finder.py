@@ -20,15 +20,18 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import address_corroborate
 import found_email
 import jobs
+from domain_names import registered_domain
+from phrase_match import all_tokens_in
 import mailbox_verify
 from contact_enrich import (
     _company_mentioned,
-    _email_registered_domain,
     extract_linkedin_urls,
     hunter_find_email,
     pick_pattern_guess,
@@ -78,6 +81,13 @@ MAX_CHEAP_GETS = 60
 MAX_GITHUB_API_CALLS = 40
 MAX_GITHUB_SEARCH_CALLS = 6
 FOUND_SOURCES_TOP_N = 3
+# Corroboration gets its own budget rather than sharing stage 5.5's. GitHub
+# search is the scarce resource in both — 30/min, and a secondary limiter that
+# bites well before that — so a shared counter would let address checks starve
+# the login resolution that finds addresses in the first place.
+CORROBORATE_MAX_GETS = 12
+CORROBORATE_MAX_GITHUB_API = 4
+CORROBORATE_MAX_GITHUB_SEARCH = 4
 MAX_CANDIDATES = 6
 EMAIL_DISCOVERY_TOP_N = 3
 MAX_EMAILS_PER_CANDIDATE = 6
@@ -194,10 +204,12 @@ def classify_email_domain(
     host = normalize_email(email).split("@", 1)[-1]
     if not host:
         return "other"
-    registered = _email_registered_domain(f"x@{host}")
-    if company_domain:
-        if registered == _email_registered_domain(f"x@{company_domain}"):
-            return "company"
+    registered = registered_domain(host)
+    company_reg = registered_domain(company_domain or "")
+    # Both sides must parse: registered_domain("") is None, and None == None
+    # would read as "company" for an address with no host.
+    if registered and company_reg and registered == company_reg:
+        return "company"
     if registered in _FREEMAIL_DOMAINS:
         return "personal"
     return "other"
@@ -342,10 +354,7 @@ def _role_hint_matches(role_hint: str, role: str) -> bool:
     if not hint or not blob:
         return False
     bits = [b for b in re.split(r"[^a-z0-9]+", hint) if len(b) >= 2]
-    return bool(bits) and all(
-        re.search(rf"(?<![a-z0-9]){re.escape(b)}(?![a-z0-9])", blob)
-        for b in bits
-    )
+    return all_tokens_in(bits, blob)
 
 
 def score_candidate(candidate: Dict, criteria: Dict) -> Dict:
@@ -372,23 +381,29 @@ def score_candidate(candidate: Dict, criteria: Dict) -> Dict:
                 return snippet, url
         return None
 
+    def award(family: str, signal: str, evidence: str, source_url: str) -> float:
+        """Credit one matched signal and hand back its weight.
+
+        Returns rather than mutating `score` so the past-company accumulator
+        can keep its own total and stay capped.
+        """
+        families.add(family)
+        matched.append({"signal": signal,
+                        "evidence": (evidence or "")[:220],
+                        "source_url": source_url or ""})
+        return _SIGNAL_WEIGHTS[family]
+
     company = criteria.get("company_name")
     if company:
         hit = first_hit(lambda s: _company_mentioned(company, "", s))
         if hit:
-            score += _SIGNAL_WEIGHTS["company"]
-            families.add("company")
-            matched.append({"signal": f"company:{company}",
-                            "evidence": hit[0][:220], "source_url": hit[1]})
+            score += award("company", f"company:{company}", *hit)
 
     aliases = criteria.get("school_aliases") or []
     if aliases:
         hit = first_hit(lambda s: _school_mentioned(aliases, s))
         if hit:
-            score += _SIGNAL_WEIGHTS["school"]
-            families.add("school")
-            matched.append({"signal": f"school:{criteria['school']}",
-                            "evidence": hit[0][:220], "source_url": hit[1]})
+            score += award("school", f"school:{criteria['school']}", *hit)
 
     user_years = criteria.get("year_ranges") or []
     if user_years:
@@ -411,28 +426,20 @@ def score_candidate(candidate: Dict, criteria: Dict) -> Dict:
     for past in criteria.get("past_companies") or []:
         hit = first_hit(lambda s: _past_employer_mentioned(past, "", s))
         if hit and past_score < _PAST_COMPANY_CAP:
-            past_score += _SIGNAL_WEIGHTS["past_company"]
-            families.add("past_company")
-            matched.append({"signal": f"past:{past}",
-                            "evidence": hit[0][:220], "source_url": hit[1]})
+            past_score += award("past_company", f"past:{past}", *hit)
     score += min(past_score, _PAST_COMPANY_CAP)
 
     if criteria.get("role_hint") and _role_hint_matches(
             criteria["role_hint"], candidate.get("role") or ""):
-        score += _SIGNAL_WEIGHTS["role"]
-        families.add("role")
-        matched.append({"signal": f"role:{criteria['role_hint']}",
-                        "evidence": (candidate.get("role") or "")[:220],
-                        "source_url": candidate.get("source_url") or ""})
+        score += award("role", f"role:{criteria['role_hint']}",
+                       candidate.get("role") or "",
+                       candidate.get("source_url") or "")
 
     location = (criteria.get("location") or "").lower().strip()
     if location:
         hit = first_hit(lambda s: location in s.lower())
         if hit:
-            score += _SIGNAL_WEIGHTS["location"]
-            families.add("location")
-            matched.append({"signal": f"location:{criteria['location']}",
-                            "evidence": hit[0][:220], "source_url": hit[1]})
+            score += award("location", f"location:{criteria['location']}", *hit)
 
     if len(families) >= 2 and score >= 4.0:
         confidence = "strong"
@@ -597,8 +604,12 @@ def _domain_from_url(url: Optional[str]) -> Optional[str]:
     return host or None
 
 
-class PersonFinderService:
+class PersonFinderService(jobs.SingleSlotJob):
     """Background hunt for one person; results staged for review."""
+
+    JOB_TYPE = "person_finder"
+    JOB_LABEL = "person search"
+    LIST_LIMIT = 20
 
     def __init__(self, db: Database, enrichment: EnrichmentService, *,
                  http_get=None):
@@ -606,61 +617,19 @@ class PersonFinderService:
         self.enrichment = enrichment
         # Injectable so found_email adapters are testable without a network.
         self._http_get = http_get
-        self._lock = threading.Lock()
-        self._running_job: Optional[str] = None
+        self._init_slot()
 
     def start(self, **query) -> Dict:
         name = (query.get("name") or "").strip()
         if len(name_tokens(name)) < 2:
             raise ValueError("A first and last name are required")
         query["name"] = name
-        with self._lock:
-            # The slot is held until the worker thread exits, even after a
-            # cancel flips the DB row — same discipline as deep research.
-            if self._running_job is not None:
-                raise RuntimeError(
-                    "A person search is already running or winding down. "
-                    "Cancel it or wait.")
-            running = [
-                j for j in self.db.list_jobs("person_finder", limit=5)
-                if j.get("status") == "running"
-            ]
-            if running:
-                raise RuntimeError(
-                    "A person search is already running. Cancel it or wait.")
-            job = self.db.create_job("person_finder", dict(query))
-            self._running_job = job["id"]
+        job = self._claim_slot(dict(query))
         thread = threading.Thread(
-            target=self._run_safe, args=(job["id"], query), daemon=True)
+            target=self.run_guarded, args=(job["id"], self._run, query),
+            daemon=True)
         thread.start()
         return job
-
-    def cancel(self, job_id: str) -> bool:
-        return jobs.cancel_atomically(self.db, job_id, "person_finder")
-
-    def list_jobs(self, limit: int = 20) -> List[Dict]:
-        return self.db.list_jobs(job_type="person_finder", limit=limit)
-
-    def get_job(self, job_id: str) -> Optional[Dict]:
-        job = self.db.get_job(job_id)
-        if job and job.get("type") != "person_finder":
-            return None
-        return job
-
-    def _cancelled(self, job_id: str) -> bool:
-        return jobs.is_finished(self.db, job_id)
-
-    def _run_safe(self, job_id: str, query: Dict):
-        try:
-            self._run(job_id, query)
-        except Exception as exc:  # pragma: no cover
-            self.db.finish_job(
-                job_id, status="failed", error=str(exc)[:500],
-                only_if_running=True)
-        finally:
-            with self._lock:
-                if self._running_job == job_id:
-                    self._running_job = None
 
     def _run(self, job_id: str, query: Dict):
         name = query["name"]
@@ -760,17 +729,19 @@ class PersonFinderService:
         # Goldman contact (goldmansachs.com vs the real gs.com).
         domain = website_domain
         if website_domain and company_name and not should_stop():
-            harvested: Dict[str, int] = {}
+            harvested: Counter = Counter()
             for q in (f'"@{website_domain}" email contact',
                       f"{company_name} email address format"):
                 # pool=False: these SERPs are template-dense by design.
-                for result in search(q, max_results=8, pool=False):
-                    for dom, n in harvest_email_domains([result]).items():
-                        harvested[dom] = harvested.get(dom, 0) + n
+                harvested.update(harvest_email_domains(
+                    search(q, max_results=8, pool=False)))
             domain, why = infer_email_domain(
                 company_name, website_domain, harvested)
             company_info["mail_domain"] = domain
             company_info["mail_domain_reason"] = why
+        # Stays the WEBSITE domain — the mail domain lives in
+        # company_info["mail_domain"]. Stage 6 crawls the site, so reusing one
+        # variable here would search site:gs.com and find nothing.
         company_info["domain"] = website_domain
 
         # ---- Stage 2: profile search ladder ------------------------------
@@ -836,10 +807,9 @@ class PersonFinderService:
                     break
                 url = result.get("href") or ""
                 html = fetch_page(url)
-                if html:
-                    team_fetched += 1
                 if not html:
                     continue
+                team_fetched += 1
                 text = self.enrichment.scraper.extract_text(html) or ""
                 if not name_appears_in(name, text[:4000]):
                     continue
@@ -923,7 +893,13 @@ class PersonFinderService:
         for cand in candidates[:EMAIL_DISCOVERY_TOP_N]:
             if should_stop():
                 break
-            cand["emails"] = self._discover_emails(cand, name, domain)
+            cand["emails"] = self._discover_emails(
+                cand, name, domain,
+                budget=found_email.GetBudget(
+                    max_gets=CORROBORATE_MAX_GETS,
+                    max_github_api=CORROBORATE_MAX_GITHUB_API,
+                    max_github_search=CORROBORATE_MAX_GITHUB_SEARCH,
+                    should_stop=should_stop))
         for cand in candidates:
             cand.setdefault("emails", [])
             cand.pop("found_emails", None)
@@ -931,15 +907,13 @@ class PersonFinderService:
         # ---- Stage 7: optional one-line LLM verdicts ---------------------
         stage(7)
         keyless = not get_cloud_llm_provider()
+        summaries: Dict[str, str] = {}
         if not keyless and candidates and not should_stop():
             summaries = _llm_summaries(name, query, candidates)
-            for cand in candidates:
-                cand["llm_summary"] = summaries.get(cand["id"])
-        else:
-            # Keyless mode shows the raw matched signals instead — the
-            # pipeline is heuristic end to end, so nothing is lost or faked.
-            for cand in candidates:
-                cand["llm_summary"] = None
+        # Keyless mode shows the raw matched signals instead — the pipeline is
+        # heuristic end to end, so nothing is lost or faked.
+        for cand in candidates:
+            cand["llm_summary"] = summaries.get(cand["id"])
 
         # ---- Stage 8: stage everything in the job row --------------------
         stage(8)
@@ -1028,8 +1002,8 @@ class PersonFinderService:
                 "github_rate_limited": budget.is_rate_limited("github")}
 
     def _discover_emails(
-            self, cand: Dict, name: str,
-            domain: Optional[str]) -> List[Dict]:
+            self, cand: Dict, name: str, domain: Optional[str],
+            *, budget=None) -> List[Dict]:
         """Labeled email list: found addresses verified, then Hunter, then
         one pattern guess. Guesses never carry email_verified."""
         emails: List[Dict] = []
@@ -1087,6 +1061,17 @@ class PersonFinderService:
                 # is recorded separately from `origin`, which stays "guessed":
                 # a mailbox existing says nothing about who owns it.
                 probe = mailbox_verify.verify_mailbox(guess)
+                # And ask the free corpora whether anyone has ever actually
+                # used this address. Independent of the mailbox probe and
+                # strictly more informative when it fires: a mail server can
+                # only say a mailbox exists, while a commit or a profile says
+                # whose it is. Runs even when no verification transport is
+                # configured, which is the normal case here.
+                import os as _os
+                corroboration = address_corroborate.corroborate_address(
+                    guess, name=name,
+                    token=_os.getenv("GITHUB_TOKEN", "").strip() or None,
+                    http_get=self._http_get, budget=budget)
                 add({
                     "email": guess,
                     "origin": "guessed",
@@ -1099,6 +1084,9 @@ class PersonFinderService:
                     "smtp_status": (
                         None if probe.reason in ("disabled", "no_transport")
                         else probe.verdict.value),
+                    "corroboration": (
+                        corroboration.as_dict()
+                        if corroboration.reason != "disabled" else None),
                 })
         return emails[:MAX_EMAILS_PER_CANDIDATE]
 

@@ -15,6 +15,8 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
+from domain_names import registered_domain
+from phrase_match import all_tokens_in, phrase_in, token_in
 from contact_verify import (
     annotate_contact,
     domain_has_mx,
@@ -68,14 +70,6 @@ def extract_linkedin_urls(*texts: str) -> List[str]:
     return found
 
 
-def _email_registered_domain(email: str) -> str:
-    host = normalize_email(email).split("@", 1)[-1]
-    parts = [p for p in host.split(".") if p]
-    if len(parts) >= 2:
-        return ".".join(parts[-2:]).lower()
-    return host.lower()
-
-
 def _company_mentioned(company_name: str, title: str, body: str) -> bool:
     """True when title/body positively name this company.
 
@@ -94,21 +88,17 @@ def _company_mentioned(company_name: str, title: str, body: str) -> bool:
     cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
     if len(cleaned) < 3:
         return False
-    phrase = re.escape(cleaned).replace(r"\ ", r"[\s\-_,./]+")
-    if re.search(rf"(?<![a-z0-9]){phrase}(?![a-z0-9])", blob):
+    # Commas and dots count as separators here — a company name is written
+    # "Acme, Inc." on a page. deep_research deliberately excludes them.
+    if phrase_in(cleaned, blob, r"[\s\-_,./]+"):
         return True
     bits = [t for t in cleaned.split() if len(t) >= 3]
-    if len(bits) >= 2 and all(
-        re.search(rf"(?<![a-z0-9]){re.escape(b)}(?![a-z0-9])", blob)
-        for b in bits
-    ):
+    if len(bits) >= 2 and all_tokens_in(bits, blob):
         return True
     # Single long token only (Stripe, Datadog) — short generics like Acme/AI need
     # the full phrase path above.
     if len(bits) == 1 and len(bits[0]) >= 6:
-        return bool(
-            re.search(rf"(?<![a-z0-9]){re.escape(bits[0])}(?![a-z0-9])", blob)
-        )
+        return token_in(bits[0], blob)
     return False
 
 
@@ -219,7 +209,7 @@ def hunter_find_email(
         email = normalize_email(data.get("email") or "")
         if not email or is_generic_inbox(email):
             return None
-        if _email_registered_domain(email) != _email_registered_domain(
+        if registered_domain(email) != registered_domain(
                 f"x@{domain}"):
             return None
         if not email_matches_person(email, name):

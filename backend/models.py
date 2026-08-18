@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 
+from contact_verify import canonical_linkedin_profile
+
 # Strict single-address pattern: no commas/semicolons/angle-brackets/whitespace,
 # so a stored address can never smuggle extra recipients into a To: header.
 EMAIL_ADDRESS_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+")
@@ -274,16 +276,7 @@ def validate_linkedin_profile_url(value: Optional[str]) -> Optional[str]:
     value = value.strip()
     if not value:
         return None
-    try:
-        parsed = urlparse(value)
-    except ValueError:
-        raise ValueError("LinkedIn URL is invalid")
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or host not in {"linkedin.com", "www.linkedin.com"}:
-        raise ValueError("Use a full https://www.linkedin.com/in/... profile URL")
-    if not parsed.path.lower().startswith("/in/"):
-        raise ValueError("LinkedIn URL must point to a member profile")
-    return f"https://www.linkedin.com{parsed.path.rstrip('/')}"
+    return canonical_linkedin_profile(value)
 
 
 class LinkedInDraftRequest(BaseModel):

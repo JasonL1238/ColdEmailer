@@ -1,10 +1,12 @@
 """
 Cold Emailer API — discovery, database, resumes, generation, sending, tracking.
 """
+import csv
 import io
 import json
 import os
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -170,6 +172,36 @@ repair_contact_email_kinds(db)
 resumes.migrate_legacy_resumes(_PROJECT_ROOT)
 _seed_profile_once()
 _reap_orphaned_jobs()
+
+
+def _find_or_create_company(name: str, *, source: str, **kwargs):
+    """Find a company by name, else create it.
+
+    Returns (company_row, created_company_id_or_None). The `before` snapshot is
+    load-bearing: `create_company` legitimately returns an *existing* row on a
+    domain or soft-key hit, so comparing ids is the only way to tell an insert
+    from a lookup — and only a real insert may be rolled back.
+    """
+    existing = db.find_company_by_name(name)
+    if existing:
+        return existing, None
+    before = {r["id"] for r in db.query("SELECT id FROM companies")}
+    company = db.create_company(name, source=source, **kwargs)
+    return company, (company["id"] if company["id"] not in before else None)
+
+
+def _drop_empty_company(company_id: Optional[str]) -> None:
+    """Roll back a company we created for a contact that never landed.
+
+    Atomic: only deletes while it is still empty, so it cannot race a
+    concurrent insert.
+    """
+    if company_id:
+        db.execute(
+            "DELETE FROM companies WHERE id=? AND NOT EXISTS "
+            "(SELECT 1 FROM contacts WHERE company_id=?)",
+            (company_id, company_id),
+        )
 
 
 def _parse_job(job: Optional[dict]) -> Optional[dict]:
@@ -448,24 +480,35 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
                 400, "That address is not one of this candidate's "
                      "discovered emails")
         if selected.get("origin") == "guessed":
-            # A guess becomes savable only when a mail server confirmed the
-            # mailbox exists AND the user takes responsibility for identity.
-            # Both are required: the server can say a mailbox is there, but
-            # only a human can say it is *this person's* — john.smith@gs.com
-            # may accept mail and belong to a different John Smith. Anything
-            # the finder can produce without a verification transport still
-            # lands on this refusal.
-            confirmed = (selected.get("smtp_status") == "deliverable"
+            # A guess becomes savable only when something outside this app
+            # backed it up AND the user takes responsibility for identity.
+            # There are two ways to earn the first half, and neither alone
+            # settles ownership — john.smith@gs.com may accept mail and belong
+            # to a different John Smith:
+            #   - a mail server confirmed the mailbox exists, or
+            #   - a public corpus shows the address in use under this person's
+            #     name (a signed commit, a profile, a published key).
+            # The second is the stronger evidence, because it carries a name
+            # and a mail server never does. Anything the finder can produce
+            # with neither still lands on the refusal below.
+            corroboration = selected.get("corroboration") or {}
+            mailbox_ok = selected.get("smtp_status") == "deliverable"
+            corroborated = corroboration.get("name_match") is True
+            confirmed = ((mailbox_ok or corroborated)
                          and selected.get("email_person_match"))
             if not confirmed:
                 raise HTTPException(
                     400, "Pattern guesses can't be saved as a sendable "
                          "address — they're recorded as a note instead.")
             if not payload.confirm_email_ownership:
+                evidence = ("a public source shows this address in use under "
+                            "this person's name"
+                            if corroborated else
+                            "a mail server confirmed this mailbox exists")
                 raise HTTPException(
-                    400, "confirm_email_ownership: a mail server confirmed "
-                         "this mailbox exists, but not that it belongs to "
-                         "this person. Confirm that, then approve again.")
+                    400, f"confirm_email_ownership: {evidence}, but that is "
+                         "not proof it belongs to this person. Confirm that, "
+                         "then approve again.")
         if is_generic_inbox(selected_email):
             raise HTTPException(
                 400, "That looks like a company inbox, not this person")
@@ -487,25 +530,11 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
         company_name = (
             payload.company_name or company_info.get("name") or "").strip()
         if company_name:
-            company = db.find_company_by_name(company_name)
-            if not company:
-                before = {r["id"] for r in db.query("SELECT id FROM companies")}
-                company = db.create_company(
-                    company_name,
-                    url=company_info.get("url"),
-                    domain=company_info.get("domain"),
-                    source="person_finder")
-                if company["id"] not in before:
-                    created_company_id = company["id"]
-
-    def cleanup_company():
-        if created_company_id:
-            # Atomic: only delete if still empty (mirrors the manual path).
-            db.execute(
-                "DELETE FROM companies WHERE id=? AND NOT EXISTS "
-                "(SELECT 1 FROM contacts WHERE company_id=?)",
-                (created_company_id, created_company_id),
-            )
+            company, created_company_id = _find_or_create_company(
+                company_name,
+                source="person_finder",
+                url=company_info.get("url"),
+                domain=company_info.get("domain"))
 
     best_evidence = (cand.get("evidence") or [{}])[0]
     # A confirmed guess is deliberately kept OUT of the boundary candidate.
@@ -541,7 +570,7 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
         # verified_channels stripped it: the local part doesn't contain the
         # person's name. Only the user can assert ownership of that mailbox.
         if not payload.confirm_email_ownership:
-            cleanup_company()
+            _drop_empty_company(created_company_id)
             raise HTTPException(
                 400, "confirm_email_ownership: that address doesn't contain "
                      "this person's name. Confirm you verified it belongs to "
@@ -549,14 +578,14 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
         confirmed_email = selected["email"]
 
     if not email0 and not linkedin0 and not confirmed_email:
-        cleanup_company()
+        _drop_empty_company(created_company_id)
         raise HTTPException(
             400, "Nothing verifiable to save — select an address or include "
                  "a verified LinkedIn profile.")
 
     existing = find_existing(db, email0 or confirmed_email or "", linkedin0)
     if existing:
-        cleanup_company()
+        _drop_empty_company(created_company_id)
         if (company and existing.get("company_id")
                 and existing["company_id"] != company["id"]):
             raise HTTPException(409, owned_elsewhere_note(
@@ -599,7 +628,7 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
             db, company=company, candidate=annotated, email=email0,
             linkedin_url=linkedin0, source="person_finder", notes=notes)
         if not attached.contact:
-            cleanup_company()
+            _drop_empty_company(created_company_id)
             raise HTTPException(
                 409, "; ".join(attached.conflicts)
                 or "Could not attach this contact")
@@ -642,13 +671,27 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
             verdict = verify_email(
                 confirmed_email, contact.get("name") or cand.get("name"),
                 check_mx=False)
-            if is_guess:
+            guess_corroboration = (selected or {}).get("corroboration") or {}
+            guess_mailbox_ok = (
+                (selected or {}).get("smtp_status") == "deliverable")
+            if is_guess and guess_mailbox_ok:
                 note_add = (
                     f"Pattern-inferred address. A mail server confirmed a "
                     f"mailbox exists here and rejected a random address on "
                     f"the same domain, so the mailbox is real — that does not "
                     f"prove it belongs to {cand.get('name')}. You confirmed "
                     f"ownership.")
+            elif is_guess:
+                # Reached only via the corroboration arm of the approval gate,
+                # so the note must describe that evidence rather than a mailbox
+                # probe that never ran.
+                where = ", ".join(guess_corroboration.get("sources") or [])
+                note_add = (
+                    f"Pattern-inferred address, corroborated by "
+                    f"{where or 'a public source'}: the address is in public "
+                    f"use under this person's name. That shows the address is "
+                    f"real, not that {cand.get('name')} still reads it. You "
+                    f"confirmed ownership.")
             else:
                 note_add = (
                     f"You confirmed this address belongs to "
@@ -663,8 +706,11 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
             })
             db.log_event("contact", contact["id"], "email_user_confirmed",
                          confirmed_email)
-            if is_guess:
+            if is_guess and guess_mailbox_ok:
                 db.log_event("contact", contact["id"], "mailbox_confirmed",
+                             confirmed_email)
+            elif is_guess:
+                db.log_event("contact", contact["id"], "address_corroborated",
                              confirmed_email)
             contact = db.get_contact(contact["id"])
 
@@ -720,6 +766,96 @@ async def get_company(company_id: str):
     return company
 
 
+def _merge_scraped_into_existing(existing_contact, candidate, *, addr,
+                                 linkedin_url, company, company_id) -> List[str]:
+    """Fold a freshly scraped candidate into a contact this company already has.
+
+    Returns the conflict notes to surface on the company. Deliberately NOT
+    shared with deep_research._persist_contacts: that path fills a blank
+    address with only a duplicate check, and has neither the sent-history
+    gate nor the generic->personal upgrade this one applies.
+    """
+    conflicts: List[str] = []
+    richer = {}
+    if not existing_contact.get("name") and candidate.get("name"):
+        richer["name"] = candidate["name"]
+    if not existing_contact.get("role") and candidate.get("role"):
+        richer["role"] = candidate["role"]
+    if not existing_contact.get("linkedin_url") and linkedin_url:
+        clash = db.find_contact_by_linkedin(linkedin_url)
+        if clash and clash.get("id") != existing_contact.get("id"):
+            other = (
+                db.get_company(clash.get("company_id"))
+                if clash.get("company_id") else None
+            )
+            other_name = (other or {}).get("name") or "another company"
+            detail = (
+                f"{linkedin_url} already belongs to {other_name} — "
+                f"not attached to {company['name']}"
+            )
+            conflicts.append(detail)
+            db.log_event(
+                "company", company_id, "contact_conflict", detail)
+        else:
+            richer["linkedin_url"] = linkedin_url
+            richer["linkedin_verified"] = int(
+                bool(candidate.get("linkedin_verified")))
+    new_notes = contact_notes(candidate)
+    if new_notes and not existing_contact.get("notes"):
+        richer["notes"] = new_notes
+    existing_email = (existing_contact.get("email") or "").strip()
+    # Mailbox-bound flags only apply to the stored address.
+    if addr:
+        same_mailbox = existing_email.lower() == addr.lower()
+        if not existing_email:
+            # Filling a blank is normally free, but the blank
+            # can be one the user just cleared on a contact
+            # with sent history — after which this would put a
+            # different person's address on that history.
+            if not _contact_has_been_emailed(existing_contact["id"]):
+                richer["email"] = addr
+                same_mailbox = True
+        elif (
+            not same_mailbox
+            and existing_contact.get("email_kind") == "generic"
+            and candidate.get("email_kind") == "personal"
+            and (candidate.get("email_verified")
+                 or candidate.get("email_person_match"))
+            and not _contact_has_been_emailed(existing_contact["id"])
+        ):
+            # Upgrade company inbox → verified person mailbox.
+            # Only while nothing has been sent yet: a follow-up
+            # is composed as "following up on my note", and
+            # moving the address underneath a sent history
+            # points that at someone who never got the note.
+            richer["email"] = addr
+            same_mailbox = True
+        if same_mailbox:
+            for flag in ("email_kind", "email_verified"):
+                if candidate.get(flag) is not None:
+                    val = candidate.get(flag)
+                    richer[flag] = (
+                        int(bool(val)) if flag != "email_kind"
+                        else val
+                    )
+    if (
+        linkedin_url
+        and candidate.get("linkedin_verified") is not None
+        and richer.get("linkedin_url")
+    ):
+        richer["linkedin_verified"] = int(
+            bool(candidate.get("linkedin_verified")))
+    if candidate.get("person_verified") is not None:
+        # Only promote when this update actually keeps verified
+        # person evidence on the row (email flags or attached LI).
+        if richer.get("email_verified") or richer.get("linkedin_url"):
+            richer["person_verified"] = int(
+                bool(candidate.get("person_verified")))
+    if richer:
+        db.update_contact(existing_contact["id"], richer)
+    return conflicts
+
+
 def _enrich_company_async(company_id: str, mode: str = "full"):
     company = db.get_company(company_id)
     if not company:
@@ -749,83 +885,10 @@ def _enrich_company_async(company_id: str, mode: str = "full"):
             existing_contact = find_existing(db, addr, linkedin_url)
             if existing_contact:
                 if existing_contact.get("company_id") == company_id:
-                    richer = {}
-                    if not existing_contact.get("name") and candidate.get("name"):
-                        richer["name"] = candidate["name"]
-                    if not existing_contact.get("role") and candidate.get("role"):
-                        richer["role"] = candidate["role"]
-                    if not existing_contact.get("linkedin_url") and linkedin_url:
-                        clash = db.find_contact_by_linkedin(linkedin_url)
-                        if clash and clash.get("id") != existing_contact.get("id"):
-                            other = (
-                                db.get_company(clash.get("company_id"))
-                                if clash.get("company_id") else None
-                            )
-                            other_name = (other or {}).get("name") or "another company"
-                            detail = (
-                                f"{linkedin_url} already belongs to {other_name} — "
-                                f"not attached to {company['name']}"
-                            )
-                            contact_conflicts.append(detail)
-                            db.log_event(
-                                "company", company_id, "contact_conflict", detail)
-                        else:
-                            richer["linkedin_url"] = linkedin_url
-                            richer["linkedin_verified"] = int(
-                                bool(candidate.get("linkedin_verified")))
-                    new_notes = contact_notes(candidate)
-                    if new_notes and not existing_contact.get("notes"):
-                        richer["notes"] = new_notes
-                    existing_email = (existing_contact.get("email") or "").strip()
-                    # Mailbox-bound flags only apply to the stored address.
-                    if addr:
-                        same_mailbox = existing_email.lower() == addr.lower()
-                        if not existing_email:
-                            # Filling a blank is normally free, but the blank
-                            # can be one the user just cleared on a contact
-                            # with sent history — after which this would put a
-                            # different person's address on that history.
-                            if not _contact_has_been_emailed(existing_contact["id"]):
-                                richer["email"] = addr
-                                same_mailbox = True
-                        elif (
-                            not same_mailbox
-                            and existing_contact.get("email_kind") == "generic"
-                            and candidate.get("email_kind") == "personal"
-                            and (candidate.get("email_verified")
-                                 or candidate.get("email_person_match"))
-                            and not _contact_has_been_emailed(existing_contact["id"])
-                        ):
-                            # Upgrade company inbox → verified person mailbox.
-                            # Only while nothing has been sent yet: a follow-up
-                            # is composed as "following up on my note", and
-                            # moving the address underneath a sent history
-                            # points that at someone who never got the note.
-                            richer["email"] = addr
-                            same_mailbox = True
-                        if same_mailbox:
-                            for flag in ("email_kind", "email_verified"):
-                                if candidate.get(flag) is not None:
-                                    val = candidate.get(flag)
-                                    richer[flag] = (
-                                        int(bool(val)) if flag != "email_kind"
-                                        else val
-                                    )
-                    if (
-                        linkedin_url
-                        and candidate.get("linkedin_verified") is not None
-                        and richer.get("linkedin_url")
-                    ):
-                        richer["linkedin_verified"] = int(
-                            bool(candidate.get("linkedin_verified")))
-                    if candidate.get("person_verified") is not None:
-                        # Only promote when this update actually keeps verified
-                        # person evidence on the row (email flags or attached LI).
-                        if richer.get("email_verified") or richer.get("linkedin_url"):
-                            richer["person_verified"] = int(
-                                bool(candidate.get("person_verified")))
-                    if richer:
-                        db.update_contact(existing_contact["id"], richer)
+                    contact_conflicts.extend(_merge_scraped_into_existing(
+                        existing_contact, candidate, addr=addr,
+                        linkedin_url=linkedin_url, company=company,
+                        company_id=company_id))
                 else:
                     detail = owned_elsewhere_note(
                         db, existing_contact.get("company_id"),
@@ -840,12 +903,7 @@ def _enrich_company_async(company_id: str, mode: str = "full"):
             contact_conflicts.extend(attached.conflicts)
             if attached.is_new_outreach:
                 contacts_added += 1
-        if contact_conflicts:
-            db.update_company(company_id, {
-                "scrape_warnings": contact_conflicts,
-            })
-        else:
-            db.update_company(company_id, {"scrape_warnings": []})
+        db.update_company(company_id, {"scrape_warnings": contact_conflicts})
         # If every outreach contact conflicted away, downgrade scraped.
         status = updates["scrape_status"]
         if status == "scraped":
@@ -1012,17 +1070,9 @@ async def create_contact(payload: ContactCreate):
     if company_id and not db.get_company(company_id):
         raise HTTPException(404, "That company no longer exists")
     if not company_id and payload.company_name and payload.company_name.strip():
-        existing = db.find_company_by_name(payload.company_name)
-        if existing:
-            company_id = existing["id"]
-        else:
-            before = {
-                r["id"] for r in db.query("SELECT id FROM companies")
-            }
-            company_id = db.create_company(
-                payload.company_name, source="manual")["id"]
-            if company_id not in before:
-                created_company_id = company_id
+        company, created_company_id = _find_or_create_company(
+            payload.company_name, source="manual")
+        company_id = company["id"]
     contact = db.create_contact(
         name=cleaned["name"], email=email, role=cleaned["role"],
         linkedin_url=linkedin_url,
@@ -1033,13 +1083,7 @@ async def create_contact(payload: ContactCreate):
         person_verified=cleaned["person_verified"],
     )
     if not contact.get("_inserted", True):
-        if created_company_id:
-            # Atomic: only delete if still empty (avoids racing a concurrent insert).
-            db.execute(
-                "DELETE FROM companies WHERE id=? AND NOT EXISTS "
-                "(SELECT 1 FROM contacts WHERE company_id=?)",
-                (created_company_id, created_company_id),
-            )
+        _drop_empty_company(created_company_id)
         raise HTTPException(
             409, "That contact already exists (possible concurrent create)")
     row = db.get_contact(contact["id"])
@@ -1244,13 +1288,12 @@ def _decode_csv(raw: bytes) -> str:
 @app.post("/api/contacts/import")
 async def import_contacts_csv(file: UploadFile = File(...)):
     """CSV import. Requires name/company plus email and/or linkedin_url."""
-    import csv as _csv
     try:
         raw = await file.read()
         if len(raw) > MAX_CSV_BYTES:
             raise ValueError(f"CSV is too large (max {MAX_CSV_BYTES // (1024 * 1024)} MB)")
         text = _decode_csv(raw)
-        reader = _csv.DictReader(io.StringIO(text))
+        reader = csv.DictReader(io.StringIO(text))
         if not reader.fieldnames:
             raise ValueError("CSV has no header row")
         cols = {c.strip().lower(): c for c in reader.fieldnames}
@@ -1309,11 +1352,8 @@ async def import_contacts_csv(file: UploadFile = File(...)):
                     label = email or linkedin_url or name or "row"
                     invalid_samples.append(f"{label} ({err})")
                 continue
-            if cleaned.get("ingest_warning"):
-                # Only count warnings for rows we actually store.
-                pending_warning = True
-            else:
-                pending_warning = False
+            # Only count warnings for rows we actually store.
+            pending_warning = bool(cleaned.get("ingest_warning"))
             email = cleaned["email"]
             linkedin_url = cleaned["linkedin_url"]
             name = cleaned["name"]
@@ -1325,17 +1365,9 @@ async def import_contacts_csv(file: UploadFile = File(...)):
             company_id = None
             created_company_id = None
             if company_name:
-                existing = db.find_company_by_name(company_name)
-                if existing:
-                    company_id = existing["id"]
-                else:
-                    before = {
-                        r["id"] for r in db.query("SELECT id FROM companies")
-                    }
-                    company_id = db.create_company(
-                        company_name, source="csv")["id"]
-                    if company_id not in before:
-                        created_company_id = company_id
+                company, created_company_id = _find_or_create_company(
+                    company_name, source="csv")
+                company_id = company["id"]
             created = db.create_contact(
                 name=name, email=email, company_id=company_id,
                 linkedin_url=linkedin_url,
@@ -1346,12 +1378,7 @@ async def import_contacts_csv(file: UploadFile = File(...)):
                 person_verified=cleaned["person_verified"],
             )
             if not created.get("_inserted", True):
-                if created_company_id:
-                    db.execute(
-                        "DELETE FROM companies WHERE id=? AND NOT EXISTS "
-                        "(SELECT 1 FROM contacts WHERE company_id=?)",
-                        (created_company_id, created_company_id),
-                    )
+                _drop_empty_company(created_company_id)
                 duplicates += 1
                 continue
             if pending_warning:
@@ -1380,10 +1407,9 @@ def _csv_safe(value) -> str:
 
 @app.get("/api/contacts/export")
 async def export_contacts_csv():
-    import csv as _csv
     contacts = db.list_contacts()
     output = io.StringIO()
-    writer = _csv.writer(output)
+    writer = csv.writer(output)
     writer.writerow([
         "name", "email", "linkedin_url", "company", "role", "affinity",
         "source_url", "status", "source", "created_at",
@@ -1587,6 +1613,17 @@ def _already_delivered(email: Optional[dict]) -> bool:
                 or str(email.get("sent_at") or "").strip())
 
 
+def _refusal(email_id: str, error: str, **extra) -> Dict[str, Any]:
+    """One refusal entry for a send batch.
+
+    `retryable` is deliberately NOT defaulted: Emails.jsx buckets on
+    `retryable === false` vs `!== false`, so materialising it on the two
+    entries that omit it today would move rows between the "skipped" and
+    "refused" buckets.
+    """
+    return {"email_id": email_id, "success": False, **extra, "error": error}
+
+
 def _send_attempt_pending(email: Optional[dict]) -> bool:
     """True when this row was handed to Gmail and we never heard the verdict.
 
@@ -1743,16 +1780,15 @@ def _bounced_for_current_address(email: Dict, contact: Optional[Dict]) -> bool:
 def _wait_for_generation_slot(job_id: str, seconds: float) -> bool:
     """Sleep out a per-minute window in small steps so Stop still works.
     Returns True when the job was cancelled while waiting."""
-    import time as _t
-    deadline = _t.monotonic() + max(0.0, seconds)
+    deadline = time.monotonic() + max(0.0, seconds)
     while True:
-        remaining = deadline - _t.monotonic()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         job = db.get_job(job_id)
         if not job or job["status"] == "cancelled":
             return True
-        _t.sleep(min(0.5, remaining))
+        time.sleep(min(0.5, remaining))
     job = db.get_job(job_id)
     return not job or job["status"] == "cancelled"
 
@@ -2262,30 +2298,28 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                 break
             email = db.get_email(email_id)
             if not email or email["status"] not in ("draft", "approved"):
-                results.append({"email_id": email_id, "success": False,
-                                "retryable": False, "error": "not sendable"})
+                results.append(_refusal(email_id, "not sendable", retryable=False))
                 continue
             if _already_delivered(email):
                 # Re-checked here and not only in the handler: a second send of
                 # this row would also overwrite gmail_message_id and orphan the
                 # thread that reply tracking follows.
-                results.append({"email_id": email_id, "success": False,
-                                "retryable": False, "error": "already sent"})
+                results.append(_refusal(email_id, "already sent", retryable=False))
                 failed += 1
                 continue
             recipient = str(email.get("contact_email") or "").strip().lower()
             if not email.get("is_follow_up") and recipient in first_contact_recipients:
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": False,
-                    "error": "a first-contact email to this recipient already went "
-                             "out in this batch"})
+                results.append(_refusal(
+                    email_id,
+                    "a first-contact email to this recipient already went out "
+                    "in this batch", retryable=False))
                 failed += 1
                 continue
             if email.get("is_follow_up") and recipient in follow_up_recipients:
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": False,
-                    "error": "a follow-up to this recipient already went out in "
-                             "this batch"})
+                results.append(_refusal(
+                    email_id,
+                    "a follow-up to this recipient already went out in this "
+                    "batch", retryable=False))
                 failed += 1
                 continue
             if _send_attempt_pending(email):
@@ -2312,19 +2346,18 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                     })
                     db.log_event("email", email_id, "send_reconciled",
                                  f"found in Gmail Sent → {email.get('contact_email')}")
-                    results.append({
-                        "email_id": email_id, "success": False, "retryable": False,
-                        "error": "already sent — the earlier attempt did land, and "
-                                 "it is now recorded as sent"})
+                    results.append(_refusal(
+                        email_id,
+                        "already sent — the earlier attempt did land, and it is "
+                        "now recorded as sent", retryable=False))
                     failed += 1
                     continue
                 if not confirm_resend:
-                    results.append({
-                        "email_id": email_id, "success": False,
-                        "delivery_unknown": True,
-                        "error": "an earlier attempt reached Gmail but never "
-                                 "confirmed, and it is not in your Sent folder. "
-                                 "Check Gmail before retrying."})
+                    results.append(_refusal(
+                        email_id,
+                        "an earlier attempt reached Gmail but never confirmed, "
+                        "and it is not in your Sent folder. Check Gmail before "
+                        "retrying.", delivery_unknown=True))
                     failed += 1
                     continue
             can, err = rate_limiter.can_send_email()
@@ -2333,8 +2366,7 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                 # so the results screen cannot report a batch as fully sent
                 # while recipients were silently never contacted.
                 for remaining_id in email_ids[i:]:
-                    results.append({"email_id": remaining_id, "success": False,
-                                    "error": err})
+                    results.append(_refusal(remaining_id, err))
                     failed += 1
                 break
             db.update_job(job_id, stage=f"Sending to {email.get('contact_email')}",
@@ -2373,12 +2405,12 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                     "SELECT 1 FROM emails WHERE contact_id=? AND has_response=1 "
                     "AND response_verified_at IS NOT NULL LIMIT 1",
                     (email["contact_id"],)):
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": False,
-                    "error": f"{recipient} replied since this follow-up was "
-                             f"drafted, so it would ask someone who already "
-                             f"answered whether they are still interested. "
-                             f"Reply in Gmail instead."})
+                results.append(_refusal(
+                    email_id,
+                    f"{recipient} replied since this follow-up was drafted, so "
+                    f"it would ask someone who already answered whether they "
+                    f"are still interested. Reply in Gmail instead.",
+                    retryable=False))
                 failed += 1
                 continue
             # The do-not-contact list, asked again here rather than trusted
@@ -2404,36 +2436,35 @@ def _send_batch_job(job_id: str, email_ids, resume_override: Optional[str],
                 # actually happened. Reporting this as "they are on your list"
                 # sent the user to Settings to remove an entry that does not
                 # exist, and marked a transient failure as permanent.
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": True,
-                    "error": f"Could not read the do-not-contact list, so "
-                             f"{recipient} was not written to: {e}"})
+                results.append(_refusal(
+                    email_id,
+                    f"Could not read the do-not-contact list, so {recipient} "
+                    f"was not written to: {e}", retryable=True))
                 failed += 1
                 continue
             if blocked:
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": False,
-                    "error": suppression.blocked_reason(blocked, recipient)})
+                results.append(_refusal(
+                    email_id, suppression.blocked_reason(blocked, recipient),
+                    retryable=False))
                 failed += 1
                 continue
             if _bounced_for_current_address(email, contact_row):
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": False,
-                    "error": f"{recipient} bounced previously — mail to it is "
-                             f"undeliverable. Add a different address for this "
-                             f"person and it will send."})
+                results.append(_refusal(
+                    email_id,
+                    f"{recipient} bounced previously — mail to it is "
+                    f"undeliverable. Add a different address for this person "
+                    f"and it will send.", retryable=False))
                 failed += 1
                 continue
             if not _domain_accepts_mail(recipient, mx_cache):
-                results.append({
-                    "email_id": email_id, "success": False, "retryable": False,
-                    "error": f"{recipient} has no mail server — the domain does "
-                             f"not accept email, so this would bounce."})
+                results.append(_refusal(
+                    email_id,
+                    f"{recipient} has no mail server — the domain does not "
+                    f"accept email, so this would bounce.", retryable=False))
                 failed += 1
                 continue
             if i > 0:
-                import time as _t
-                _t.sleep(email_sender.send_delay)
+                time.sleep(email_sender.send_delay)
             # Write the intent *before* the network call. Between "Gmail accepted
             # the POST" and the update below the row is otherwise an ordinary
             # clean draft, so anything that kills the process in that window
@@ -2758,13 +2789,12 @@ def scheduled_send_sweep() -> Optional[str]:
 
 
 def _scheduler_loop():
-    import time as _t
     while True:
         try:
             scheduled_send_sweep()
         except Exception as e:                       # never let the loop die
             print(f"[scheduler] sweep failed: {e}")
-        _t.sleep(_SCHEDULER_TICK_SECONDS)
+        time.sleep(_SCHEDULER_TICK_SECONDS)
 
 
 @app.get("/api/send-window")

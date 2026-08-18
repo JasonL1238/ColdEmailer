@@ -1,19 +1,7 @@
 """The contact boundary: inbound sanitization, and attaching scraped people."""
-import os
-import tempfile
-
-import pytest
-
 from contact_ingest import (attach_candidate, find_existing,
                             owned_elsewhere_note, sanitize_inbound_contact,
                             verified_channels)
-from db import Database
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 class TestSanitizeInbound:
@@ -266,3 +254,26 @@ class TestLookupHelpers:
         note = owned_elsewhere_note(db, None, "jane@newco.com", "NewCo")
         assert note == ("jane@newco.com already belongs to another company — "
                         "not reassigned to NewCo")
+
+
+def test_role_inboxes_never_become_a_person_named_after_the_inbox():
+    """One generic-inbox vocabulary, `contact_verify.GENERIC_LOCALS`.
+
+    contact_ingest used to carry its own 19-word copy that shadowed the
+    canonical 46-word one and did not split on separators, so compound role
+    addresses were named as if they were people: `sales.support@acme.com`
+    produced a contact called "Sales Support", which then looked like an
+    identified human everywhere downstream.
+    """
+    from contact_ingest import guess_name_from_email
+
+    for role_local in ("people.ops", "hr.team", "admin.office",
+                       "sales.support", "info.desk", "billing.accounts",
+                       "press.media", "careers", "hello"):
+        assert guess_name_from_email(role_local) == "", role_local
+
+    # Real names are untouched, including the ones that merely start with a
+    # role-ish token.
+    assert guess_name_from_email("jane.doe") == "Jane Doe"
+    assert guess_name_from_email("john.smith") == "John Smith"
+    assert guess_name_from_email("mary.jane.watson") == "Mary Jane Watson"

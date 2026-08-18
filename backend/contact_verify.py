@@ -282,6 +282,26 @@ def verify_email(email: str, name: Optional[str] = None,
     return result
 
 
+def canonical_linkedin_profile(value: Optional[str]) -> str:
+    """Canonical `https://www.linkedin.com/in/<slug>`, or ValueError.
+
+    Raising rather than returning None is what lets both callers keep their
+    existing behaviour from one implementation: `models` surfaces the message
+    to the user as a 422, and `enrichment` catches it and returns None because
+    a scraped page is allowed to contain links that are not profiles.
+    """
+    try:
+        parsed = urlparse((value or "").strip())
+    except ValueError:
+        raise ValueError("LinkedIn URL is invalid")
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host not in {"linkedin.com", "www.linkedin.com"}:
+        raise ValueError("Use a full https://www.linkedin.com/in/... profile URL")
+    if not parsed.path.lower().startswith("/in/"):
+        raise ValueError("LinkedIn URL must point to a member profile")
+    return f"https://www.linkedin.com{parsed.path.rstrip('/')}"
+
+
 def linkedin_slug(url: Optional[str]) -> Optional[str]:
     try:
         parsed = urlparse((url or "").strip())

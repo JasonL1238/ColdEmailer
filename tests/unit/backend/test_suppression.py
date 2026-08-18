@@ -124,6 +124,32 @@ class TestNormalize:
                         holes.append(address)
         assert not holes, f"sendable but unblockable: {holes[:5]}"
 
+    def test_ingest_and_send_agree_on_what_an_address_is(self):
+        """The strict single-recipient pattern exists in three modules.
+
+        `models.EMAIL_ADDRESS_RE` guards ingest, `email_sender._RECIPIENT_RE`
+        guards the send path, and `suppression._SENDABLE` guards the block
+        list — each deliberately re-stated rather than imported across the send
+        boundary. Only two of the three were held together by a test, so the
+        ingest copy could drift and start accepting an address the sender
+        refuses (or worse, the reverse). Same sweep as above, both directions.
+        """
+        import models
+        from email_sender import _RECIPIENT_RE
+        alphabet = "ad0._%+-"
+        domains = ("a.co", "-a.co", "a-.co", "a.b-c.co", "--.co",
+                   "sub.acme.co.uk")
+        disagreements = []
+        for size in range(1, 4):
+            for local in itertools.product(alphabet, repeat=size):
+                for domain in domains:
+                    address = "".join(local) + "@" + domain
+                    if bool(_RECIPIENT_RE.fullmatch(address)) != bool(
+                            models.EMAIL_ADDRESS_RE.fullmatch(address)):
+                        disagreements.append(address)
+        assert not disagreements, (
+            f"ingest and send disagree on: {disagreements[:5]}")
+
     def test_stripping_never_widens_an_address_into_a_domain(self):
         """`.@acme.com` is absurd but sendable. Stripping punctuation
         unconditionally turned it into a block on the whole of acme.com —

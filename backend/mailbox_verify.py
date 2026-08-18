@@ -29,13 +29,13 @@ from __future__ import annotations
 
 import os
 import secrets
-import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, Optional, Protocol, Tuple
 
 from contact_verify import normalize_email
+from ttl_cache import cache_clear, cache_get as _cache_get, cache_put as _cache_put
 
 # Only these ever reach a socket. DATA/BDAT are absent by construction, not by
 # review: the transport raises on anything outside this set, and a test asserts
@@ -49,7 +49,6 @@ _RESULT_TTL = 900.0             # mailboxes are created and deleted
 _RESULT_TTL_UNKNOWN = 60.0
 _RESULT_MAX = 2048
 
-_LOCK = threading.Lock()
 _ACCEPT_ALL_CACHE: Dict[str, Tuple[float, Optional[bool]]] = {}
 _RESULT_CACHE: Dict[str, Tuple[float, "MailboxResult"]] = {}
 
@@ -96,30 +95,8 @@ def _canary(domain: str) -> str:
     return f"zz-probe-{secrets.token_hex(16)}@{domain}"
 
 
-def _cache_get(cache: Dict, key: str):
-    with _LOCK:
-        entry = cache.get(key)
-        if not entry:
-            return None
-        expires, value = entry
-        if time.time() >= expires:
-            cache.pop(key, None)
-            return None
-        return value
-
-
-def _cache_put(cache: Dict, key: str, value, ttl: float, cap: int) -> None:
-    with _LOCK:
-        if len(cache) >= cap:
-            # Dropping the cache only ever costs re-work, never an answer.
-            cache.clear()
-        cache[key] = (time.time() + ttl, value)
-
-
 def clear_mailbox_cache() -> None:
-    with _LOCK:
-        _ACCEPT_ALL_CACHE.clear()
-        _RESULT_CACHE.clear()
+    cache_clear(_ACCEPT_ALL_CACHE, _RESULT_CACHE)
 
 
 def _result(email, verdict, reason, **kw) -> MailboxResult:

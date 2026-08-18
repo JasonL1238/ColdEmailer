@@ -14,8 +14,10 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from contact_enrich import enrich_contacts_outreach
+from domain_names import name_tokens as _name_tokens, registered_domain
 from contact_verify import (
     annotate_contact,
+    canonical_linkedin_profile,
     is_generic_inbox,
     linkedin_matches_person,
     name_tokens,
@@ -135,35 +137,8 @@ _LOCAL_PRIORITY = [
 ]
 
 
-def registered_domain(url_or_domain: str) -> Optional[str]:
-    """'https://www.foo.co.uk/x' -> 'foo.co.uk' (best effort, no PSL dep)."""
-    if not url_or_domain:
-        return None
-    s = url_or_domain.strip().lower()
-    if "//" in s:
-        s = urlparse(s).netloc or s.split("//", 1)[-1].split("/", 1)[0]
-    s = s.split("@")[-1].split(":")[0]
-    if s.startswith("www."):
-        s = s[4:]
-    parts = [p for p in s.split(".") if p]
-    if len(parts) < 2:
-        return s or None
-    # Handle common two-part TLDs
-    if len(parts) >= 3 and parts[-2] in {"co", "com", "org", "net", "ac", "gov"} \
-            and len(parts[-1]) == 2:
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:])
 
 
-# Words that carry no identifying signal when matching a name to a domain.
-_NAME_STOPWORDS = {"inc", "llc", "ltd", "corp", "corporation", "company", "co",
-                   "the", "group", "labs", "lab", "technologies", "technology",
-                   "tech", "systems", "solutions", "software", "ai", "io"}
-
-
-def _name_tokens(name: str) -> List[str]:
-    tokens = re.split(r"[^a-z0-9]+", (name or "").lower())
-    return [t for t in tokens if t and t not in _NAME_STOPWORDS]
 
 
 def domain_matches_name(company_name: str, domain: Optional[str]) -> bool:
@@ -495,16 +470,9 @@ def _linkedin_profile_url(value: str, person_name: Optional[str] = None) -> Opti
     we never store a same-first-name stranger's profile.
     """
     try:
-        parsed = urlparse((value or "").strip())
+        url = canonical_linkedin_profile(value)
     except ValueError:
         return None
-    if parsed.scheme != "https":
-        return None
-    if (parsed.hostname or "").lower() not in {"linkedin.com", "www.linkedin.com"}:
-        return None
-    if not parsed.path.lower().startswith("/in/"):
-        return None
-    url = f"https://www.linkedin.com{parsed.path.rstrip('/')}"
     if person_name and not linkedin_matches_person(url, person_name):
         return None
     return url
@@ -651,11 +619,7 @@ def extract_contact_candidates(
             name = _infer_name(context, local)
             # Track whether the displayed name was invented from the local-part
             # so verification cannot circularly "confirm" that address.
-            name_from_email = False
-            if name:
-                from_ctx = _infer_name(context, "")
-                if not from_ctx:
-                    name_from_email = True
+            name_from_email = bool(name) and not _infer_name(context, "")
             candidate = {
                 "email": addr,
                 "linkedin_url": None,
@@ -1020,11 +984,10 @@ class EnrichmentService:
         obscure company is routinely an unrelated site, and accepting it
         fabricates a company profile that then flows into real emails.
         """
-        skip = ["linkedin.com", "facebook.com", "twitter.com", "x.com", "instagram.com",
-                "indeed.com", "glassdoor.com", "crunchbase.com", "wikipedia.org",
-                "bloomberg.com", "yelp.com", "youtube.com", "github.com", "medium.com",
-                "angel.co", "wellfound.com", "pitchbook.com", "zoominfo.com",
-                "apollo.io", "owler.com", "cbinsights.com", "reddit.com"]
+        # No local skip list: every entry it held is in
+        # discovery.AGGREGATOR_DOMAINS, which is_junk_site() already rejects.
+        # Worse, it matched by substring, so "x.com" silently discarded
+        # netflix.com, matrix.com, equinix.com and citrix.com.
         try:
             from ddg_search import ddg_text_search
             from discovery import is_junk_site
@@ -1032,7 +995,6 @@ class EnrichmentService:
             usable = [
                 (r.get("href") or r.get("url") or "") for r in results
                 if (r.get("href") or r.get("url"))
-                and not any(s in (r.get("href") or r.get("url") or "").lower() for s in skip)
                 and not is_junk_site(r.get("href") or r.get("url"))
                 and is_safe_public_url(r.get("href") or r.get("url"))
             ]
@@ -1226,8 +1188,6 @@ class EnrichmentService:
                         # independent multi-token name (not "Kim" for kim@).
                         if len(name_tokens(grounded_name)) >= 2:
                             contact["name_from_email"] = False
-                        elif contact.get("name_from_email"):
-                            contact["name_from_email"] = True
                     if grounded.get("role"):
                         contact["role"] = grounded["role"]
                     if grounded.get("source_url"):
@@ -1391,11 +1351,9 @@ class EnrichmentService:
                     if not queue:
                         # In fast mode, stop guessing paths after a couple of
                         # 404s — homepage may already be enough.
-                        if fast and (
+                        if not (fast and (
                                 fallback_failures >= max_fast_fallback_failures
-                                or about_page_present(page_records)):
-                            pass
-                        else:
+                                or about_page_present(page_records))):
                             seed_from_sitemap()
                             for fallback in fallback_pages:
                                 key = fallback.rstrip("/")

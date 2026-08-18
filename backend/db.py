@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from domain_names import company_name_key as _company_name_key
 from send_window import SEND_WINDOW_DEFAULT, normalize_send_window
 
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -428,22 +429,8 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
-_COMPANY_NAME_STOP = {
-    "inc", "llc", "ltd", "corp", "corporation", "company", "co", "the",
-    "group", "labs", "lab", "technologies", "technology", "tech", "systems",
-    "solutions", "software", "ai", "io",
-}
-
-
-def company_name_key(name: Optional[str]) -> Optional[str]:
-    """Normalize a company name for duplicate detection ('Acme Inc' == 'acme')."""
-    if not name:
-        return None
-    tokens = [
-        t for t in re.split(r"[^a-z0-9]+", name.lower())
-        if t and t not in _COMPANY_NAME_STOP
-    ]
-    return "".join(tokens) or None
+# Re-exported: `db.company_name_key` is the name the rest of the app knows.
+company_name_key = _company_name_key
 
 
 def normalize_linkedin_url(url: Optional[str]) -> Optional[str]:
@@ -868,21 +855,13 @@ class Database:
             existing = self.find_company_by_domain(domain)
             if existing:
                 return existing
-        # Exact name + same domain (or both missing domain) only.
+        # Exact name counts as the same company only when the domains agree
+        # (both set and equal, or both missing). Same display name with a
+        # different domain → distinct companies; the soft-key block below is
+        # what decides the one-has-a-domain case.
         existing = self.find_company_by_name(name)
-        if existing:
-            existing_domain = (existing.get("domain") or "").lower() or None
-            if existing_domain == domain:
-                return existing
-            # Same display name, different domain → distinct companies
-            if domain and existing_domain and existing_domain != domain:
-                existing = None
-            elif not domain and not existing_domain:
-                return existing
-            else:
-                # One has domain, one doesn't — prefer treating as same only when
-                # soft keys match AND we're not inventing a second domain later.
-                existing = None
+        if existing and ((existing.get("domain") or "").lower() or None) == domain:
+            return existing
         if name_key:
             soft = self.find_company_by_name_key(name_key)
             # Soft-key collision only counts as a duplicate when domains match.

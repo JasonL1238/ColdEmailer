@@ -127,12 +127,6 @@ def sanitize_inbound_contact(
 # dropped it. One implementation, three callers.
 # --------------------------------------------------------------------------
 
-GENERIC_LOCALS = {
-    "hello", "hi", "hey", "info", "contact", "team", "careers", "jobs",
-    "recruiting", "talent", "press", "sales", "support", "admin", "office",
-    "founders", "founder", "ceo", "general",
-}
-
 ROLE_BY_LOCAL = {
     "careers": "Careers inbox", "jobs": "Careers inbox",
     "recruiting": "Recruiting", "talent": "Recruiting",
@@ -144,8 +138,14 @@ ROLE_BY_LOCAL = {
 
 
 def guess_name_from_email(local: str) -> str:
-    """'jane.doe' -> 'Jane Doe'; generic or unparseable locals -> ''."""
-    if local.lower() in GENERIC_LOCALS:
+    """'jane.doe' -> 'Jane Doe'; generic or unparseable locals -> ''.
+
+    Role inboxes are decided by `contact_verify.is_generic_inbox`, which is the
+    one vocabulary. A shorter local copy used to shadow it, so compound role
+    addresses slipped through and were named as if they were people —
+    `sales.support@` became a contact called "Sales Support".
+    """
+    if is_generic_inbox(local):
         return ""
     words = [p for p in re.split(r"[._-]", local) if p.isalpha() and len(p) > 1]
     if len(words) >= 2:

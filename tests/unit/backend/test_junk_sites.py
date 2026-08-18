@@ -47,3 +47,20 @@ class TestIsJunkSite:
     def test_short_hostnames_are_not_content_farms(self):
         """Guard against the length heuristic eating legitimate long-ish names."""
         assert is_junk_site("https://cloudflarestatus.com") is False
+
+
+def test_find_website_keeps_domains_that_merely_contain_an_aggregator_name():
+    """`x.com` used to be substring-matched, so netflix.com was discarded.
+
+    find_website now filters through discovery.is_junk_site() alone, which
+    compares registered domains rather than substrings.
+    """
+    from discovery import is_junk_site
+
+    for real in ("https://www.netflix.com", "https://matrix.com",
+                 "https://equinix.com", "https://citrix.com",
+                 "https://phoenix.com"):
+        assert is_junk_site(real) is False, real
+    for aggregator in ("https://x.com/acme", "https://www.linkedin.com/company/acme",
+                       "https://github.com/acme"):
+        assert is_junk_site(aggregator) is True, aggregator
