@@ -16,9 +16,7 @@ vi.mock('../../src/api', () => ({
   pipelineAPI: { get: getSpy },
 }))
 vi.mock('../../src/App', () => ({ useApp: () => ({ navigate: navSpy }) }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
-}))
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
 import Pipeline from '../../src/pages/Pipeline'
 

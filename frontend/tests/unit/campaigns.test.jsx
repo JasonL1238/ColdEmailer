@@ -18,11 +18,10 @@ vi.mock('../../src/api', () => ({
   campaignsAPI: { list: listSpy, update: updateSpy },
 }))
 vi.mock('../../src/App', () => ({ useApp: () => ({ navigate: navSpy }) }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
-}))
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
-import Campaigns, { rateLabel } from '../../src/pages/Campaigns'
+import Campaigns from '../../src/pages/Campaigns'
+import { rateLabel } from '../../src/ui'
 
 const campaign = (over = {}) => ({
   id: 'c1', name: 'fintech NYC', query: 'seed fintech in NYC',

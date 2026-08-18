@@ -13,9 +13,7 @@ vi.mock('../../src/api', () => ({
   errMessage: (e, f) => e?.response?.data?.detail || f || 'err',
   emailsAPI: { thread: threadSpy },
 }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
-}))
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
 import { ThreadPane } from '../../src/pages/Emails'
 

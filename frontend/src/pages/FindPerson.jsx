@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import toast from 'react-hot-toast'
 import {
   Building2, ExternalLink, History, UserSearch, X,
 } from 'lucide-react'
 import { personFinderAPI, errMessage } from '../api'
 import {
-  Button, Chip, EmptyState, ProgressBar, Spinner, timeAgo,
+  Button, Chip, EmptyState, ProgressBar, Spinner, timeAgo, useRunPolling,
 } from '../ui'
 import { useApp } from '../App'
 
@@ -44,6 +44,42 @@ const SMTP_META = {
     title: 'No usable answer — greylisting, a timeout, or no verification transport available.' },
 }
 
+// Corroboration answers the opposite half from a mailbox check: not "does mail
+// land here" but "has a real person ever used this address, and were they this
+// person". A miss means nothing — most people appear in none of these corpora.
+const CORROBORATION_SOURCE = {
+  github_commit: 'a public git commit',
+  github_profile: 'a public GitHub profile',
+  gravatar: 'a Gravatar profile',
+  pgp_verified: 'a PGP key they confirmed by email',
+  pgp_keyserver: 'a published PGP key',
+  mailing_list: 'a public mailing-list archive',
+}
+
+const corroborationChip = (c) => {
+  if (!c || !c.found) return null
+  const where = (c.sources || [])
+    .map((s) => CORROBORATION_SOURCE[s] || s).join(', ')
+  const who = (c.names || []).join(', ')
+  if (c.name_match === true) {
+    return { tone: 'green', label: 'In public use under this name',
+      title: `This exact address appears in ${where}${who ? `, under the name ${who}` : ''}. That means the address is real and someone with this name used it — not that they still read it.` }
+  }
+  if (c.name_match === false) {
+    return { tone: 'red', label: 'Real, but someone else’s',
+      title: `This address is real — it appears in ${where} — but under the name ${who}, not this person. Very likely a namesake.` }
+  }
+  return { tone: 'amber', label: 'Address is real — owner unknown',
+    title: `This exact address appears in ${where}, so it is a real address. That source gave no name, so it does not say whose it is.` }
+}
+
+// A guess earns selectability from either kind of evidence: a mail server
+// confirming the mailbox, or a corpus showing the address in use under this
+// person's name. This mirrors the approval gate in main.py — change both.
+const guessConfirmed = (entry) => (
+  entry.smtp_status === 'deliverable'
+  || entry.corroboration?.name_match === true)
+
 const DOMAIN_META = {
   company: { tone: 'gray', label: 'Company' },
   personal: { tone: 'violet', label: 'Personal' },
@@ -54,7 +90,8 @@ function EmailRow({ entry, selected, disabled, onSelect }) {
   const origin = ORIGIN_META[entry.origin] || ORIGIN_META.found
   const domain = DOMAIN_META[entry.domain_kind] || DOMAIN_META.other
   const guessed = entry.origin === 'guessed'
-  const smtpOk = entry.smtp_status === 'deliverable'
+  const smtpOk = guessConfirmed(entry)
+  const corroboration = corroborationChip(entry.corroboration)
   return (
     <label
       className="row"
@@ -85,6 +122,11 @@ function EmailRow({ entry, selected, disabled, onSelect }) {
           {SMTP_META[entry.smtp_status].label}
         </Chip>
       )}
+      {corroboration && (
+        <Chip tone={corroboration.tone} title={corroboration.title}>
+          {corroboration.label}
+        </Chip>
+      )}
       <Chip tone={domain.tone}>{domain.label}</Chip>
       {entry.email_verified && <Chip tone="green">Verified</Chip>}
       {!entry.email_verified && !guessed && !entry.email_person_match && (
@@ -111,7 +153,7 @@ function CandidateCard({ jobId, candidate, onApproved }) {
   const conf = CONFIDENCE_META[candidate.confidence] || CONFIDENCE_META.weak
   const emails = candidate.emails || []
   const selectable = emails.filter(
-    (e) => e.origin !== 'guessed' || e.smtp_status === 'deliverable')
+    (e) => e.origin !== 'guessed' || guessConfirmed(e))
   const [selectedEmail, setSelectedEmail] = useState(
     selectable.find((e) => e.email_verified)?.email
     || selectable.find((e) => e.origin !== 'guessed')?.email || null,
@@ -285,39 +327,16 @@ export default function FindPerson() {
   const [run, setRun] = useState(null)
   const [history, setHistory] = useState([])
   const [starting, setStarting] = useState(false)
-  const pollRef = useRef(null)
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) clearInterval(pollRef.current)
-    pollRef.current = null
-  }, [])
-
-  const pollRun = useCallback((id) => {
-    stopPolling()
-    let failures = 0
-    const tick = async () => {
-      try {
-        const { data } = await personFinderAPI.get(id)
-        failures = 0
-        setRun(data)
-        if (['done', 'failed', 'cancelled'].includes(data.status)) {
-          stopPolling()
-          loadHistory({ resume: false })
-          if (data.status === 'failed') {
-            toast.error(data.error || 'Person search failed')
-          }
-        }
-      } catch {
-        if (++failures >= 10) {
-          stopPolling()
-          toast.error('Lost contact with the backend while tracking this search.')
-        }
+  const [pollRun, stopPolling] = useRunPolling(personFinderAPI.get, 1500, {
+    onUpdate: setRun,
+    onFinish: (data) => {
+      loadHistory({ resume: false })
+      if (data.status === 'failed') {
+        toast.error(data.error || 'Person search failed')
       }
-    }
-    tick()
-    pollRef.current = setInterval(tick, 1500)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stopPolling])
+    },
+    onLostContact: () => toast.error('Lost contact with the backend while tracking this search.'),
+  })
 
   const loadHistory = useCallback(async ({ resume = true } = {}) => {
     try {

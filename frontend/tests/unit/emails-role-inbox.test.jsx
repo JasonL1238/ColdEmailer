@@ -9,74 +9,56 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, waitFor, fireEvent } from '@testing-library/react'
 
+/* The fields every row here shares. `body` and `contact_name` are passed at
+   each call site on purpose: the greeting is paired with the name, and the
+   'mismatch' row is 'Hi Jane,' sent to bob.smith@ — that pairing IS the
+   named_unmatched fixture. */
+const draft = (over) => ({
+  status: 'draft', company_name: 'ZZTEST Corp', email_type: 'application',
+  sent_at: null, gmail_message_id: null,
+  has_response: 0, has_follow_up: 0, used_template_fallback: 0, ...over,
+})
+
 const emails = [
-  {
-    id: 'role', status: 'draft', subject: 'ZZTEST to a shared inbox',
+  draft({
+    id: 'role', subject: 'ZZTEST to a shared inbox',
     body: 'Hi there,\n\nA perfectly ordinary body.\n\nThanks so much,',
     contact_name: '', contact_email: 'info@zztest.invalid',
-    contact_email_kind: 'generic',
-    company_name: 'ZZTEST Corp', email_type: 'application',
-    sent_at: null, gmail_message_id: null, created_at: '2026-07-01T09:00:00',
-    has_response: 0, has_follow_up: 0, used_template_fallback: 0,
-  },
-  {
-    id: 'person', status: 'draft', subject: 'ZZTEST to a human',
+    contact_email_kind: 'generic', created_at: '2026-07-01T09:00:00',
+  }),
+  draft({
+    id: 'person', subject: 'ZZTEST to a human',
     body: 'Hi Jane,\n\nA perfectly ordinary body.\n\nThanks so much,',
     contact_name: 'ZZTEST Jane', contact_email: 'jane.doe@zztest.invalid',
-    contact_email_kind: 'personal',
-    company_name: 'ZZTEST Corp', email_type: 'application',
-    sent_at: null, gmail_message_id: null, created_at: '2026-07-01T10:00:00',
-    has_response: 0, has_follow_up: 0, used_template_fallback: 0,
-  },
-  {
-    id: 'mismatch', status: 'draft', subject: 'ZZTEST wrong human',
+    contact_email_kind: 'personal', created_at: '2026-07-01T10:00:00',
+  }),
+  draft({
+    id: 'mismatch', subject: 'ZZTEST wrong human',
     body: 'Hi Jane,\n\nA perfectly ordinary body.\n\nThanks so much,',
     contact_name: 'ZZTEST Jane Doe', contact_email: 'bob.smith@zztest.invalid',
-    contact_email_kind: 'named_unmatched',
-    company_name: 'ZZTEST Corp', email_type: 'application',
-    sent_at: null, gmail_message_id: null, created_at: '2026-07-01T10:30:00',
-    has_response: 0, has_follow_up: 0, used_template_fallback: 0,
-  },
-  {
-    id: 'quota', status: 'draft', subject: 'ZZTEST fell back',
+    contact_email_kind: 'named_unmatched', created_at: '2026-07-01T10:30:00',
+  }),
+  draft({
+    id: 'quota', subject: 'ZZTEST fell back',
     body: 'Hi Sam,\n\nA perfectly ordinary body.\n\nThanks so much,',
     contact_name: 'ZZTEST Sam', contact_email: 'sam@zztest.invalid',
-    contact_email_kind: 'personal',
-    company_name: 'ZZTEST Corp', email_type: 'application',
-    sent_at: null, gmail_message_id: null, created_at: '2026-07-01T11:00:00',
-    has_response: 0, has_follow_up: 0,
+    contact_email_kind: 'personal', created_at: '2026-07-01T11:00:00',
     used_template_fallback: 1, fallback_reason: 'llm_quota',
-  },
-  {
-    id: 'mystery', status: 'draft', subject: 'ZZTEST fell back vaguely',
+  }),
+  draft({
+    id: 'mystery', subject: 'ZZTEST fell back vaguely',
     body: 'Hi Kim,\n\nA perfectly ordinary body.\n\nThanks so much,',
     contact_name: 'ZZTEST Kim', contact_email: 'kim@zztest.invalid',
-    contact_email_kind: 'personal',
-    company_name: 'ZZTEST Corp', email_type: 'application',
-    sent_at: null, gmail_message_id: null, created_at: '2026-07-01T12:00:00',
-    has_response: 0, has_follow_up: 0,
+    contact_email_kind: 'personal', created_at: '2026-07-01T12:00:00',
     used_template_fallback: 1, fallback_reason: 'llm_unavailable',
-  },
+  }),
 ]
 
-vi.mock('../../src/api', () => ({
-  errMessage: (e, f) => f || 'err',
-  emailsAPI: {
-    list: vi.fn(() => Promise.resolve({ data: emails })),
-    followUps: vi.fn(() => Promise.resolve({ data: [] })),
-    update: vi.fn(() => Promise.resolve({ data: {} })),
-    bulkStatus: vi.fn(() => Promise.resolve({ data: { updated: 0 } })),
-    generateFollowUp: vi.fn(() => Promise.resolve({ data: {} })),
-    send: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })),
-  },
-  resumesAPI: { list: vi.fn(() => Promise.resolve({ data: [] })) },
-  sendWindowAPI: { get: vi.fn(() => Promise.resolve({ data: { enabled: false } })) },
-  jobsAPI: { get: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })) },
+vi.mock('../../src/api', async () => (await import('../_mocks')).emailsPageApi({
+  emailsAPI: { list: vi.fn(() => Promise.resolve({ data: emails })) },
 }))
-vi.mock('../../src/App', () => ({ useApp: () => ({ navigate: vi.fn(), settings: {} }) }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
-}))
+vi.mock('../../src/App', async () => (await import('../_mocks')).appMock())
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
 import Emails, { addressWarning, fallbackExplanation } from '../../src/pages/Emails'
 

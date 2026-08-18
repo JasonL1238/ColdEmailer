@@ -13,11 +13,10 @@ vi.mock('../../src/api', () => ({
   errMessage: (e, f) => f || 'err',
   analyticsAPI: { get: getSpy },
 }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
-}))
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
-import Analytics, { humanHours, rateLabel } from '../../src/pages/Analytics'
+import Analytics, { humanHours } from '../../src/pages/Analytics'
+import { rateLabel } from '../../src/ui'
 
 const seg = (over) => ({
   key: 'application', label: 'application', sent: 20, replied: 4,

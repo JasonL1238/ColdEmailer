@@ -21,18 +21,8 @@ import {
   Layers, AlertTriangle, Archive, ArchiveRestore, Pencil, Check, X,
 } from 'lucide-react'
 import { campaignsAPI, errMessage } from '../api'
-import { Button, Chip, EmptyState, timeAgo } from '../ui'
+import { Button, Chip, EmptyState, rateLabel, timeAgo } from '../ui'
 import { useApp } from '../App'
-
-/* What a campaign is allowed to claim. Below the floor the backend sends
-   `rate: null`, and this must not fall back to `rate ?? 0` — that renders a
-   three-send campaign as a confident 0% beside a real one. */
-export function rateLabel(c) {
-  if (!c.enough_data || c.rate === null || c.rate === undefined) {
-    return { text: `${c.replied}/${c.sent}`, muted: true }
-  }
-  return { text: `${c.rate}%`, muted: false }
-}
 
 export default function Campaigns() {
   const { navigate } = useApp()

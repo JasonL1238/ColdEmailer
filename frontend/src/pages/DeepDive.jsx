@@ -7,7 +7,7 @@ import {
 import { deepResearchAPI, errMessage } from '../api'
 import {
   Button, Chip, EmptyState, ProgressBar, Segmented, Spinner,
-  contactStatusMeta, timeAgo, useCompanyDrawer,
+  contactStatusMeta, timeAgo, useCompanyDrawer, useRunPolling,
 } from '../ui'
 import { useApp } from '../App'
 import CompanyDrawer from '../components/CompanyDrawer'
@@ -47,90 +47,66 @@ export default function DeepDive() {
   const [browseQuery, setBrowseQuery] = useState('')
   const [showAllCompanies, setShowAllCompanies] = useState(false)
   const [resultCompact, setResultCompact] = useState(false)
-  const pollRef = useRef(null)
   const loadHistoryRef = useRef(null)
   const loadConsolidatedRef = useRef(null)
 
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) clearInterval(pollRef.current)
-    pollRef.current = null
-  }, [])
-
-  const pollRun = useCallback((id, { announce = true } = {}) => {
-    stopPolling()
-    let failures = 0
-    let announced = false
-    const tick = async () => {
-      try {
-        const { data } = await deepResearchAPI.get(id)
-        failures = 0
-        setRun(data)
-        if (['done', 'failed', 'cancelled'].includes(data.status)) {
-          stopPolling()
-          loadHistoryRef.current?.()
-          // Fold the finished run into its company's merged section.
-          loadConsolidatedRef.current?.()
-          if (announce && !announced) {
-            announced = true
-            if (data.status === 'done') {
-              const r = data.result || {}
-              const saved = r.contacts_saved ?? r.contacts_selected ?? 0
-              const matches = r.criteria_matches ?? 0
-              const msg = `Deep dive ready — ${saved} contacts `
-                + `(${matches} match your criteria)`
-              if (r.identity_verified === false) {
-                toast.error('Deep dive finished, but the site did not match this company.')
-              } else if (
-                r.timed_out
-                && r.target_criteria_matches
-                && r.target_met !== true
-              ) {
-                toast.error(
-                  `Hit 30-minute limit with ${matches}/${r.target_criteria_matches}`
-                  + ' criteria matches — partial results saved.',
-                )
-              } else if (r.timed_out) {
-                // Hard-stop saved partial results — prefer that message over
-                // floor-not-met, which is expected when time ran out.
-                const floorNote = (
-                  r.floor_required && !r.floor_met
-                ) ? ' Contact floor not fully met.' : ''
-                toast.success(
-                  `${msg}. Stopped at the 30-minute limit.${floorNote}`,
-                )
-              } else if (
-                r.target_criteria_matches
-                && r.target_met === false
-              ) {
-                toast.error(
-                  `${msg}. Target was ${r.target_criteria_matches} criteria matches — try Continue contacts.`,
-                )
-              } else if (r.alumni_mode && r.floor_required && !r.floor_met) {
-                toast.error(
-                  `${msg}. Alumni floor not met — try Continue contacts.`,
-                )
-              } else if (r.floor_required && !r.floor_met) {
-                toast.error(`${msg}. Contact floor not met.`)
-              } else if (r.floor_required && r.criteria_ratio_met === false) {
-                toast.error(`${msg}. Fewer than 4 criteria matches.`)
-              } else {
-                toast.success(msg)
-              }
-            } else if (data.status === 'failed') {
-              toast.error(data.error || 'Deep research failed')
-            }
-          }
+  const [pollRun, stopPolling] = useRunPolling(deepResearchAPI.get, 2500, {
+    onUpdate: setRun,
+    onFinish: (data, announce) => {
+      loadHistoryRef.current?.()
+      // Fold the finished run into its company's merged section.
+      loadConsolidatedRef.current?.()
+      if (!announce) return
+      if (data.status === 'done') {
+        const r = data.result || {}
+        const saved = r.contacts_saved ?? r.contacts_selected ?? 0
+        const matches = r.criteria_matches ?? 0
+        const msg = `Deep dive ready — ${saved} contacts `
+          + `(${matches} match your criteria)`
+        if (r.identity_verified === false) {
+          toast.error('Deep dive finished, but the site did not match this company.')
+        } else if (
+          r.timed_out
+          && r.target_criteria_matches
+          && r.target_met !== true
+        ) {
+          toast.error(
+            `Hit 30-minute limit with ${matches}/${r.target_criteria_matches}`
+            + ' criteria matches — partial results saved.',
+          )
+        } else if (r.timed_out) {
+          // Hard-stop saved partial results — prefer that message over
+          // floor-not-met, which is expected when time ran out.
+          const floorNote = (
+            r.floor_required && !r.floor_met
+          ) ? ' Contact floor not fully met.' : ''
+          toast.success(
+            `${msg}. Stopped at the 30-minute limit.${floorNote}`,
+          )
+        } else if (
+          r.target_criteria_matches
+          && r.target_met === false
+        ) {
+          toast.error(
+            `${msg}. Target was ${r.target_criteria_matches} criteria matches — try Continue contacts.`,
+          )
+        } else if (r.alumni_mode && r.floor_required && !r.floor_met) {
+          toast.error(
+            `${msg}. Alumni floor not met — try Continue contacts.`,
+          )
+        } else if (r.floor_required && !r.floor_met) {
+          toast.error(`${msg}. Contact floor not met.`)
+        } else if (r.floor_required && r.criteria_ratio_met === false) {
+          toast.error(`${msg}. Fewer than 4 criteria matches.`)
+        } else {
+          toast.success(msg)
         }
-      } catch {
-        if (++failures >= 10) {
-          stopPolling()
-          toast.error('Lost contact with the backend while tracking this deep dive.')
-        }
+      } else if (data.status === 'failed') {
+        toast.error(data.error || 'Deep research failed')
       }
-    }
-    tick()
-    pollRef.current = setInterval(tick, 2500)
-  }, [stopPolling])
+    },
+    onLostContact: () => toast.error('Lost contact with the backend while tracking this deep dive.'),
+  })
 
   const loadHistory = useCallback(async () => {
     try {
@@ -592,7 +568,7 @@ export default function DeepDive() {
 
           {!resultCompact && (intel.talking_points || []).length > 0 && (
             <div className="card card-pad">
-              <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+              <div className="tiny section-label" style={{ marginBottom: 8 }}>
                 Interview talking points
               </div>
               <ul className="deep-list">
@@ -645,7 +621,7 @@ export default function DeepDive() {
             ) : (
               <div className="stack" style={{ gap: 16 }}>
                 <div>
-                  <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+                  <div className="tiny section-label" style={{ marginBottom: 8 }}>
                     Criteria matches ({visibleMatched.length}
                     {contactFilter !== 'all' ? ` of ${matchedContacts.length}` : ''})
                   </div>
@@ -660,7 +636,7 @@ export default function DeepDive() {
                   )}
                 </div>
                 <div>
-                  <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+                  <div className="tiny section-label" style={{ marginBottom: 8 }}>
                     Other contacts ({visibleOther.length}
                     {contactFilter !== 'all' ? ` of ${otherContacts.length}` : ''})
                   </div>
@@ -999,13 +975,7 @@ function CompanyDigest({ entry, open, onToggle, onOpenCompany, onCompose, onReru
 
 function DigestLabel({ children }) {
   return (
-    <div
-      className="tiny"
-      style={{
-        fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em',
-        marginBottom: 6, opacity: 0.7,
-      }}
-    >
+    <div className="tiny section-label" style={{ marginBottom: 6, opacity: 0.7 }}>
       {children}
     </div>
   )
@@ -1091,7 +1061,7 @@ function IntelBlock({ title, items }) {
   const list = Array.isArray(items) ? items : []
   return (
     <div className="card card-pad">
-      <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+      <div className="tiny section-label" style={{ marginBottom: 8 }}>
         {title}
       </div>
       {list.length === 0 ? (

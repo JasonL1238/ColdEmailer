@@ -17,9 +17,7 @@ vi.mock('../../src/api', () => ({
   },
 }))
 
-vi.mock('react-hot-toast', () => ({
-  default: { success: vi.fn(), error: vi.fn(), loading: vi.fn() },
-}))
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
 import Resumes from '../../src/pages/Resumes'
 

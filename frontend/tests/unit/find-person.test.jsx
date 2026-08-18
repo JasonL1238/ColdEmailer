@@ -233,6 +233,53 @@ describe('FindPerson — found sources and mailbox checks', () => {
     expect(save.disabled).toBe(false)
   })
 
+  const guessWith = (corroboration) => withEmails([{
+    email: 'jane.doe@acme.com', origin: 'guessed', domain_kind: 'company',
+    email_kind: 'pattern_guess', email_person_match: true,
+    email_mx_ok: true, email_verified: false, smtp_status: null,
+    corroboration,
+  }])
+
+  it('a corpus hit under this name unlocks the guess with no mailbox check',
+    async () => {
+      // The common case on a home network: port 25 is blocked so smtp_status
+      // is null, and corroboration is the only evidence there is.
+      await openDoneRun(guessWith({
+        found: true, sources: ['github_commit'], names: ['Jane Doe'],
+        name_match: true,
+      }))
+      expect(screen.getByText('In public use under this name')).toBeTruthy()
+      const radio = screen.getByText('jane.doe@acme.com')
+        .closest('label').querySelector('input[type=radio]')
+      expect(radio.disabled).toBe(false)
+      fireEvent.click(radio)
+      const save = screen.getByText('Save as contact').closest('button')
+      expect(save.disabled).toBe(true)
+      fireEvent.click(screen.getByText(/not a namesake/))
+      expect(save.disabled).toBe(false)
+    })
+
+  it('a real address belonging to a namesake stays locked', async () => {
+    await openDoneRun(guessWith({
+      found: true, sources: ['github_commit'], names: ['Bob Stone'],
+      name_match: false,
+    }))
+    expect(screen.getByText(/Real, but someone else/)).toBeTruthy()
+    const radio = screen.getByText('jane.doe@acme.com')
+      .closest('label').querySelector('input[type=radio]')
+    expect(radio.disabled).toBe(true)
+  })
+
+  it('a corpus hit with no name attached stays locked', async () => {
+    await openDoneRun(guessWith({
+      found: true, sources: ['mailing_list'], names: [], name_match: null,
+    }))
+    expect(screen.getByText('Address is real — owner unknown')).toBeTruthy()
+    const radio = screen.getByText('jane.doe@acme.com')
+      .closest('label').querySelector('input[type=radio]')
+    expect(radio.disabled).toBe(true)
+  })
+
   it('warns when GitHub throttled the run', async () => {
     const job = doneJob()
     job.result.found_sources = { github_rate_limited: true }

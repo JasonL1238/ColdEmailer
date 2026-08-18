@@ -12,7 +12,7 @@ import { useEffect, useState } from 'react'
 import toast from 'react-hot-toast'
 import { BarChart3, MessageSquare, Clock, AlertTriangle } from 'lucide-react'
 import { analyticsAPI, errMessage } from '../api'
-import { Button, Chip, EmptyState, Segmented } from '../ui'
+import { Button, Chip, EmptyState, Segmented, rateLabel } from '../ui'
 
 const WINDOWS = [
   { value: 30, label: '30 days' },
@@ -37,11 +37,6 @@ export function humanHours(hours) {
   return `${Math.round(hours / 24)}d`
 }
 
-/* What a segment is allowed to claim.
-
-   Below the sample floor the backend sends `rate: null`, and this must not
-   fall back to `rate ?? 0` — that renders a thin segment as a confident 0%
-   next to a real one, which is exactly the wrong comparison to invite. */
 /* What the "Typical wait" tile says underneath itself.
 
    "no replies yet" beside "Replied 5" is a flat contradiction, and it happens
@@ -57,13 +52,6 @@ export function waitSub(wait, replied) {
     return `${replied} ${replied === 1 ? 'reply' : 'replies'}, none with a usable timestamp`
   }
   return 'no replies yet'
-}
-
-export function rateLabel(seg) {
-  if (!seg.enough_data || seg.rate === null || seg.rate === undefined) {
-    return { text: `${seg.replied}/${seg.sent}`, muted: true }
-  }
-  return { text: `${seg.rate}%`, muted: false }
 }
 
 export default function Analytics() {
@@ -140,7 +128,7 @@ export default function Analytics() {
           </div>
 
           {data.unverified > 0 && (
-            <div className="card card-pad row mb-16" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)', gap: 10 }}>
+            <div className="card card-pad card-warn row mb-16" style={{ gap: 10 }}>
               <AlertTriangle size={16} style={{ color: 'var(--amber)', flexShrink: 0 }} />
               <span className="small">
                 <b>{data.unverified} reply flag{data.unverified === 1 ? '' : 's'} left out of every number here.</b>{' '}

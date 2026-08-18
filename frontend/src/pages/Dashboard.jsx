@@ -139,7 +139,7 @@ export default function Dashboard() {
 
           {/* unverified legacy reply flags */}
           {counts.replied_unverified > 0 && (
-            <div className="card card-pad mt-16 row-between" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
+            <div className="card card-pad card-warn mt-16 row-between">
               <div className="row">
                 <AlertTriangle size={17} style={{ color: 'var(--amber)' }} />
                 <div>
@@ -160,7 +160,7 @@ export default function Dashboard() {
 
           {/* follow-ups banner */}
           {follow_ups_due > 0 && (
-            <div className="card card-pad mt-16 row-between" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
+            <div className="card card-pad card-warn mt-16 row-between">
               <div className="row">
                 <Clock size={17} style={{ color: 'var(--amber)' }} />
                 <div>

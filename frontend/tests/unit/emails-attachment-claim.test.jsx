@@ -27,18 +27,11 @@ const emails = [
   },
 ]
 
-vi.mock('../../src/api', () => ({
-  errMessage: (e, f) => f || 'err',
+vi.mock('../../src/api', async () => (await import('../_mocks')).emailsPageApi({
   emailsAPI: {
     list: vi.fn(() => Promise.resolve({ data: emails })),
-    followUps: vi.fn(() => Promise.resolve({ data: [] })),
-    update: vi.fn(() => Promise.resolve({ data: {} })),
-    bulkStatus: vi.fn(() => Promise.resolve({ data: { updated: 0 } })),
-    generateFollowUp: vi.fn(() => Promise.resolve({ data: {} })),
     checkReplies: vi.fn(() => Promise.resolve({ data: {} })),
-    send: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })),
   },
-  sendWindowAPI: { get: vi.fn(() => Promise.resolve({ data: { enabled: false } })) },
   resumesAPI: {
     list: vi.fn(() => Promise.resolve({
       data: [
@@ -47,13 +40,10 @@ vi.mock('../../src/api', () => ({
       ],
     })),
   },
-  jobsAPI: { get: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })) },
 }))
 
-vi.mock('../../src/App', () => ({ useApp: () => ({ navigate: vi.fn(), settings: {} }) }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
-}))
+vi.mock('../../src/App', async () => (await import('../_mocks')).appMock())
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
 import Emails from '../../src/pages/Emails'
 import { emailsAPI } from '../../src/api'

@@ -37,9 +37,7 @@ vi.mock('../../src/api', () => ({
   },
 }))
 vi.mock('../../src/App', () => ({ useApp: () => ({ settings, refreshSettings }) }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
-}))
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
 import Settings, { cadenceSummary } from '../../src/pages/Settings'
 

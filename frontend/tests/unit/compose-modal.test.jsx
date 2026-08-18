@@ -1,24 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 
-vi.mock('../../src/api', () => ({
-  errMessage: (e, f) => f || 'err',
-  emailsAPI: {
-    generate: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })),
-    cancelGeneration: vi.fn(() => Promise.resolve({})),
-  },
-  resumesAPI: {
-    list: vi.fn(() => Promise.resolve({
-      data: [{ id: 'r1', label: 'ZZTEST resume', is_default: true }],
-    })),
-  },
-  jobsAPI: { get: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })) },
-}))
+vi.mock('../../src/api', async () => (await import('../_mocks')).composeModalApi())
 
-vi.mock('../../src/App', () => ({ useApp: () => ({ navigate: vi.fn(), settings: {} }) }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
-}))
+vi.mock('../../src/App', async () => (await import('../_mocks')).appMock())
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
 import ComposeModal from '../../src/pages/ComposeModal'
 import { emailsAPI } from '../../src/api'

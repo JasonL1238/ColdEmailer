@@ -246,7 +246,7 @@ export default function ComposeModal({ contactIds, onClose, onDone }) {
               : `${job.progress_current}/${job.progress_total} drafted — each email is researched and written individually, this takes a few seconds per contact`}
           </div>
           {phase === 'done' && skippedList.length > 0 && (
-            <div className="card card-pad" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
+            <div className="card card-pad card-warn">
               <div className="small" style={{ fontWeight: 650, marginBottom: 4 }}>Skipped</div>
               {job.result.skipped.map((s, i) => (
                 <div key={i} className="small">

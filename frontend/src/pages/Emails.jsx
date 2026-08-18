@@ -19,7 +19,7 @@ export const isDelivered = (e) => !!(e.gmail_message_id || e.sent_at)
 
 // A message that reached Gmail without a confirmation coming back. Gmail may
 // have queued it, so this is not a safe retry — never present it as one.
-export const isUnconfirmed = (e) => !!e.send_attempted_at && !isDelivered(e)
+const isUnconfirmed = (e) => !!e.send_attempted_at && !isDelivered(e)
 
 /* Whether this email can still be changed at all — the single definition
    behind both the detail pane's buttons and the keyboard shortcuts.
@@ -28,7 +28,7 @@ export const isUnconfirmed = (e) => !!e.send_attempted_at && !isDelivered(e)
    its Trash button. A shortcut gated on the narrower test offered to trash
    exactly those rows, and the backend then refused — leaving a "trashed"
    toast and an Undo button for something that never happened. */
-export const isEditable = (e) => !(e.status === 'sent' || isDelivered(e))
+const isEditable = (e) => !(e.status === 'sent' || isDelivered(e))
 
 // A reply flag the current checker has confirmed vs. one inherited from the old
 // checker (which counted bounces, auto-replies and our own messages). Only the
@@ -87,8 +87,8 @@ export const whenLabel = (iso) => {
   return sameDay ? time : `${at.toLocaleDateString([], { weekday: 'short' })} ${time}`
 }
 
-export const hasVerifiedReply = (e) => !!e.has_response && !e.reply_unverified
-export const hasUnverifiedReply = (e) => !!(e.reply_unverified || e.contact_reply_unverified)
+const hasVerifiedReply = (e) => !!e.has_response && !e.reply_unverified
+const hasUnverifiedReply = (e) => !!(e.reply_unverified || e.contact_reply_unverified)
 
 /* Where this person sits in the follow-up cadence, and therefore what the
    detail pane should offer.
@@ -537,7 +537,7 @@ export default function Emails() {
       </div>
 
       {unverifiedCount > 0 && (
-        <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
+        <div className="card card-pad card-warn row-between mb-16">
           <div className="row">
             <AlertTriangle size={16} style={{ color: 'var(--amber)' }} />
             <span className="small">
@@ -573,7 +573,7 @@ export default function Emails() {
       )}
 
       {followUps.length > 0 && tab !== 'trashed' && (
-        <div className="card card-pad row-between mb-16" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
+        <div className="card card-pad card-warn row-between mb-16">
           <div className="row">
             <Clock size={16} style={{ color: 'var(--amber)' }} />
             <span className="small">
@@ -1260,7 +1260,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
             ))}
           </div>
           {claimConflicts.length > 0 && (
-            <div className="card card-pad stack" style={{ gap: 6, background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
+            <div className="card card-pad card-warn stack" style={{ gap: 6 }}>
               <div className="row small" style={{ gap: 6, fontWeight: 650 }}>
                 <AlertTriangle size={13} style={{ color: 'var(--amber)' }} />
                 {claimConflicts.length === 1 ? 'One of these emails says' : `${claimConflicts.length} of these emails say`}
@@ -1286,7 +1286,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
             </div>
           )}
           {unconfirmed.length > 0 && (
-            <div className="card card-pad stack" style={{ gap: 6, background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
+            <div className="card card-pad card-warn stack" style={{ gap: 6 }}>
               <div className="row small" style={{ gap: 6, fontWeight: 650 }}>
                 <AlertTriangle size={13} style={{ color: 'var(--amber)' }} />
                 {unconfirmed.length === 1 ? 'One of these was' : `${unconfirmed.length} of these were`} already handed to Gmail
@@ -1354,7 +1354,7 @@ function SendModal({ emailIds, emails, onClose, onSent }) {
                   {failures.length > 0 && <> · <b style={{ color: 'var(--red)' }}>{failures.length} failed</b></>}
                 </div>
                 {unknownOut.length > 0 && (
-                  <div className="card card-pad" style={{ background: 'var(--amber-soft)', borderColor: 'var(--amber-border)' }}>
+                  <div className="card card-pad card-warn">
                     <div className="small" style={{ fontWeight: 650, marginBottom: 6 }}>
                       We could not confirm whether these were delivered — check your
                       Gmail Sent folder before retrying:

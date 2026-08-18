@@ -109,7 +109,7 @@ export default function CompanyDrawer({
         <div className="card card-pad" style={{ borderColor: 'var(--amber)' }}>
           <div className="row" style={{ gap: 6, marginBottom: 6 }}>
             <AlertTriangle size={14} style={{ color: 'var(--amber)' }} />
-            <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            <div className="tiny section-label">
               Contact conflicts
             </div>
           </div>
@@ -124,7 +124,7 @@ export default function CompanyDrawer({
         <div className="card card-pad" style={{ borderColor: 'var(--amber)' }}>
           <div className="row" style={{ gap: 6, marginBottom: 4 }}>
             <AlertTriangle size={14} style={{ color: 'var(--amber)' }} />
-            <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            <div className="tiny section-label">
               Deep dive issue
             </div>
           </div>
@@ -156,7 +156,7 @@ export default function CompanyDrawer({
           )}
           <div className="card card-pad" style={{ background: 'var(--surface-hover)' }}>
             <div className="row-between" style={{ gap: 8 }}>
-              <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              <div className="tiny section-label">
                 Research coverage
               </div>
               <Chip tone={company.research_quality === 'high' ? 'green'
@@ -192,7 +192,7 @@ export default function CompanyDrawer({
           out of the research block and out of emails — it is not evidence. */}
       {company.discovery_note && (
         <div className="card card-pad" style={{ background: 'var(--surface-hover)' }}>
-          <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>
+          <div className="tiny section-label" style={{ marginBottom: 3 }}>
             Why the search matched
           </div>
           <div className="small" style={{ lineHeight: 1.55 }}>{company.discovery_note}</div>
@@ -301,7 +301,7 @@ export default function CompanyDrawer({
 function Info({ label, value }) {
   return (
     <div>
-      <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>
+      <div className="tiny section-label" style={{ marginBottom: 3 }}>
         {label}
       </div>
       <div className="small" style={{ lineHeight: 1.55 }}>{value}</div>
@@ -313,7 +313,7 @@ function DeepIntelList({ label, items }) {
   if (!Array.isArray(items) || items.length === 0) return null
   return (
     <div>
-      <div className="tiny" style={{ fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>
+      <div className="tiny section-label" style={{ marginBottom: 3 }}>
         {label}
       </div>
       <ul className="deep-list" style={{ margin: 0 }}>

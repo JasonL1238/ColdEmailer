@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import toast from 'react-hot-toast'
 import {
   Search, Sparkles, X, ChevronRight, Globe, Users, AlertCircle, History, Compass,
@@ -6,7 +6,7 @@ import {
 import { discoveryAPI, errMessage } from '../api'
 import {
   Button, Chip, EmptyState, ProgressBar, Segmented, Spinner,
-  initials, timeAgo, useCompanyDrawer,
+  initials, timeAgo, useCompanyDrawer, useRunPolling,
 } from '../ui'
 import { useApp } from '../App'
 import CompanyDrawer, { SCRAPE_STATUS } from '../components/CompanyDrawer'
@@ -31,48 +31,25 @@ export default function Discover() {
   const [starting, setStarting] = useState(false)
   const drawer = useCompanyDrawer()
   const [composeIds, setComposeIds] = useState(null)
-  const pollRef = useRef(null)
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) clearInterval(pollRef.current)
-    pollRef.current = null
-  }, [])
 
   /** Watch a run. announce=false when merely opening a past search, so an
    *  old completed run doesn't fire a "search complete" toast on click. */
-  const pollRun = useCallback((id, { announce = true } = {}) => {
-    stopPolling()
-    let failures = 0
-    let announced = false
-    const tick = async () => {
-      try {
-        const { data } = await discoveryAPI.get(id)
-        failures = 0
-        setRun(data)
-        if (['done', 'failed', 'cancelled'].includes(data.status)) {
-          stopPolling()
-          loadHistoryRef.current?.()
-          if (announce && !announced) {
-            announced = true
-            if (data.status === 'done') {
-              const r = data.result || {}
-              toast.success(`Found ${r.companies_added ?? 0} companies with ${r.contacts_added ?? 0} contacts`)
-            } else if (data.status === 'failed') {
-              toast.error(data.error || 'Discovery failed')
-            }
-          }
-        }
-      } catch {
-        // Give up rather than polling a dead backend forever.
-        if (++failures >= 10) {
-          stopPolling()
-          toast.error("Lost contact with the backend while tracking this search.")
+  const [pollRun, stopPolling] = useRunPolling(discoveryAPI.get, 2000, {
+    onUpdate: setRun,
+    onFinish: (data, announce) => {
+      loadHistory()
+      if (announce) {
+        if (data.status === 'done') {
+          const r = data.result || {}
+          toast.success(`Found ${r.companies_added ?? 0} companies with ${r.contacts_added ?? 0} contacts`)
+        } else if (data.status === 'failed') {
+          toast.error(data.error || 'Discovery failed')
         }
       }
-    }
-    tick()
-    pollRef.current = setInterval(tick, 2000)
-  }, [stopPolling])
+    },
+    // Give up rather than polling a dead backend forever.
+    onLostContact: () => toast.error("Lost contact with the backend while tracking this search."),
+  })
 
   const [historyLoaded, setHistoryLoaded] = useState(false)
 
@@ -89,11 +66,6 @@ export default function Discover() {
       setHistoryLoaded(true)
     }
   }, [pollRun])
-
-  // pollRun needs loadHistory, and loadHistory needs pollRun — break the cycle
-  // with a ref instead of recreating both callbacks on every render.
-  const loadHistoryRef = useRef(loadHistory)
-  useEffect(() => { loadHistoryRef.current = loadHistory }, [loadHistory])
 
   useEffect(() => {
     loadHistory()
@@ -263,7 +235,7 @@ export default function Discover() {
                   onClick={() => drawer.open(c.id)}
                   style={{ textAlign: 'left', cursor: 'pointer', width: '100%' }}
                 >
-                  <div className="company-card-head">
+                  <div className="row">
                     <div className="company-favicon">{initials(c.name)}</div>
                     <div style={{ minWidth: 0 }}>
                       <div className="company-name">{c.name}</div>

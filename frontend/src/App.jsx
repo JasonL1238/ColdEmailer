@@ -91,12 +91,15 @@ export default function App() {
         toastOptions={{
           className: 'toast-base',
           style: {
-            background: '#171b22', color: '#eceae4', borderRadius: 12,
+            // #171b22 and #2a3140 sit just off the scale — near --surface-2
+            // (#181c24) and --border (#242a35) but not equal to either, so
+            // they stay literal rather than become a silent repaint.
+            background: '#171b22', color: 'var(--text)', borderRadius: 12,
             border: '1px solid #2a3140',
             boxShadow: '0 12px 40px rgba(0,0,0,0.45)', maxWidth: 420,
           },
-          success: { iconTheme: { primary: '#b8e62e', secondary: '#0b0d10' } },
-          error: { iconTheme: { primary: '#f87171', secondary: '#0b0d10' }, duration: 5000 },
+          success: { iconTheme: { primary: 'var(--accent)', secondary: 'var(--accent-ink)' } },
+          error: { iconTheme: { primary: 'var(--red)', secondary: 'var(--accent-ink)' }, duration: 5000 },
         }}
       />
       <div className="shell">

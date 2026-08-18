@@ -116,6 +116,8 @@ export function Segmented({ options, value, onChange }) {
 
 /* ---------- hooks ---------- */
 
+const TERMINAL_STATUSES = ['done', 'failed', 'cancelled']
+
 /** Poll a background job until it reaches a terminal state.
  *  Gives up after `maxFailures` consecutive errors and reports a synthetic
  *  failed job, so a backend blip cannot leave the caller polling forever with
@@ -142,7 +144,7 @@ export function useJobPolling(onUpdate, interval = 1500, maxFailures = 8) {
         failures = 0
         setJob(data)
         cbRef.current?.(data)
-        if (['done', 'failed', 'cancelled'].includes(data.status)) stop()
+        if (TERMINAL_STATUSES.includes(data.status)) stop()
       } catch {
         if (++failures >= maxFailures) {
           stop()
@@ -161,6 +163,62 @@ export function useJobPolling(onUpdate, interval = 1500, maxFailures = 8) {
 
   useEffect(() => stop, [stop])
   return { job, track }
+}
+
+/** Watch one long-running run — a discovery, a deep dive, a person search —
+ *  until it reaches a terminal state.
+ *
+ *  Each of those three pages owns a different run API, a different cadence and
+ *  a different thing to say when the run lands, but the loop around them is the
+ *  same: tick once immediately, then on `interval`; hand every response to the
+ *  page; stop on done/failed/cancelled; and give up after `maxFailures`
+ *  consecutive errors rather than polling a dead backend forever.
+ *
+ *  `handlers` is re-read on every render, so the callbacks may close over
+ *  current page state. `onFinish(run, announce)` gets announce=false when the
+ *  caller is merely opening a past run (`poll(id, { announce: false })`) or
+ *  when a slow tick reaches the terminal state a second time, so re-opening a
+ *  finished run cannot re-fire its completion toast.
+ *
+ *  Returns `[poll, stop]`; `stop` also runs on unmount. */
+export function useRunPolling(fetchRun, interval, handlers, maxFailures = 10) {
+  const timer = useRef(null)
+  const hRef = useRef(handlers)
+  hRef.current = handlers
+
+  const stop = useCallback(() => {
+    if (timer.current) clearInterval(timer.current)
+    timer.current = null
+  }, [])
+
+  const poll = useCallback((id, { announce = true } = {}) => {
+    stop()
+    let failures = 0
+    let announced = false
+    const tick = async () => {
+      try {
+        const { data } = await fetchRun(id)
+        failures = 0
+        hRef.current.onUpdate?.(data)
+        if (TERMINAL_STATUSES.includes(data.status)) {
+          stop()
+          const say = announce && !announced
+          if (say) announced = true
+          hRef.current.onFinish?.(data, say)
+        }
+      } catch {
+        if (++failures >= maxFailures) {
+          stop()
+          hRef.current.onLostContact?.()
+        }
+      }
+    }
+    tick()
+    timer.current = setInterval(tick, interval)
+  }, [fetchRun, interval, maxFailures, stop])
+
+  useEffect(() => stop, [stop])
+  return [poll, stop]
 }
 
 /** The company drawer, opened from Discover, Deep dive, and the Database.
@@ -211,6 +269,19 @@ export function replyCheckNotes(data) {
     suffix: notes.length ? ` (${notes.join('; ')})` : '',
     duration: notes.length ? 6000 : 4000,
   }
+}
+
+/** What a segment or a campaign is allowed to claim.
+ *
+ *  Below its sample floor the backend sends `rate: null`, and this must not
+ *  fall back to `rate ?? 0` — that renders a two-send segment or a three-send
+ *  campaign as a confident 0% beside a real one, which is exactly the wrong
+ *  comparison to invite. Analytics and Campaigns withhold it the same way. */
+export function rateLabel(row) {
+  if (!row.enough_data || row.rate === null || row.rate === undefined) {
+    return { text: `${row.replied}/${row.sent}`, muted: true }
+  }
+  return { text: `${row.rate}%`, muted: false }
 }
 
 /* ---------- utils ---------- */

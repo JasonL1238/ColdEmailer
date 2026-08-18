@@ -22,10 +22,8 @@ vi.mock('../../src/api', () => ({
   },
 }))
 
-vi.mock('../../src/App', () => ({ useApp: () => ({ navigate: vi.fn(), settings: {} }) }))
-vi.mock('react-hot-toast', () => ({
-  default: { success: vi.fn(), error: vi.fn(), loading: vi.fn(), dismiss: vi.fn() },
-}))
+vi.mock('../../src/App', async () => (await import('../_mocks')).appMock())
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 vi.mock('../../src/pages/ComposeModal', () => ({ default: () => null }))
 
 import DatabasePage from '../../src/pages/DatabasePage'

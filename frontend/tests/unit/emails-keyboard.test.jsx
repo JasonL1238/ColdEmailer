@@ -15,27 +15,20 @@ const { listSpy, bulkStatusSpy, sendSpy, updateSpy } = vi.hoisted(() => ({
   listSpy: vi.fn(), bulkStatusSpy: vi.fn(), sendSpy: vi.fn(), updateSpy: vi.fn(),
 }))
 
-vi.mock('../../src/api', () => ({
-  errMessage: (e, f) => f || 'err',
+vi.mock('../../src/api', async () => (await import('../_mocks')).emailsPageApi({
   emailsAPI: {
     list: listSpy,
-    followUps: vi.fn(() => Promise.resolve({ data: [] })),
     update: updateSpy,
     bulkStatus: bulkStatusSpy,
     bulkDelete: vi.fn(() => Promise.resolve({ data: { deleted: 0 } })),
-    generateFollowUp: vi.fn(() => Promise.resolve({ data: {} })),
     regenerate: vi.fn(() => Promise.resolve({ data: {} })),
     send: sendSpy,
     thread: vi.fn(() => Promise.resolve({ data: { messages: [] } })),
   },
-  resumesAPI: { list: vi.fn(() => Promise.resolve({ data: [] })) },
-  sendWindowAPI: { get: vi.fn(() => Promise.resolve({ data: { enabled: false } })) },
   jobsAPI: { get: vi.fn(() => Promise.resolve({ data: { id: 'j1', status: 'running' } })) },
 }))
-vi.mock('../../src/App', () => ({ useApp: () => ({ navigate: vi.fn(), settings: {} }) }))
-vi.mock('react-hot-toast', () => ({
-  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), dismiss: vi.fn() }),
-}))
+vi.mock('../../src/App', async () => (await import('../_mocks')).appMock())
+vi.mock('react-hot-toast', async () => (await import('../_mocks')).toastMock())
 
 import Emails, { shouldIgnoreShortcut, SHORTCUTS } from '../../src/pages/Emails'
 

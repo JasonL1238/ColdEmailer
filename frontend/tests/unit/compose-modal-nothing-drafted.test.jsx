@@ -20,17 +20,7 @@ const doneJob = (generated, skipped) => ({
 
 let jobResponse = doneJob(0, 3)
 
-vi.mock('../../src/api', () => ({
-  errMessage: (e, f) => f || 'err',
-  emailsAPI: {
-    generate: vi.fn(() => Promise.resolve({ data: { id: 'job1', status: 'running' } })),
-    cancelGeneration: vi.fn(() => Promise.resolve({})),
-  },
-  resumesAPI: {
-    list: vi.fn(() => Promise.resolve({
-      data: [{ id: 'r1', label: 'ZZTEST resume', is_default: true }],
-    })),
-  },
+vi.mock('../../src/api', async () => (await import('../_mocks')).composeModalApi({
   jobsAPI: { get: vi.fn(() => Promise.resolve({ data: jobResponse })) },
 }))
 
