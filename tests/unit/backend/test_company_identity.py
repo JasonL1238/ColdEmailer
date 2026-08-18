@@ -3,21 +3,13 @@ them. Accepting the first hit fabricated whole company profiles — the user's
 real data had "Sabanto" filed as an Epson printer-ink page and "Claim" as
 merriam-webster.com, and those descriptions flow verbatim into cold emails.
 """
-import os
-import tempfile
 
 import pytest
 
-from db import (Database, repair_mismatched_company_sites,
+from db import (repair_mismatched_company_sites,
                 repair_offdomain_contact_warnings)
 from enrichment import (domain_matches_name, page_mentions_company,
                         scrape_status_for)
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 class TestDomainMatchesName:

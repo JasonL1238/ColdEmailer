@@ -7,21 +7,11 @@ Those flags drove the headline reply rate, a per-email "replied <date>" chip,
 114 contact chips, and (most damaging) they switched the follow-up pipeline off.
 """
 import asyncio
-import os
-import tempfile
 from datetime import datetime, timedelta
 
-import pytest
-
 import main
-from db import (Database, _batch_stamped_reply_ids,
+from db import (_batch_stamped_reply_ids,
                 repair_contact_reply_status, repair_unverified_legacy_replies)
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 # ---------- the flags are marked unverified, not fact ----------

@@ -5,22 +5,18 @@ rows read email_kind='unknown', which happened to keep them out of the branches
 below; giving them a real classification armed both.
 """
 import asyncio
-import os
-import tempfile
 
 import pytest
 
 import main
-from db import Database, now_iso
+from db import now_iso
 from models import ContactUpdate
 
 
 @pytest.fixture
-def db(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmp:
-        fresh = Database(os.path.join(tmp, "test.db"))
-        monkeypatch.setattr(main, "db", fresh)
-        yield fresh
+def db(wired_db):
+    """Named `db` locally so every test below reads the wired database."""
+    return wired_db
 
 
 class TestAnUpgradeMustNotMoveASentAddress:

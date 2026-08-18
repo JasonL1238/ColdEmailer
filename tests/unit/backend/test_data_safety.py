@@ -1,18 +1,10 @@
 """Regression tests for data-loss and quota-integrity fixes."""
-import os
-import tempfile
 
 import pytest
 
-from db import Database, now_iso
+from db import now_iso
 from main import _csv_safe
 from rate_limiter import RateLimiter
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 class TestCsvFormulaInjection:

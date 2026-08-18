@@ -5,18 +5,10 @@ but both read `contacts.email_kind`. Anything stored before that column existed
 carries 'unknown', so info@acme.com looked exactly like a named human to every
 filter, chip and sort — and got an email written to it.
 """
-import os
-import tempfile
 
 import pytest
 
-from db import Database, repair_contact_email_kinds
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
+from db import repair_contact_email_kinds
 
 
 def _kind(db, contact_id):

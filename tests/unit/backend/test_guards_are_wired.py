@@ -6,22 +6,18 @@ was named after. Each test here was written against a specific mutation and
 verified to fail when that change is reverted.
 """
 import asyncio
-import os
-import tempfile
 
 import pytest
 
 import main
-from db import Database, _looks_like_role_local, now_iso
+from db import _looks_like_role_local, now_iso
 from models import ContactUpdate
 
 
 @pytest.fixture
-def db(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmp:
-        fresh = Database(os.path.join(tmp, "test.db"))
-        monkeypatch.setattr(main, "db", fresh)
-        yield fresh
+def db(wired_db):
+    """Named `db` locally so every test below reads the wired database."""
+    return wired_db
 
 
 def _emailed_contact(db, address="careers@acme.com"):
@@ -235,8 +231,7 @@ class TestPersonFinderApprovalCrossesTheContactBoundary:
         import asyncio
 
         from models import PersonApproveRequest
-        from tests.unit.backend.test_person_finder import (
-            FakeEnrichment, _staged_job)
+        from _person_fixtures import FakeEnrichment, _staged_job
         from person_finder import PersonFinderService
 
         monkeypatch.setattr(main, "person_finder",

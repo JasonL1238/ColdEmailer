@@ -1,12 +1,10 @@
 """Person finder: disambiguation scoring, staged results, email labeling."""
 import json
-import os
-import tempfile
 
 import pytest
 
 import person_finder as pf
-from db import Database
+from _person_fixtures import FakeEnrichment, _staged_job
 from person_finder import (
     PersonFinderService,
     build_criteria,
@@ -18,12 +16,6 @@ from person_finder import (
     years_overlap,
     _past_employer_mentioned,
 )
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 @pytest.fixture
@@ -244,28 +236,6 @@ class TestScoring:
             self._candidate("Northwestern University, 2018 - 2022"),
             self._criteria())
         assert any(s["signal"] == "years" for s in verdict["matched_signals"])
-
-
-class FakeScraper:
-    def __init__(self, pages=None):
-        self.pages = pages or {}
-        self.fetched = []
-
-    def fetch_html(self, url):
-        self.fetched.append(url)
-        return self.pages.get(url)
-
-    def extract_text(self, html):
-        return html
-
-
-class FakeEnrichment:
-    def __init__(self, website=None, pages=None):
-        self.scraper = FakeScraper(pages)
-        self._website = website
-
-    def find_website(self, _name):
-        return self._website
 
 
 def serp_router(mapping):
@@ -657,51 +627,6 @@ class TestFoundSourcesStage:
         assert len(seen) == pf.FOUND_SOURCES_TOP_N
 
 
-def _staged_job(db, *, emails=None, linkedin="https://www.linkedin.com/in/jane-doe",
-                company=None):
-    """A finished person_finder job with one staged candidate."""
-    candidate = {
-        "id": "c1",
-        "name": "Jane Doe",
-        "role": "VP Engineering",
-        "linkedin_url": linkedin,
-        "linkedin_verified": bool(linkedin),
-        "source_url": linkedin or "https://acme.com/team",
-        "confidence": "strong",
-        "score": 5.0,
-        "matched_signals": [{"signal": "company:Acme",
-                             "evidence": "VP Engineering at Acme",
-                             "source_url": "https://acme.com/team"}],
-        "conflicting_signals": [],
-        "evidence": [{"source_url": "https://acme.com/team",
-                      "snippet": "Jane Doe leads engineering at Acme"}],
-        "channels": [{"kind": "github", "url": "https://github.com/janedoe"}],
-        "emails": emails if emails is not None else [{
-            "email": "jane.doe@acme.com", "origin": "found",
-            "domain_kind": "company", "source_url": "https://acme.com/team",
-            "email_kind": "personal", "email_person_match": True,
-            "email_mx_ok": True, "email_verified": True,
-        }, {
-            "email": "jdoe@acme.com", "origin": "guessed",
-            "domain_kind": "company", "source_url": None,
-            "email_kind": "pattern_guess", "email_person_match": True,
-            "email_mx_ok": True, "email_verified": False,
-        }],
-        "llm_summary": None,
-        "approved_contact_id": None,
-    }
-    job = db.create_job("person_finder", {"name": "Jane Doe"})
-    db.finish_job(job["id"], status="done", result={
-        "query": {"name": "Jane Doe", "company_name": "Acme"},
-        "company": company or {"company_id": None, "name": "Acme",
-                               "domain": "acme.com",
-                               "url": "https://acme.com"},
-        "candidates": [candidate],
-        "keyless": True, "timed_out": False, "searches_used": 3,
-    })
-    return job["id"]
-
-
 class TestApproval:
     @pytest.fixture
     def wired(self, db, monkeypatch, mx_true):
@@ -963,3 +888,93 @@ class TestSmtpConfirmedGuessApproval:
         events = {r["event"] for r in db.query(
             "SELECT event FROM events WHERE entity_id=?", (contact["id"],))}
         assert {"email_user_confirmed", "mailbox_confirmed"} <= events
+
+
+class TestCorroboratedGuessApproval:
+    """The second way a guess earns its way out of "note only".
+
+    Outbound port 25 is blocked on most home networks, so the mailbox probe
+    usually cannot run at all. A public corpus showing the address in use under
+    this person's name is the alternative — and it is the stronger evidence of
+    the two, because a mail server can only say a mailbox exists while a signed
+    commit says whose it is. It still proves nothing about ownership *today*,
+    so it lands on the same human assertion and the same email_verified=0.
+    """
+
+    @pytest.fixture
+    def wired(self, db, monkeypatch, mx_true):
+        import main
+        monkeypatch.setattr(main, "db", db)
+        monkeypatch.setattr(
+            main, "person_finder", PersonFinderService(db, FakeEnrichment()))
+        return main
+
+    def _guess(self, corroboration):
+        return [{"email": "jane.doe@acme.com", "origin": "guessed",
+                 "domain_kind": "company", "source_url": None,
+                 "email_kind": "pattern_guess", "email_person_match": True,
+                 "email_mx_ok": True, "email_verified": False,
+                 "smtp_status": None, "corroboration": corroboration}]
+
+    def _approve(self, main_mod, job_id, **kw):
+        import asyncio
+        from models import PersonApproveRequest
+        return asyncio.run(main_mod.approve_person_candidate(
+            job_id, PersonApproveRequest(candidate_id="c1", **kw)))
+
+    def test_corroborated_under_this_name_saves_but_never_verified(
+            self, db, wired):
+        job_id = _staged_job(db, emails=self._guess({
+            "found": True, "sources": ["github_commit"],
+            "names": ["Jane Doe"], "name_match": True,
+            "evidence_url": "https://github.com/o/r/commit/abc"}))
+        out = self._approve(wired, job_id, email="jane.doe@acme.com",
+                            confirm_email_ownership=True)
+        contact = out["contact"]
+        assert contact["email"] == "jane.doe@acme.com"
+        assert contact["email_verified"] == 0
+        assert contact["person_verified"] == 0
+        # The note must describe the evidence that actually existed, not the
+        # mailbox probe that never ran.
+        assert "github_commit" in (contact["notes"] or "")
+        events = {r["event"] for r in db.query(
+            "SELECT event FROM events WHERE entity_id=?", (contact["id"],))}
+        assert {"email_user_confirmed", "address_corroborated"} <= events
+        assert "mailbox_confirmed" not in events
+
+    def test_anonymous_corroboration_is_refused(self, db, wired):
+        """A hit with no name attached shows the address is real but not whose.
+
+        lore.kernel.org is the measured case: only 8 of 199 matching entries
+        carried the address in a From header.
+        """
+        import main
+        job_id = _staged_job(db, emails=self._guess({
+            "found": True, "sources": ["mailing_list"], "names": [],
+            "name_match": None}))
+        with pytest.raises(main.HTTPException) as caught:
+            self._approve(wired, job_id, email="jane.doe@acme.com",
+                          confirm_email_ownership=True)
+        assert caught.value.status_code == 400
+
+    def test_a_namesakes_real_address_is_refused(self, db, wired):
+        """The address is genuinely real and belongs to someone else."""
+        import main
+        job_id = _staged_job(db, emails=self._guess({
+            "found": True, "sources": ["github_commit"],
+            "names": ["Bob Stone"], "name_match": False}))
+        with pytest.raises(main.HTTPException) as caught:
+            self._approve(wired, job_id, email="jane.doe@acme.com",
+                          confirm_email_ownership=True)
+        assert caught.value.status_code == 400
+
+    def test_corroborated_without_ownership_is_refused(self, db, wired):
+        import main
+        job_id = _staged_job(db, emails=self._guess({
+            "found": True, "sources": ["github_commit"],
+            "names": ["Jane Doe"], "name_match": True}))
+        with pytest.raises(main.HTTPException) as caught:
+            self._approve(wired, job_id, email="jane.doe@acme.com")
+        assert caught.value.status_code == 400
+        assert "confirm_email_ownership" in str(caught.value.detail)
+        assert "public source" in str(caught.value.detail)

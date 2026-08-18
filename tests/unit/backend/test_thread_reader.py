@@ -10,16 +10,11 @@ Every test here is one of three things:
     message the dashboard counts, because both ask the same function.
 """
 import base64
-import os
-import tempfile
 from unittest.mock import MagicMock
-
-import pytest
-from fastapi.testclient import TestClient
 
 import main
 import thread_reader
-from db import Database, now_iso
+from db import now_iso
 from response_checker import AUTO, BOUNCE, OWN, REPLY
 
 
@@ -435,14 +430,6 @@ class TestParseThread:
 
 
 # ------------------------------------------------------- the HTTP endpoint
-
-@pytest.fixture
-def client(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmp:
-        database = Database(os.path.join(tmp, "t.db"))
-        monkeypatch.setattr(main, "db", database)
-        yield TestClient(main.app), database
-
 
 def _delivered_email(database, **over):
     company = database.create_company(name="ZZTEST Co", url="https://zz.example")

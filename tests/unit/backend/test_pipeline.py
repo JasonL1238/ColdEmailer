@@ -9,15 +9,8 @@ bounced, one marked `replied` on a flag the current checker never verified.
 Getting those wrong is not a cosmetic bug. A contact filed under a stage that
 means "handled" is a person who never gets written to again.
 """
-import os
-import tempfile
-
-import pytest
-from fastapi.testclient import TestClient
-
-import main
 import pipeline
-from db import Database, now_iso
+from db import now_iso
 
 
 def row(**over):
@@ -293,14 +286,6 @@ class TestBuild:
         # all three are `ready` here — none has a delivered email
         ready = next(s for s in out["stages"] if s["key"] == "ready")
         assert [c["id"] for c in ready["cards"]] == ["sent", "amy", "zed"]
-
-
-@pytest.fixture
-def client(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmp:
-        database = Database(os.path.join(tmp, "t.db"))
-        monkeypatch.setattr(main, "db", database)
-        yield TestClient(main.app), database
 
 
 class TestPipelineEndpoint:

@@ -16,8 +16,6 @@ The rules a cadence has to keep, and which each test below pins:
 * every rung says something different, in AI mode *and* in template mode.
 """
 import asyncio
-import os
-import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -28,12 +26,6 @@ from fastapi import HTTPException
 import main
 from db import Database, normalize_follow_up_cadence
 from models import ContactUpdate
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 def _days_ago(n):
@@ -262,7 +254,7 @@ def test_one_definition_of_a_follow_up_serves_every_counter(db):
 def test_the_legacy_import_marks_a_follow_up_by_either_signal(tmp_path):
     """Normalised on the way in rather than teaching every reader to cope."""
     import json as _json
-    from db import Database, migrate_legacy_data
+    from db import migrate_legacy_data
     data = tmp_path / "data"
     data.mkdir()
     (data / "generated_emails.json").write_text(_json.dumps({

@@ -5,20 +5,12 @@ scraping failed — the same field the composer quotes as established fact. An
 email would then tell a real person what their own company does on the
 strength of nothing but a search result.
 """
-import os
-import tempfile
 
 import pytest
 
-from db import Database, repair_speculative_company_summaries
+from db import repair_speculative_company_summaries
 from email_composer import EmailComposer
 from resume_service import ResumeService
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 class TestDiscoveryNoteIsSeparateFromResearch:

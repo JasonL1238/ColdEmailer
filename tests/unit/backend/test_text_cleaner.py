@@ -1,5 +1,5 @@
 import pytest
-from backend.text_cleaner import TextCleaner
+from text_cleaner import TextCleaner
 
 
 class TestTextCleaner:

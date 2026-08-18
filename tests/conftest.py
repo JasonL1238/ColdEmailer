@@ -4,6 +4,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 project_root = Path(__file__).parent.parent
 backend_path = project_root / "backend"
 sys.path.insert(0, str(backend_path))
@@ -52,3 +54,54 @@ for _key in ('GOOGLE_AI_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY',
              'OLLAMA_BASE_URL', 'GITHUB_TOKEN', 'SEC_CONTACT_EMAIL',
              'MAILBOX_VERIFY', 'SMTP_PROBE_HELO', 'SMTP_PROBE_FROM'):
     os.environ[_key] = ''
+
+# ADDRESS_CORROBORATION cannot join the loop above: it defaults ON, so blanking
+# it would *enable* corroboration and send every test that produces a pattern
+# guess at live GitHub, Gravatar and lore. It needs the explicit off value, and
+# tests that exercise it turn it on with an injected http_get.
+os.environ['ADDRESS_CORROBORATION'] = '0'
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures.
+#
+# `db` was copy-pasted verbatim into fourteen backend test modules, `client`
+# into three more, and `wired_db` into two; there is now one definition of each
+# to keep honest. Backend imports stay *inside* the fixture bodies on purpose:
+# everything above exists to fix the environment before any backend module is
+# imported, and a top-level `import main` here would run at collection time and
+# quietly undo that ordering.
+
+
+@pytest.fixture
+def db():
+    """A throwaway database on its own temp directory, deleted per test."""
+    from db import Database
+
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Database(os.path.join(tmp, "test.db"))
+
+
+@pytest.fixture
+def wired_db(monkeypatch):
+    """`db`, plus rebinding `main.db` so the HTTP handlers read it too."""
+    import main
+    from db import Database
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fresh = Database(os.path.join(tmp, "test.db"))
+        monkeypatch.setattr(main, "db", fresh)
+        yield fresh
+
+
+@pytest.fixture
+def client(monkeypatch):
+    """A TestClient over a throwaway database, yielded alongside it."""
+    import main
+    from db import Database
+    from fastapi.testclient import TestClient
+
+    with tempfile.TemporaryDirectory() as tmp:
+        database = Database(os.path.join(tmp, "t.db"))
+        monkeypatch.setattr(main, "db", database)
+        yield TestClient(main.app), database

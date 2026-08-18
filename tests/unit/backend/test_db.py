@@ -1,18 +1,8 @@
 """Tests for the SQLite storage layer."""
 import json
-import os
-import tempfile
 from datetime import datetime, timedelta
 
-import pytest
-
 from db import Database, migrate_legacy_data, repair_delivered_email_status
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 def test_profile_defaults_and_update(db):

@@ -7,24 +7,16 @@ hard bounces are what turn a Gmail account into a spam-foldered one, so the
 cost landed on the deliverable addresses rather than the dead one.
 """
 import itertools
-import os
-import tempfile
 from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 
 import main
-from db import Database, now_iso
+from db import now_iso
 from response_checker import AUTO, BOUNCE, OWN, REPLY, ResponseChecker
 
 _seq = itertools.count()
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 def _gmail(messages, headers_by_id):

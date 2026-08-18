@@ -10,18 +10,10 @@ The concrete failure it enables: a follow-up is composed as "following up on my
 note from <date>" and is addressed by the same join, so it arrives at someone
 who never received the note.
 """
-import os
-import tempfile
 
 import pytest
 
-from db import Database, now_iso
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
+from db import now_iso
 
 
 @pytest.fixture

@@ -12,16 +12,10 @@ when it is new, which makes this the most tempting place in the app to render
 "1 of 3" as 33%. The floor is the same one `analytics` uses, imported rather
 than re-declared.
 """
-import os
-import tempfile
-
-import pytest
-from fastapi.testclient import TestClient
-
 import campaigns
 import main
 from analytics import MIN_SAMPLE
-from db import Database, now_iso
+from db import now_iso
 
 
 def row(**over):
@@ -123,14 +117,6 @@ class TestBuild:
         assert out["campaigns"] == []
         assert out["unassigned"]["sent"] == 0
         assert out["min_sample"] == MIN_SAMPLE
-
-
-@pytest.fixture
-def client(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmp:
-        database = Database(os.path.join(tmp, "t.db"))
-        monkeypatch.setattr(main, "db", database)
-        yield TestClient(main.app), database
 
 
 def _seed(database, campaign_id=None):

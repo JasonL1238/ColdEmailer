@@ -1,6 +1,6 @@
 import pytest
 from datetime import datetime, timedelta
-from backend.rate_limiter import RateLimiter
+from rate_limiter import RateLimiter
 
 
 class TestRateLimiter:
@@ -139,7 +139,7 @@ class TestRateLimiter:
         # Mock datetime.now to return base_time
         def mock_now():
             return base_time
-        monkeypatch.setattr('backend.rate_limiter.datetime', type('MockDatetime', (), {
+        monkeypatch.setattr('rate_limiter.datetime', type('MockDatetime', (), {
             'now': staticmethod(mock_now),
             'datetime': datetime
         })())

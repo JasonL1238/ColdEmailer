@@ -17,23 +17,12 @@ dangerous than a missing one, because the user acts on it.
 """
 import asyncio
 import itertools
-import os
-import tempfile
 from datetime import datetime, timedelta
-
-import pytest
 
 import analytics
 import main
-from db import Database
 
 _seq = itertools.count()
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 def _rows(n, replied=0, unverified=0, **fields):

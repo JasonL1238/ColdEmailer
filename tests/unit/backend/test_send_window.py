@@ -17,7 +17,6 @@ through a sleeping thread.
 import itertools
 import os
 import sys
-import tempfile
 import types
 from datetime import datetime, timedelta
 
@@ -28,19 +27,12 @@ from zoneinfo import ZoneInfo
 
 import main
 import send_window
-from db import Database
 from models import SendRequest, SendWindowUpdate
 
 _seq = itertools.count()
 
 # Monday 2026-08-03 at 09:00 — inside a default weekday 8–5 window.
 MONDAY_9AM = datetime(2026, 8, 3, 9, 0)
-
-
-@pytest.fixture
-def db():
-    with tempfile.TemporaryDirectory() as tmp:
-        yield Database(os.path.join(tmp, "test.db"))
 
 
 def _recently(hours=1):
