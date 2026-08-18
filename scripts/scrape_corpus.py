@@ -8,14 +8,16 @@ crawls broader than production: every same-domain link it can reach within the
 budget, plus `/sitemap.xml`, `/robots.txt`, and the conventional paths the
 crawler guesses.
 
+    python scripts/scrape_corpus.py capture       # every site in scripts/corpus_sites.txt
     python scripts/scrape_corpus.py capture "Acme=https://acme.com" --archetype spa
+    python scripts/scrape_corpus.py capture --dry-run     # print the plan, fetch nothing
     python scripts/scrape_corpus.py list
     python scripts/scrape_corpus.py survey        # JSON-LD / sitemap prevalence
 
-Replay happens at the `fetch_html` seam, the same injection point the existing
-tests use (`service.scraper = fixture`, tests/unit/backend/test_scraping_rigor.py).
-That exercises the whole enrichment crawl while never touching the SSRF guard —
-no localhost server, and therefore no test-only bypass that could leak into
+Replay is not this module's job: `scripts/measure_shipped.py` reads each
+captured `site.json` and feeds the stored bodies straight to
+`enrichment.extract_*`. Measurement therefore never touches the network or the
+SSRF guard — no localhost server, and no test-only bypass that could leak into
 production.
 """
 from __future__ import annotations
@@ -33,6 +35,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 
 CORPUS_DIR = os.path.join(ROOT, "tests", "fixtures", "corpus")
+# The curated site list `capture` falls back to: `archetype<TAB>Name=url` rows.
+SITES_FILE = os.path.join(ROOT, "scripts", "corpus_sites.txt")
 
 # Broader than the production crawler on purpose — see module docstring.
 CAPTURE_PATHS = (
@@ -127,63 +131,6 @@ class CorpusSite:
                 "pages": self.pages,
             }, handle, indent=1)
         return path
-
-    def body(self, url: str) -> Optional[str]:
-        page = self.pages.get(_norm(url))
-        if not page or page.get("status", 0) >= 400:
-            return None
-        return page.get("body")
-
-    def status(self, url: str) -> int:
-        page = self.pages.get(_norm(url))
-        return page.get("status", 404) if page else 404
-
-
-class CorpusScraper:
-    """Replay stand-in for `WebScraper`, injected as `service.scraper`.
-
-    Shaped like the fixture scrapers the test suite already uses. It
-    deliberately omits `delay_override` and `browser_session` so `enrich()`'s
-    `hasattr` guards skip them, and records every request so an arm can be
-    scored on wasted fetches as well as pages found.
-    """
-
-    def __init__(self, site: CorpusSite):
-        self.site = site
-        self.requested: List[str] = []
-        self.misses: List[str] = []
-        self.min_delay = 0
-
-    def fetch_html(self, url: str) -> Optional[str]:
-        self.requested.append(url)
-        body = self.site.body(url)
-        if body is None:
-            self.misses.append(url)
-        return body
-
-    def extract_text(self, html: str) -> Optional[str]:
-        if not html:
-            return None
-        try:
-            import trafilatura
-            extracted = trafilatura.extract(html)
-            if extracted:
-                return extracted
-        except Exception:
-            pass
-        try:
-            from bs4 import BeautifulSoup
-            return BeautifulSoup(html, "lxml").get_text(" ", strip=True)
-        except Exception:
-            return None
-
-    def stats(self) -> Dict:
-        return {
-            "requests": len(self.requested),
-            "misses": len(self.misses),
-            "wasted_rate": (round(len(self.misses) / len(self.requested), 3)
-                            if self.requested else 0.0),
-        }
 
 
 # --- capture ------------------------------------------------------------
@@ -402,6 +349,22 @@ def _person_tiers(node: Dict) -> Dict[str, bool]:
 
 # --- cli ----------------------------------------------------------------
 
+def load_site_list(path: str = SITES_FILE) -> List[tuple]:
+    """Parse the curated corpus list into (archetype, "Name=url") pairs."""
+    rows: List[tuple] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            archetype, _, target = line.partition("\t")
+            if not target:
+                raise SystemExit(
+                    f"{path}: expected 'archetype<TAB>Name=url', got {line!r}")
+            rows.append((archetype.strip(), target.strip()))
+    return rows
+
+
 def list_slugs() -> List[str]:
     if not os.path.isdir(CORPUS_DIR):
         return []
@@ -414,9 +377,15 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     cap = sub.add_parser("capture", help="mirror one or more sites")
-    cap.add_argument("targets", nargs="+", help="Company=https://company.com")
-    cap.add_argument("--archetype", default="unknown")
+    cap.add_argument("targets", nargs="*",
+                     help="Company=https://company.com; default: every site "
+                          "in scripts/corpus_sites.txt")
+    cap.add_argument("--archetype", default="unknown",
+                     help="archetype for command-line targets; sites from the "
+                          "list carry their own")
     cap.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
+    cap.add_argument("--dry-run", action="store_true",
+                     help="print the capture plan and exit, fetching nothing")
 
     sub.add_parser("list", help="show captured sites")
     sub.add_parser("survey", help="JSON-LD / sitemap / bot-wall prevalence")
@@ -424,13 +393,28 @@ def main():
     args = parser.parse_args()
 
     if args.command == "capture":
-        for target in args.targets:
+        if args.targets:
+            plan = [(args.archetype, t) for t in args.targets]
+            source = "command line"
+        else:
+            plan = load_site_list()
+            source = os.path.relpath(SITES_FILE, ROOT)
+        # Printed before the first request so a mistyped command cannot start
+        # an unattended crawl of third-party servers without saying so.
+        print(f"plan: {len(plan)} site(s) from {source}, <= {args.max_pages} "
+              f"pages each at {CAPTURE_DELAY_SEC}s/request "
+              f"(the full list is ~300MB, one polite pass)")
+        if args.dry_run:
+            for archetype, target in plan:
+                print(f"  [{archetype}] {target}")
+            return
+        for archetype, target in plan:
             if "=" not in target:
                 raise SystemExit("targets look like Company=https://company.com")
             name, url = target.split("=", 1)
-            print(f"capturing {name.strip()} ({url.strip()})")
+            print(f"capturing {name.strip()} ({url.strip()}) [{archetype}]")
             site = capture_site(name.strip(), url.strip(),
-                                args.archetype, args.max_pages)
+                                archetype, args.max_pages)
             path = site.save(slugify(name))
             print(f"  -> {len(site.pages)} pages, {path}")
         return

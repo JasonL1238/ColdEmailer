@@ -16,7 +16,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ("map.md", "architecture.md", "testing.md", "decisions.md")
-IGNORED_DIRS = {"node_modules", "venv", ".git", "dist", "build", "__pycache__"}
+# Tool caches are skipped too: .pytest_cache ships a README.md, so the file
+# count moved every time a cache was cleared.
+IGNORED_DIRS = {"node_modules", "venv", ".git", "dist", "build", "__pycache__",
+                ".pytest_cache", ".mypy_cache", ".ruff_cache", "output"}
 # `[text](target)`, skipping images and anything with a scheme or an anchor-only
 # target. Trailing `#section` is stripped before the file is checked.
 LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)\s]+)\)")
@@ -55,10 +58,12 @@ def main() -> int:
         if f"docs/{name}" not in root_agents:
             errors.append(f"root AGENTS.md does not route to docs/{name}")
 
+    links = 0
     for path in markdown_files():
         for target in LINK_RE.findall(path.read_text(encoding="utf-8")):
             if "://" in target or target.startswith(("#", "mailto:")):
                 continue
+            links += 1
             resolved = (path.parent / target.split("#", 1)[0]).resolve()
             if not resolved.exists():
                 errors.append(
@@ -71,7 +76,8 @@ def main() -> int:
         return 1
 
     print(f"Agent documentation check passed "
-          f"({len(adapters)} adapter pairs, {len(markdown_files())} files linked).")
+          f"({len(adapters)} adapter pairs, {len(markdown_files())} docs, "
+          f"{links} links checked).")
     return 0
 
 
