@@ -337,7 +337,7 @@ def _github_headers(token: Optional[str]) -> Dict[str, str]:
     return headers
 
 
-def _github_json(url: str, *, token, http_get, budget) -> Optional[Any]:
+def github_json(url: str, *, token, http_get, budget) -> Optional[Any]:
     fetched = guarded_get_json(url, headers=_github_headers(token),
                                http_get=http_get, budget=budget)
     if fetched is None:
@@ -429,7 +429,7 @@ def profile_name_matches(target: str, profile_name: Optional[str]) -> bool:
 def _verify_login(login: str, name: str, company: Optional[str], *, token,
                   http_get, budget) -> Optional[Dict]:
     """A login is only accepted when the profile itself corroborates it."""
-    profile = _github_json(f"{GITHUB_API}/users/{login}",
+    profile = github_json(f"{GITHUB_API}/users/{login}",
                            token=token, http_get=http_get, budget=budget)
     if not isinstance(profile, dict) or profile.get("type") != "User":
         return None
@@ -462,7 +462,7 @@ def github_search_logins(name: str, *, token=None, http_get=None,
     ]
     out: List[str] = []
     for query in queries:
-        data = _github_json(
+        data = github_json(
             f"{GITHUB_API}/search/users?q={quote(query)}&per_page=5",
             token=token, http_get=http_get, budget=budget)
         for item in (data or {}).get("items", []):
@@ -536,7 +536,7 @@ def github_repo_commits(login: str, *, limit: int = 8, token=None,
     The events feed only covers ~90 days, so an occasional contributor looks
     silent there while their commits sit in their own repositories.
     """
-    repos = _github_json(
+    repos = github_json(
         f"{GITHUB_API}/users/{login}/repos?sort=pushed&per_page=10",
         token=token, http_get=http_get, budget=budget)
     out: List[Tuple[str, str]] = []
@@ -544,7 +544,7 @@ def github_repo_commits(login: str, *, limit: int = 8, token=None,
         full = repo.get("full_name")
         if not full or repo.get("fork"):
             continue
-        commits = _github_json(
+        commits = github_json(
             f"{GITHUB_API}/repos/{full}/commits?author={login}&per_page=5",
             token=token, http_get=http_get, budget=budget)
         for commit in commits or []:
@@ -564,7 +564,7 @@ def github_push_heads(login: str, *, limit: int = 20, token=None,
     0 of 350 PushEvents carry it), and a stale fixture that still has it must
     not silently become the answer.
     """
-    events = _github_json(
+    events = github_json(
         f"{GITHUB_API}/users/{login}/events/public?per_page=100",
         token=token, http_get=http_get, budget=budget)
     heads: List[Tuple[str, str]] = []
@@ -602,7 +602,7 @@ def github_commit_author(repo: str, sha: str, *, token=None, http_get=None,
         # people's commits. Picking the first would be a guess, so ask the API
         # which identity GitHub itself attributes the commit to.
 
-    data = _github_json(f"{GITHUB_API}/repos/{repo}/commits/{sha}",
+    data = github_json(f"{GITHUB_API}/repos/{repo}/commits/{sha}",
                         token=token, http_get=http_get, budget=budget)
     if not isinstance(data, dict):
         return None
