@@ -178,7 +178,10 @@ def contact_notes(candidate: Dict) -> Optional[str]:
         notes.append("Email local-part does not clearly match this person's name.")
     if candidate.get("linkedin_verified"):
         source = candidate.get("linkedin_source")
-        if source == "web_search":
+        if source == "user_provided":
+            notes.append(
+                "LinkedIn profile supplied directly by you as the identity anchor.")
+        elif source == "web_search":
             notes.append("LinkedIn found via web search; slug matches this person's name.")
         else:
             notes.append("LinkedIn URL slug matches this person's name.")

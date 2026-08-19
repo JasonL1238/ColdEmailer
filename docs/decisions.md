@@ -132,6 +132,28 @@ Sachs), and the ground-truth profiles were themselves produced by this
 extractor — so the benchmark is homogeneous *and* optimistic. Treat these as
 relative improvements, not as an expected real-world hit rate.
 
+**A user-supplied LinkedIn member URL is a constraint, not another ranking
+feature.** Ranking is useful only when identity is unknown. Once the user gives
+the exact `/in/` profile, keeping same-name alternatives wastes lookup budget
+and can attach the wrong person's channels or email to the right profile. The
+finder therefore canonicalizes the URL, seeds that exact candidate, discards
+all alternative profiles, and uses public snippets for the exact URL to fill
+explicit `role at Company` gaps. Generic personal-source routing is disabled
+for anchored runs; source adapters can use only an already-correlated direct
+channel URL. Minor public-title spelling variations are tolerated, while an
+exact-profile title that explicitly names a different person is flagged and
+its LinkedIn channel is not treated as verified. Country LinkedIn subdomains
+canonicalize to `www` instead of falling into the ambiguous no-profile pool.
+
+**Loose evidence must never be absorbed into the only LinkedIn profile.** A
+search result mentioning the same name and company is not proof that its
+Medium page, Pinterest page, GitHub account, or page-wide email belongs to the
+profile. No-profile evidence therefore stays a separate candidate even when
+only one profile was found. Before display, every unattributed found address
+must also be person-shaped for the requested name; commit/author-attributed
+addresses retain their provenance exception. This intentionally prefers no
+email over a plausible address for a namesake.
+
 **The stored `role` on these contacts leaks the answer — never quote an
 accuracy number measured with it.** 27 of the 30 ground-truth roles are
 verbatim substrings of the correct profile's own LinkedIn headline, because
@@ -210,7 +232,8 @@ and they attach to real people: two different contacts each "had"
 destroying the one domain inference that works. The two mechanisms are mutually
 destructive, so they are separated structurally rather than by comment.
 `mail_domain.py` owns the template-dense evidence path, while person finder uses
-`search(..., pool=False)` to keep those results out of its found-address pool.
+search results only for identity/domain discovery and extracts addresses only
+from fetched or source-adapter evidence.
 
 **A template address and a real one can be the same string, so provenance
 decides.** `jane@acme.com` is a documentation example on a format page and a
@@ -228,7 +251,9 @@ server policy informative; Hunter may then run.
 The negative catch-all result is cached for the domain so later patterns skip
 the redundant random-canary RCPT. None of this proves ownership: the surviving
 address stays `origin="guessed"`, never receives `email_verified`, and still
-requires the user-confirmation approval gate.
+requires the user-confirmation approval gate. Person finder does not display an
+inconclusive pattern merely because it was the most likely format: it must be
+SMTP-deliverable or independently tied to the target name by public evidence.
 
 **Team and leadership pages are identity evidence, not an email source.** 0
 emails from 862KB of measured HTML (exyn.com/about, goldmansachs.com

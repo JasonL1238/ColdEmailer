@@ -128,6 +128,14 @@ read as bugs is in [`decisions.md`](decisions.md).
 - Corroboration is positive-only. A hit means the address exists in a public
   corpus; a miss means nothing and must never be reported as evidence the
   address is fake.
+- A LinkedIn URL supplied to person finder is an identity constraint, not a
+  score bonus: only that canonical `/in/` profile survives candidate assembly.
+  Loose no-profile evidence never gets merged into a profile. Generic
+  GitHub/arXiv/website searches are disabled for anchored runs; source adapters
+  can use only a direct channel URL that was already correlated. An
+  exact-profile search that explicitly names somebody else is surfaced as a
+  conflict and is not stored as a verified LinkedIn channel. Country LinkedIn
+  subdomains canonicalize to `www` so they remain first-class profiles.
 - A guessed address becomes sendable only through the approve route, and only
   when all of: a mailbox probe returned `deliverable` OR corroboration returned
   `name_match is True`; the address matches the person (`email_person_match`);
@@ -141,12 +149,14 @@ read as bugs is in [`decisions.md`](decisions.md).
   Definitive rejections advance to the next pattern;
   the first deliverable result stops without spending Hunter, while blocked,
   greylisted, or catch-all SMTP stops pattern probing and permits the provider
-  fallback. A live guessed mailbox remains a guess and gains no verified flag.
+  fallback. Person finder hides an inconclusive guess unless a public corpus
+  independently ties that exact address to the target name. A live guessed
+  mailbox remains a guess and gains no verified flag.
 - The placeholder-address filter applies to the found path only. Mail-domain
   discovery consumes template-dense search evidence through `mail_domain.py`;
-  person finder additionally keeps those SERPs out of its found-address pool
-  with `search(..., pool=False)`. See decisions.md for the measurement that
-  forbids merging the two evidence paths.
+  person finder never treats search-result snippets as found-address evidence.
+  See decisions.md for the measurement that forbids merging the two evidence
+  paths.
 - Contact addresses are validated at ingest and again before send, so a comma or
   newline can never add a recipient or a `Bcc:` header.
 - State-changing requests from a non-allowlisted `Origin` are rejected, so another

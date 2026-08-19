@@ -98,6 +98,9 @@ describe('FindPerson', () => {
       screen.getByPlaceholderText(/Company \(e\.g\./),
       { target: { value: 'Acme' } })
     fireEvent.change(
+      screen.getByPlaceholderText(/LinkedIn profile URL/),
+      { target: { value: 'https://www.linkedin.com/in/jane-doe' } })
+    fireEvent.change(
       screen.getByPlaceholderText(/School \(e\.g\./),
       { target: { value: 'Northwestern' } })
     fireEvent.change(
@@ -105,10 +108,17 @@ describe('FindPerson', () => {
       { target: { value: '2018-2022' } })
     fireEvent.click(screen.getByText('Find this person'))
     await waitFor(() => expect(startSpy).toHaveBeenCalledWith({
-      name: 'Jane Doe', company_name: 'Acme', company_url: null,
+      name: 'Jane Doe',
+      linkedin_url: 'https://www.linkedin.com/in/jane-doe',
+      company_name: 'Acme', company_url: null,
       school: 'Northwestern', school_dates: '2018-2022',
       past_companies: null, role_hint: null, location: null, notes: null,
     }))
+  })
+
+  it('shows when a result is locked to the supplied profile', async () => {
+    await openDoneRun(doneJob({ identity_anchor: true }))
+    expect(screen.getByText('Exact profile supplied')).toBeTruthy()
   })
 
   it('labels found, guessed, and personal emails distinctly', async () => {

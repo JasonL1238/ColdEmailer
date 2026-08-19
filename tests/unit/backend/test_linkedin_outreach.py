@@ -28,6 +28,9 @@ def test_linkedin_url_validation_accepts_member_profiles_only():
     assert validate_linkedin_profile_url(
         "https://linkedin.com/in/jane-doe/?trk=company"
     ) == "https://www.linkedin.com/in/jane-doe"
+    assert validate_linkedin_profile_url(
+        "https://in.linkedin.com/in/jane-doe"
+    ) == "https://www.linkedin.com/in/jane-doe"
 
     for url in (
         "https://linkedin.com/company/acme",

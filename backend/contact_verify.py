@@ -302,11 +302,13 @@ def canonical_linkedin_profile(value: Optional[str]) -> str:
     except ValueError:
         raise ValueError("LinkedIn URL is invalid")
     host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or host not in {"linkedin.com", "www.linkedin.com"}:
+    if parsed.scheme != "https" or not is_linkedin_host(host):
         raise ValueError("Use a full https://www.linkedin.com/in/... profile URL")
-    if not parsed.path.lower().startswith("/in/"):
+    parts = [part for part in parsed.path.split("/") if part]
+    if (len(parts) != 2 or parts[0].lower() != "in"
+            or not parts[1].strip()):
         raise ValueError("LinkedIn URL must point to a member profile")
-    return f"https://www.linkedin.com{parsed.path.rstrip('/')}"
+    return f"https://www.linkedin.com/in/{parts[1]}"
 
 
 def linkedin_slug(url: Optional[str]) -> Optional[str]:
@@ -315,13 +317,19 @@ def linkedin_slug(url: Optional[str]) -> Optional[str]:
     except ValueError:
         return None
     host = (parsed.hostname or "").lower()
-    if host not in {"linkedin.com", "www.linkedin.com"}:
+    if not is_linkedin_host(host):
         return None
     path = parsed.path.rstrip("/").lower()
     if not path.startswith("/in/"):
         return None
     slug = path[4:].split("/")[0]
     return slug or None
+
+
+def is_linkedin_host(host: Optional[str]) -> bool:
+    """True for LinkedIn itself, including country subdomains such as `in`."""
+    value = (host or "").lower().rstrip(".")
+    return value == "linkedin.com" or value.endswith(".linkedin.com")
 
 
 def linkedin_matches_person(url: Optional[str], name: Optional[str]) -> bool:

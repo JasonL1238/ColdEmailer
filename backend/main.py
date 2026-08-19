@@ -399,6 +399,7 @@ async def start_person_finder(payload: PersonFindRequest):
     try:
         job = person_finder.start(
             name=payload.name,
+            linkedin_url=payload.linkedin_url,
             company_name=payload.company_name,
             company_url=payload.company_url,
             school=payload.school,
@@ -548,6 +549,7 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
         "email": "" if is_guess else (selected["email"] if selected else ""),
         "linkedin_url": (cand.get("linkedin_url") or None)
         if payload.include_linkedin else None,
+        "linkedin_source": cand.get("linkedin_source"),
         "role": cand.get("role"),
         "source_url": ((selected or {}).get("source_url")
                        or best_evidence.get("source_url")
@@ -560,6 +562,20 @@ async def approve_person_candidate(job_id: str, payload: PersonApproveRequest):
         "affinity": [],
     }
     annotated = annotate_contact(boundary, check_mx=bool(selected))
+    # A custom LinkedIn slug may contain no recognizable name. For this one
+    # workflow, the exact URL the user supplied is the identity evidence. The
+    # override is bound to the immutable staged query and is refused when the
+    # exact-profile search explicitly named someone else.
+    supplied_linkedin = (result.get("query") or {}).get("linkedin_url")
+    if (payload.include_linkedin and supplied_linkedin
+            and cand.get("identity_anchor")
+            and not cand.get("identity_anchor_conflict")):
+        # Both values came from PersonFindRequest's shared canonicalizer; an
+        # exact comparison is therefore the strongest and simplest binding.
+        if boundary["linkedin_url"] == supplied_linkedin:
+            annotated["linkedin_person_match"] = True
+            annotated["linkedin_verified"] = True
+            annotated["person_verified"] = True
     email0, linkedin0 = verified_channels(annotated)
 
     confirmed_email = None

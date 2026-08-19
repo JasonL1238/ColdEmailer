@@ -12,7 +12,7 @@ Enter the smallest relevant area before searching broadly.
 | `jobs.py` | Shared background-job cancellation contract, plus the `SingleSlotJob` one-at-a-time mixin | `test_pipeline.py`, job tests |
 | `discovery.py` | Company discovery jobs, junk-site filtering | `test_discovery_*.py` |
 | `deep_research.py` | Deep company/contact research, criteria, evidence | `test_deep_research.py` |
-| `person_finder.py` | Find-one-person search, staged review, approval into the contact boundary | `test_person_finder.py` |
+| `person_finder.py` | Find-one-person search, optional exact-LinkedIn identity anchoring, staged review, approval into the contact boundary | `test_person_finder.py` |
 | `mail_domain.py` | Conservative website-domain → employee-mail-domain inference using public sightings plus shared mail tenancy | `test_mail_domain.py`, `test_person_finder.py` |
 | `found_email.py` | Self-published address sources (GitHub commits, arXiv, EDGAR) behind an injectable, SSRF-guarded HTTP seam | `test_found_email.py` |
 | `mailbox_verify.py` | "Does this mailbox exist" over direct SMTP first, then an HTTPS fallback; never sends mail | `test_mailbox_verify.py` |

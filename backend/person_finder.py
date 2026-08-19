@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from difflib import SequenceMatcher
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -35,7 +36,9 @@ from contact_enrich import (
     probe_pattern_guesses,
 )
 from contact_verify import (
+    canonical_linkedin_profile,
     domain_has_mx,
+    email_matches_person,
     name_appears_in,
     is_generic_inbox,
     linkedin_matches_person,
@@ -296,22 +299,7 @@ def merge_person_candidates(candidates: List[Dict]) -> List[Dict]:
             if item.get("source_url") not in known:
                 existing["evidence"].append(item)
                 known.add(item.get("source_url"))
-    result = [merged[k] for k in order]
-    # A lone profile candidate absorbs the pooled no-profile evidence — with
-    # several same-named profiles, attributing it would guess who it belongs
-    # to, so it stays its own (honestly weak) candidate.
-    profiles = [c for c in result if c.get("linkedin_url")]
-    if len(profiles) == 1 and "nm:no-profile" in merged:
-        loose = merged["nm:no-profile"]
-        keeper = profiles[0]
-        known = {e.get("source_url") for e in keeper["evidence"]}
-        for item in loose.get("evidence") or []:
-            if item.get("source_url") not in known:
-                keeper["evidence"].append(item)
-        if not keeper.get("role") and loose.get("role"):
-            keeper["role"] = loose["role"]
-        result = profiles
-    return result
+    return [merged[k] for k in order]
 
 
 # Signal families for confidence: a bare name match can never be "strong" —
@@ -440,7 +428,13 @@ def score_candidate(candidate: Dict, criteria: Dict) -> Dict:
         if hit:
             score += award("location", f"location:{criteria['location']}", *hit)
 
-    if len(families) >= 2 and score >= 4.0:
+    identity_conflict = candidate.get("identity_anchor_conflict_evidence")
+    if identity_conflict:
+        conflicting.insert(0, dict(identity_conflict))
+
+    if identity_conflict:
+        confidence = "weak"
+    elif len(families) >= 2 and score >= 4.0:
         confidence = "strong"
     elif families:
         confidence = "possible"
@@ -482,6 +476,119 @@ def _domain_from_url(url: Optional[str]) -> Optional[str]:
     return host or None
 
 
+def _same_linkedin_profile(value: Optional[str], target: Optional[str]) -> bool:
+    """Compare member URLs canonically; malformed/search noise never matches."""
+    if not value or not target:
+        return False
+    try:
+        return canonical_linkedin_profile(value) == target
+    except ValueError:
+        return False
+
+
+def _company_from_linkedin_results(
+        name: str, results: List[Dict]) -> Optional[str]:
+    """Infer a current company only from explicit exact-profile wording.
+
+    LinkedIn snippets are incomplete and occasionally stale, so loose title
+    segments are not enough. Accept only statements shaped like ``role at X``,
+    ``works at X``, or ``current company: X`` on a result that names the target.
+    """
+    patterns = (
+        re.compile(r"\b(?:works?|working)\s+at\s+([^|·•;]{2,120})", re.I),
+        re.compile(r"\bcurrent\s+(?:company|employer)\s*:\s*"
+                   r"([^|·•;]{2,120})", re.I),
+        re.compile(r"\b(?:[A-Za-z][A-Za-z/&+.'’-]*\s+){0,5}at\s+"
+                   r"([^|·•;]{2,120})", re.I),
+    )
+    for result in results or []:
+        title = result.get("title") or ""
+        body = result.get("body") or ""
+        head = re.split(r"\s*[-–—|]\s*", title)[0].strip()
+        if not _names_near(name, head):
+            continue
+        for blob in (title, body):
+            for pattern in patterns:
+                match = pattern.search(blob)
+                if not match:
+                    continue
+                company = re.sub(
+                    r"\s+(?:on|and|with)\s+LinkedIn.*$", "",
+                    match.group(1), flags=re.I).strip(" .,-–—")
+                if (2 <= len(company) <= 120
+                        and not re.fullmatch(r"linkedin", company, re.I)):
+                    return company
+    return None
+
+
+def _names_near(name: str, displayed: str) -> bool:
+    """Allow a minor spelling variation while still rejecting a namesake."""
+    wanted = name_tokens(name)
+    got = name_tokens(displayed)
+    return bool(
+        len(wanted) >= 2 and len(got) >= 2
+        and SequenceMatcher(None, wanted[0], got[0]).ratio() >= 0.84
+        and SequenceMatcher(None, wanted[-1], got[-1]).ratio() >= 0.84
+    )
+
+
+def _linkedin_name_conflict(name: str, results: List[Dict]) -> Optional[Dict]:
+    """Return explicit exact-profile evidence that names a different person."""
+    for result in results or []:
+        title = (result.get("title") or "").strip()
+        head = re.split(r"\s*[-–—|]\s*", title)[0].strip()
+        head_tokens = name_tokens(head)
+        if (len(head_tokens) >= 2
+                and not _names_near(name, head)
+                and "linkedin" not in head.lower()):
+            return {
+                "signal": "linkedin:name_conflict",
+                "evidence": title[:220],
+                "source_url": result.get("href") or result.get("url") or "",
+            }
+    return None
+
+
+def _linkedin_anchor_candidate(
+        name: str, linkedin_url: str, results: List[Dict],
+        company_name: str) -> Dict:
+    """Build the supplied-profile candidate from exact-URL public snippets."""
+    role = None
+    evidence = []
+    for result in results or []:
+        title = (result.get("title") or "").strip()
+        body = (result.get("body") or "").strip()
+        head = re.split(r"\s*[-–—|]\s*", title)[0].strip()
+        if not _names_near(name, head):
+            continue
+        parts = re.split(r"\s*[-–—|]\s*", title)
+        if len(parts) >= 2:
+            segment = parts[1].strip()
+            at_match = re.match(r"(.+?)\s+at\s+(.+)$", segment, re.I)
+            if at_match:
+                role = at_match.group(1).strip()[:80]
+            elif (segment and len(segment.split()) <= 6
+                  and not re.search(r"linkedin", segment, re.I)
+                  and not (company_name and all_tokens_in(
+                      name_tokens(company_name), segment))):
+                role = segment[:80]
+        snippet = person_scoped_evidence(head, title, body)
+        if snippet:
+            evidence.append({
+                "source_url": linkedin_url,
+                "snippet": snippet,
+            })
+    return {
+        "name": name,
+        "role": role,
+        "linkedin_url": linkedin_url,
+        "linkedin_source": "user_provided",
+        "source_url": linkedin_url,
+        "evidence": evidence,
+        "found_by": ["provided_linkedin_url"],
+    }
+
+
 class PersonFinderService(jobs.SingleSlotJob):
     """Background hunt for one person; results staged for review."""
 
@@ -502,6 +609,9 @@ class PersonFinderService(jobs.SingleSlotJob):
         if len(name_tokens(name)) < 2:
             raise ValueError("A first and last name are required")
         query["name"] = name
+        linkedin_url = (query.get("linkedin_url") or "").strip()
+        if linkedin_url:
+            query["linkedin_url"] = canonical_linkedin_profile(linkedin_url)
         job = self._claim_slot(dict(query))
         thread = threading.Thread(
             target=self.run_guarded, args=(job["id"], self._run, query),
@@ -529,25 +639,12 @@ class PersonFinderService(jobs.SingleSlotJob):
             max_gets=MAX_CHEAP_GETS, max_github_api=MAX_GITHUB_API_CALLS,
             max_github_search=MAX_GITHUB_SEARCH_CALLS,
             should_stop=should_stop)
-        serp_pool: List[Dict] = []
-
-        def search(q: str, max_results: int = 8, *,
-                   pool: bool = True) -> List[Dict]:
-            """`pool=False` keeps a query's results out of the found-address
-            path. The mail-domain harvest deliberately reads template-dense
-            "email format" pages, and the placeholder filter that protects the
-            found path would destroy that inference — measured, it flips
-            Goldman from gs.com to goldmansachs.com. Separate inputs is what
-            keeps the two from cancelling each other out.
-            """
+        def search(q: str, max_results: int = 8) -> List[Dict]:
             nonlocal searches_used
             if should_stop() or searches_used >= MAX_PERSON_SEARCHES:
                 return []
             searches_used += 1
-            results = ddg_text_search(q, max_results=max_results)
-            if pool:
-                serp_pool.extend(results)
-            return results
+            return ddg_text_search(q, max_results=max_results)
 
         def fetch_page(url: str) -> Optional[str]:
             """SSRF-guarded fetch; the scraper re-checks every redirect hop."""
@@ -581,12 +678,30 @@ class PersonFinderService(jobs.SingleSlotJob):
 
         # ---- Stage 1: resolve the company to a row + domain --------------
         stage(0)
+        linkedin_url = (query.get("linkedin_url") or "").strip() or None
+        if linkedin_url:
+            linkedin_url = canonical_linkedin_profile(linkedin_url)
+        anchor_query = f'"{linkedin_url}" "{name}"' if linkedin_url else None
+        anchor_results = []
+        if anchor_query and not should_stop():
+            anchor_results = [
+                result for result in search(anchor_query, max_results=6)
+                if _same_linkedin_profile(
+                    result.get("href") or result.get("url"), linkedin_url)
+            ]
         company_name = (query.get("company_name") or "").strip()
+        company_inferred = False
+        if not company_name and anchor_results:
+            company_name = (
+                _company_from_linkedin_results(name, anchor_results) or "")
+            company_inferred = bool(company_name)
         company_url = (query.get("company_url") or "").strip() or None
         company_info: Dict[str, Any] = {
             "company_id": None, "name": company_name or None,
             "domain": None, "url": company_url,
         }
+        if company_inferred:
+            company_info["name_source"] = "linkedin_search"
         if company_name:
             row = self.db.find_company_by_name(company_name)
             if row:
@@ -607,13 +722,11 @@ class PersonFinderService(jobs.SingleSlotJob):
         # Goldman contact (goldmansachs.com vs the real gs.com).
         domain = website_domain
         if website_domain and company_name and not should_stop():
-            # pool=False: these SERPs are template-dense by design and must
-            # stay separate from the person-evidence result pool.
             domain, why, _ = discover_mail_domain(
                 company_name,
                 website_domain,
                 search_fn=lambda q, max_results=8: search(
-                    q, max_results=max_results, pool=False),
+                    q, max_results=max_results),
             )
             company_info["mail_domain"] = domain
             company_info["mail_domain_reason"] = why
@@ -625,28 +738,41 @@ class PersonFinderService(jobs.SingleSlotJob):
         # ---- Stage 2: profile search ladder ------------------------------
         stage(1)
         criteria = build_criteria({
-            **query, "company_domain": domain or "",
+            **query, "company_name": company_name,
+            "company_domain": domain or "",
         })
         queries: List[str] = []
-        if company_name:
-            queries.append(f'"{name}" "{company_name}" site:linkedin.com/in')
-        for alias in (criteria["school_aliases"] or [])[:3]:
-            queries.append(f'"{name}" "{alias}" site:linkedin.com/in')
-        for past in criteria["past_companies"][:3]:
-            queries.append(f'"{name}" "{past}" site:linkedin.com/in')
-        if company_name:
-            queries.append(f'"{name}" "{company_name}"')
-        if criteria["school"]:
-            queries.append(f'"{name}" "{criteria["school"]}"')
+        if not linkedin_url:
+            if company_name:
+                queries.append(
+                    f'"{name}" "{company_name}" site:linkedin.com/in')
+            for alias in (criteria["school_aliases"] or [])[:3]:
+                queries.append(f'"{name}" "{alias}" site:linkedin.com/in')
+            for past in criteria["past_companies"][:3]:
+                queries.append(f'"{name}" "{past}" site:linkedin.com/in')
+            if company_name:
+                queries.append(f'"{name}" "{company_name}"')
+            if criteria["school"]:
+                queries.append(f'"{name}" "{criteria["school"]}"')
 
         raw_candidates: List[Dict] = []
+        if linkedin_url:
+            anchor_conflict = _linkedin_name_conflict(name, anchor_results)
+            anchor_candidate = _linkedin_anchor_candidate(
+                name, linkedin_url, anchor_results, company_name)
+            anchor_candidate.update({
+                "identity_anchor": True,
+                "identity_anchor_conflict": bool(anchor_conflict),
+                "identity_anchor_conflict_evidence": anchor_conflict,
+            })
+            raw_candidates.append(anchor_candidate)
         for q in queries:
             raw_candidates.extend(
                 extract_person_candidates(search(q), name, source=q))
             if should_stop():
                 break
         candidates = merge_person_candidates(raw_candidates)
-        if len(candidates) < 2 and not should_stop():
+        if not linkedin_url and len(candidates) < 2 and not should_stop():
             fallback = f'"{name}" site:linkedin.com/in'
             raw_candidates.extend(extract_person_candidates(
                 search(fallback), name, source=fallback))
@@ -656,13 +782,28 @@ class PersonFinderService(jobs.SingleSlotJob):
         stage(2)
         for cand in candidates:
             cand.update(score_candidate(cand, criteria))
-        candidates.sort(key=rank_score, reverse=True)
+        candidates.sort(
+            key=lambda cand: (
+                1 if cand.get("identity_anchor") else 0,
+                rank_score(cand),
+            ),
+            reverse=True,
+        )
+        if linkedin_url:
+            # The supplied member URL is an identity constraint. Do not spend
+            # discovery or verification work on same-name alternatives.
+            candidates = [
+                cand for cand in candidates if cand.get("identity_anchor")
+            ]
         candidates = candidates[:MAX_CANDIDATES]
         for i, cand in enumerate(candidates):
             cand["id"] = f"c{i + 1}"
             cand["linkedin_verified"] = bool(
-                cand.get("linkedin_url")
-                and linkedin_matches_person(cand["linkedin_url"], name))
+                (cand.get("identity_anchor")
+                 and not cand.get("identity_anchor_conflict")) or (
+                    cand.get("linkedin_url")
+                    and linkedin_matches_person(cand["linkedin_url"], name)
+                ))
             cand["found_emails"] = []
             cand["channels"] = []
 
@@ -697,18 +838,20 @@ class PersonFinderService(jobs.SingleSlotJob):
                         name, result.get("title") or "", text[:600]),
                 })
                 for addr in extract_emails_from_html(html):
-                    if is_generic_inbox(addr):
-                        continue
                     top["found_emails"].append(
                         {"email": addr, "source_url": url,
                          "source_kind": "team_page"})
 
         # ---- Stage 5: personal channels (GitHub, personal site, papers) --
         stage(4)
-        if top and not should_stop():
+        # Even name + employer is not unique enough to bind an arbitrary
+        # GitHub, paper, or personal page to an exact LinkedIn profile.
+        if (top and not should_stop()
+                and not top.get("identity_anchor")):
             personal_queries = [f'"{name}" site:github.com']
             if company_name:
-                personal_queries.append(f'"{name}" "{company_name}" github')
+                personal_queries.append(
+                    f'"{name}" "{company_name}" github')
             personal_queries.append(
                 f'"{name}" (blog OR portfolio OR "personal site")')
             personal_queries.append(
@@ -747,8 +890,6 @@ class PersonFinderService(jobs.SingleSlotJob):
                             name, result.get("title") or "", text[:600]),
                     })
                     for addr in extract_emails_from_html(html):
-                        if is_generic_inbox(addr):
-                            continue
                         top["found_emails"].append(
                             {"email": addr, "source_url": url})
                 if fetched >= CHANNEL_FETCH_CAP or should_stop():
@@ -801,7 +942,7 @@ class PersonFinderService(jobs.SingleSlotJob):
             job_id, status="done",
             result={
                 "query": {k: query.get(k) for k in (
-                    "name", "company_name", "company_url", "school",
+                    "name", "linkedin_url", "company_name", "company_url", "school",
                     "school_dates", "past_companies", "role_hint",
                     "location", "notes")},
                 "company": company_info,
@@ -833,7 +974,6 @@ class PersonFinderService(jobs.SingleSlotJob):
             return False
         if attributed:
             return True
-        from contact_verify import email_matches_person
         return email_matches_person(email, name)
 
     def _run_found_sources(self, candidates: List[Dict], *, name: str,
@@ -857,6 +997,24 @@ class PersonFinderService(jobs.SingleSlotJob):
                 urls=[u for u in urls if u], company_name=company_name,
                 company_domain=website_domain, notes=notes,
                 edgar_enabled=bool(contact))
+            if cand.get("identity_anchor"):
+                # A role like "engineer" is enough for the general router to
+                # try GitHub, but not enough to bind a same-name GitHub login
+                # to an exact LinkedIn profile. Anchored runs only use sources
+                # for which an already-correlated channel URL was found.
+                direct_urls = [u for u in urls if u]
+                allowed = set()
+                if any(found_email.github_login_from_url(u)
+                       for u in direct_urls):
+                    allowed.add("github")
+                if any(
+                    host in (urlparse(u).hostname or "")
+                    for u in direct_urls
+                    for host in ("arxiv.org", "scholar.google",
+                                 "semanticscholar.org", "orcid.org")
+                ):
+                    allowed.add("arxiv")
+                sources = [source for source in sources if source in allowed]
             routed[cand["id"]] = sources
             for source in sources:
                 kwargs = {"http_get": self._http_get, "budget": budget}
@@ -871,11 +1029,9 @@ class PersonFinderService(jobs.SingleSlotJob):
                     # A broken adapter degrades this run to "no found address".
                     # It must never fail the job.
                     continue
-                for addr in found:
-                    if self._accept_found_address(
-                            addr["email"], name=name,
-                            attributed=addr.get("attributed", False)):
-                        cand["found_emails"].append(addr)
+                # One common gate in _discover_emails handles adapter results
+                # and fetched-page addresses identically.
+                cand["found_emails"].extend(found)
         return {**budget.counts, "routed": routed,
                 "github_rate_limited": budget.is_rate_limited("github")}
 
@@ -903,6 +1059,11 @@ class PersonFinderService(jobs.SingleSlotJob):
             key=lambda f: found_email.SOURCE_PRECEDENCE.get(
                 f.get("source_kind") or "serp", 9))
         for found in ordered:
+            attributed = bool(found.get("attributed"))
+            if not self._accept_found_address(
+                    found.get("email") or "", name=name,
+                    attributed=attributed):
+                continue
             verdict = verify_email(found["email"], name, check_mx=True)
             add({
                 "email": verdict["email"],
@@ -927,6 +1088,12 @@ class PersonFinderService(jobs.SingleSlotJob):
                 guess, name=name,
                 token=_os.getenv("GITHUB_TOKEN", "").strip() or None,
                 http_get=self._http_get, budget=budget)
+            supported = (
+                pattern.get("smtp_status") == "deliverable"
+                or corroboration.name_match is True
+            )
+            if not supported:
+                return
             add({
                 "email": guess,
                 "origin": "guessed",
@@ -978,9 +1145,9 @@ class PersonFinderService(jobs.SingleSlotJob):
                         "email_verified": verdict["email_verified"],
                     })
                 else:
-                    # Preserve one visibly labeled guess only when SMTP was
-                    # inconclusive/disabled. Never show a pattern the server
-                    # definitively rejected.
+                    # An inconclusive pattern is shown only when a public
+                    # corpus independently ties that exact address to the
+                    # target name. Otherwise silence is higher quality.
                     add_guess(pattern)
         return emails[:MAX_EMAILS_PER_CANDIDATE]
 
@@ -996,7 +1163,7 @@ def _llm_summaries(
         return {}
     known = "; ".join(
         f"{k}: {query.get(k)}" for k in (
-            "company_name", "school", "school_dates", "past_companies",
+            "linkedin_url", "company_name", "school", "school_dates", "past_companies",
             "role_hint", "location", "notes")
         if (query.get(k) or "").strip())
     blocks = []

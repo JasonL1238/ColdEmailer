@@ -15,13 +15,13 @@ from __future__ import annotations
 import os
 import re
 from typing import Callable, Dict, List, Optional, Set
-from urllib.parse import urlparse
 
 import mailbox_verify
 from domain_names import registered_domain
 from phrase_match import all_tokens_in, phrase_in, token_in
 from contact_verify import (
     annotate_contact,
+    canonical_linkedin_profile,
     domain_has_mx,
     email_matches_person,
     is_generic_inbox,
@@ -37,28 +37,9 @@ except ImportError:  # pragma: no cover
 
 
 _LINKEDIN_IN_RE = re.compile(
-    r"https?://(?:www\.)?linkedin\.com/in/[A-Za-z0-9\-_%]+/?",
+    r"https?://(?:[A-Za-z0-9-]+\.)?linkedin\.com/in/[A-Za-z0-9\-_%]+/?",
     re.I,
 )
-
-
-def _normalize_linkedin(url: str) -> Optional[str]:
-    if not url:
-        return None
-    try:
-        parsed = urlparse(url.strip())
-    except Exception:
-        return None
-    host = (parsed.hostname or "").lower()
-    if host not in {"linkedin.com", "www.linkedin.com"}:
-        return None
-    path = (parsed.path or "").rstrip("/")
-    if not path.lower().startswith("/in/"):
-        return None
-    slug = path.split("/in/", 1)[-1].split("/")[0]
-    if not slug or len(slug) < 2:
-        return None
-    return f"https://www.linkedin.com/in/{slug}"
 
 
 def extract_linkedin_urls(*texts: str) -> List[str]:
@@ -66,8 +47,11 @@ def extract_linkedin_urls(*texts: str) -> List[str]:
     seen = set()
     for text in texts:
         for match in _LINKEDIN_IN_RE.findall(text or ""):
-            url = _normalize_linkedin(match)
-            if url and url.lower() not in seen:
+            try:
+                url = canonical_linkedin_profile(match)
+            except ValueError:
+                continue
+            if url.lower() not in seen:
                 seen.add(url.lower())
                 found.append(url)
     return found

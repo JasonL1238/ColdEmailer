@@ -195,6 +195,18 @@ function CandidateCard({ jobId, candidate, onApproved }) {
       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
         <div style={{ fontWeight: 650 }}>{candidate.name || 'Unnamed'}</div>
         <Chip tone={conf.tone}>{conf.label}</Chip>
+        {candidate.identity_anchor && (
+          <Chip
+            tone={candidate.identity_anchor_conflict ? 'red' : 'green'}
+            title={candidate.identity_anchor_conflict
+              ? 'Public search evidence for this exact URL names somebody else.'
+              : 'You supplied this exact profile URL, so same-name alternatives were excluded.'}
+          >
+            {candidate.identity_anchor_conflict
+              ? 'Profile name conflict'
+              : 'Exact profile supplied'}
+          </Chip>
+        )}
         {candidate.linkedin_url && (
           <a href={candidate.linkedin_url} target="_blank" rel="noreferrer"
             className="tiny row" style={{ gap: 4 }}>
@@ -319,7 +331,7 @@ function CandidateCard({ jobId, candidate, onApproved }) {
 
 export default function FindPerson() {
   const [form, setForm] = useState({
-    name: '', company_name: '', company_url: '', school: '',
+    name: '', linkedin_url: '', company_name: '', company_url: '', school: '',
     school_dates: '', past_companies: '', role_hint: '', location: '',
     notes: '',
   })
@@ -416,10 +428,10 @@ export default function FindPerson() {
         </div>
         <h1 className="hero-title">Find one specific person</h1>
         <p className="small muted" style={{ marginTop: 8, maxWidth: 640, lineHeight: 1.55 }}>
-          Tell it what you know — name, company, school and rough years, past
-          jobs — and it searches the public web, picks the right person among
-          same-named strangers, and collects their email addresses for your
-          review. Nothing is saved until you approve it.
+          Tell it what you know — ideally their LinkedIn profile URL, plus a
+          name, company, school, or past jobs. An exact profile URL excludes
+          same-named strangers and lets the search fill gaps from public
+          evidence. Nothing is saved until you approve it.
         </p>
 
         <div className="stack" style={{ gap: 10, marginTop: 18 }}>
@@ -445,6 +457,16 @@ export default function FindPerson() {
                 disabled={disabled}
               />
             </div>
+          </div>
+          <div className="discover-search-wrap" style={{ marginTop: 0 }}>
+            <ExternalLink size={16} />
+            <input
+              className="discover-input"
+              placeholder="LinkedIn profile URL (recommended — https://www.linkedin.com/in/...)"
+              value={form.linkedin_url}
+              onChange={(e) => set('linkedin_url', e.target.value)}
+              disabled={disabled}
+            />
           </div>
           <div className="discover-input-row" style={{ marginTop: 0 }}>
             <input

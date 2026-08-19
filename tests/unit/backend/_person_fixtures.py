@@ -31,7 +31,7 @@ class FakeEnrichment:
 
 
 def _staged_job(db, *, emails=None, linkedin="https://www.linkedin.com/in/jane-doe",
-                company=None):
+                company=None, candidate_over=None, query_over=None):
     """A finished person_finder job with one staged candidate."""
     candidate = {
         "id": "c1",
@@ -63,9 +63,12 @@ def _staged_job(db, *, emails=None, linkedin="https://www.linkedin.com/in/jane-d
         "llm_summary": None,
         "approved_contact_id": None,
     }
+    candidate.update(candidate_over or {})
+    query = {"name": "Jane Doe", "company_name": "Acme"}
+    query.update(query_over or {})
     job = db.create_job("person_finder", {"name": "Jane Doe"})
     db.finish_job(job["id"], status="done", result={
-        "query": {"name": "Jane Doe", "company_name": "Acme"},
+        "query": query,
         "company": company or {"company_id": None, "name": "Acme",
                                "domain": "acme.com",
                                "url": "https://acme.com"},

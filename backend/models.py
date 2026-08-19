@@ -173,6 +173,7 @@ class DeepResearchRequest(BaseModel):
 class PersonFindRequest(BaseModel):
     """Everything the user knows about one specific person."""
     name: str = Field(..., min_length=2, max_length=120)
+    linkedin_url: Optional[str] = None
     company_name: Optional[str] = Field(None, max_length=120)
     company_url: Optional[str] = None
     school: Optional[str] = Field(None, max_length=200)
@@ -188,6 +189,11 @@ class PersonFindRequest(BaseModel):
     @classmethod
     def _check_url(cls, v):
         return validate_http_url(v)
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def _check_linkedin_url(cls, v):
+        return validate_linkedin_profile_url(v)
 
     @field_validator("company_name")
     @classmethod

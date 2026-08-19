@@ -2,10 +2,12 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
 import mail_domain as md
 import person_finder as pf
 from _person_fixtures import FakeEnrichment, _staged_job
+from models import PersonFindRequest
 from person_finder import (
     PersonFinderService,
     build_criteria,
@@ -137,6 +139,16 @@ class TestExtractPersonCandidates:
         assert out[0]["linkedin_url"] == ""
         assert out[0]["source_url"] == "https://acme.com/blog/jane"
 
+    def test_country_linkedin_subdomain_is_a_distinct_profile(self):
+        result = {
+            "title": "Jane Doe - Engineer | LinkedIn",
+            "href": "https://in.linkedin.com/in/jane-doe-123",
+            "body": "Jane Doe works in engineering.",
+        }
+        out = extract_person_candidates([result], "Jane Doe")
+        assert out[0]["linkedin_url"] == (
+            "https://www.linkedin.com/in/jane-doe-123")
+
 
 class TestMergeCandidates:
     def test_same_slug_merges_evidence(self):
@@ -151,7 +163,7 @@ class TestMergeCandidates:
         b = dict(a, linkedin_url="https://www.linkedin.com/in/jane-doe-2")
         assert len(merge_person_candidates([a, b])) == 2
 
-    def test_lone_profile_absorbs_no_profile_evidence(self):
+    def test_lone_profile_does_not_absorb_ambiguous_loose_evidence(self):
         profile = extract_person_candidates([LINKEDIN_RESULT], "Jane Doe")[0]
         loose = {
             "name": "Jane Doe", "role": None, "linkedin_url": "",
@@ -160,9 +172,10 @@ class TestMergeCandidates:
                           "snippet": "by Jane Doe"}],
         }
         merged = merge_person_candidates([profile, loose])
-        assert len(merged) == 1
-        assert any(e["source_url"] == "https://acme.com/blog/jane"
-                   for e in merged[0]["evidence"])
+        assert len(merged) == 2
+        profile_result = next(c for c in merged if c.get("linkedin_url"))
+        assert not any(e["source_url"] == "https://acme.com/blog/jane"
+                       for e in profile_result["evidence"])
 
     def test_two_profiles_keep_no_profile_pool_separate(self):
         a = extract_person_candidates([LINKEDIN_RESULT], "Jane Doe")[0]
@@ -298,12 +311,107 @@ class TestServiceRun:
         # finder does not probe patterns or spend Hunter after finding it.
         assert "guessed" not in by_origin
 
-    def test_guessed_never_carries_verified(self, db, mx_true):
+    def test_supplied_linkedin_is_the_only_candidate_and_fills_company(
+            self, db, monkeypatch, mx_true):
+        exact = "https://www.linkedin.com/in/jane-custom-4821"
+        serp = {
+            exact: [{
+                "title": "Jane Doe - VP Engineering at Acme | LinkedIn",
+                "href": exact,
+                "body": "Jane Doe works at Acme and leads platform engineering.",
+            }, {
+                "title": "Jane Doe - Architect at WrongCo | LinkedIn",
+                "href": "https://www.linkedin.com/in/jane-doe-wrong",
+                "body": "A different Jane Doe at WrongCo.",
+            }],
+        }
+        job = self._run_service(
+            db, monkeypatch, serp=serp,
+            query={"linkedin_url": exact, "company_name": ""})
+        result = json.loads(job["result"])
+
+        assert result["query"]["linkedin_url"] == exact
+        assert result["company"]["name"] == "Acme"
+        assert result["company"]["name_source"] == "linkedin_search"
+        assert len(result["candidates"]) == 1
+        candidate = result["candidates"][0]
+        assert candidate["linkedin_url"] == exact
+        assert candidate["identity_anchor"] is True
+        assert candidate["linkedin_verified"] is True
+        assert "VP Engineering" in candidate["role"]
+
+    def test_exact_profile_name_conflict_is_flagged(
+            self, db, monkeypatch, mx_true):
+        exact = "https://www.linkedin.com/in/custom-profile"
+        job = self._run_service(
+            db, monkeypatch,
+            serp={exact: [{
+                "title": "John Smith - CTO at OtherCo | LinkedIn",
+                "href": exact,
+                "body": "John Smith leads OtherCo.",
+            }]},
+            query={"linkedin_url": exact})
+        candidate = json.loads(job["result"])["candidates"][0]
+        assert candidate["identity_anchor_conflict"] is True
+        assert candidate["linkedin_verified"] is False
+        assert candidate["conflicting_signals"][0]["signal"] == (
+            "linkedin:name_conflict")
+
+    def test_minor_name_spelling_difference_is_not_a_profile_conflict(
+            self, db, monkeypatch, mx_true):
+        exact = "https://www.linkedin.com/in/sk593"
+        job = self._run_service(
+            db, monkeypatch,
+            serp={exact: [{
+                "title": "Shruthi Kumar - Microsoft | LinkedIn",
+                "href": exact,
+                "body": "Shruthi Kumar works at Microsoft.",
+            }]},
+            query={"name": "Shruti Kumar", "linkedin_url": exact,
+                   "company_name": ""})
+        result = json.loads(job["result"])
+        candidate = result["candidates"][0]
+        assert result["company"]["name"] == "Microsoft"
+        assert candidate["identity_anchor_conflict"] is False
+        assert candidate["linkedin_verified"] is True
+
+    def test_anchor_does_not_attach_same_name_personal_page_or_its_emails(
+            self, db, monkeypatch, mx_true):
+        exact = "https://www.linkedin.com/in/sk593"
+        medium = "https://medium.com/@namesake/a-post"
+        job = self._run_service(
+            db, monkeypatch,
+            pages={medium: (
+                "Shruti Kumar writes about Microsoft. "
+                "pressinquiries@medium.com angelgarcia.mail@gmail.com")},
+            serp={
+                exact: [{
+                    "title": "Shruthi Kumar - Microsoft | LinkedIn",
+                    "href": exact,
+                    "body": "Shruthi Kumar works at Microsoft.",
+                }],
+                "blog OR portfolio": [{
+                    "title": "Shruti Kumar on Medium",
+                    "href": medium,
+                    "body": "Shruti Kumar writes about Microsoft.",
+                }],
+            },
+            query={
+                "name": "Shruti Kumar",
+                "linkedin_url": exact,
+                "company_name": "Microsoft",
+                "company_url": "https://microsoft.com",
+            })
+        candidate = json.loads(job["result"])["candidates"][0]
+        assert all(item.get("source_url") != medium
+                   for item in candidate["evidence"])
+        assert candidate["emails"] == []
+
+    def test_inconclusive_uncorroborated_guess_is_not_shown(self, db, mx_true):
         svc = PersonFinderService(db, FakeEnrichment())
         emails = svc._discover_emails(
             {"found_emails": []}, "Jane Doe", "acme.com")
-        assert [e["origin"] for e in emails] == ["guessed"]
-        assert emails[0]["email_verified"] is False
+        assert emails == []
 
     def test_smtp_pattern_success_precedes_and_skips_hunter(
             self, db, monkeypatch, mx_true):
@@ -356,19 +464,35 @@ class TestServiceRun:
         svc = PersonFinderService(db, FakeEnrichment())
         emails = svc._discover_emails(
             {"found_emails": [{"email": "coolhacker99@gmail.com",
-                               "source_url": "https://github.com/ch99"}]},
+                               "source_url": "https://github.com/ch99",
+                               "source_kind": "github_commit",
+                               "attributed": True}]},
             "Jane Doe", "acme.com")
         entry = next(e for e in emails if e["origin"] == "found")
         assert entry["domain_kind"] == "personal"
         assert entry["email_person_match"] is False
         assert entry["email_verified"] is False
 
+    def test_unattributed_page_wide_addresses_must_match_person(
+            self, db, mx_true):
+        svc = PersonFinderService(db, FakeEnrichment())
+        emails = svc._discover_emails({"found_emails": [
+            {"email": "pressinquiries@medium.com",
+             "source_url": "https://medium.com/story"},
+            {"email": "angelgarcia.mail@gmail.com",
+             "source_url": "https://medium.com/story"},
+            {"email": "j.doe@acme.com",
+             "source_url": "https://acme.com/team"},
+        ]}, "Jane Doe", "acme.com")
+        assert [entry["email"] for entry in emails] == [
+            "j.doe@acme.com"]
+
     def test_name_matching_freemail_verifies(self, db, mx_true):
         # The behavior the approve path relies on: a name-matching personal
         # address is a first-class verified channel, no override needed.
         svc = PersonFinderService(db, FakeEnrichment())
         emails = svc._discover_emails(
-            {"found_emails": [{"email": "jane.doe@gmail.com",
+            {"found_emails": [{"email": "j.doe@gmail.com",
                                "source_url": "https://janedoe.dev"}]},
             "Jane Doe", "acme.com")
         entry = next(e for e in emails if e["origin"] == "found")
@@ -379,6 +503,30 @@ class TestServiceRun:
         svc = PersonFinderService(db, FakeEnrichment())
         with pytest.raises(ValueError):
             svc.start(name="Cher")
+
+    def test_request_canonicalizes_and_validates_linkedin_url(self):
+        request = PersonFindRequest(
+            name="Jane Doe",
+            linkedin_url="https://linkedin.com/in/jane-doe/?trk=public",
+        )
+        assert request.linkedin_url == (
+            "https://www.linkedin.com/in/jane-doe")
+        country_request = PersonFindRequest(
+            name="Jane Doe",
+            linkedin_url="https://in.linkedin.com/in/jane-doe",
+        )
+        assert country_request.linkedin_url == (
+            "https://www.linkedin.com/in/jane-doe")
+        with pytest.raises(ValidationError):
+            PersonFindRequest(
+                name="Jane Doe",
+                linkedin_url="https://example.com/in/jane-doe",
+            )
+        with pytest.raises(ValidationError):
+            PersonFindRequest(
+                name="Jane Doe",
+                linkedin_url="https://www.linkedin.com/in/",
+            )
 
     def test_single_flight_slot(self, db):
         svc = PersonFinderService(db, FakeEnrichment())
@@ -674,6 +822,24 @@ class TestFoundSourcesStage:
             budget=pf.found_email.GetBudget(), should_stop=lambda: False)
         assert len(seen) == pf.FOUND_SOURCES_TOP_N
 
+    def test_anchor_does_not_route_from_generic_engineer_role(
+            self, db, monkeypatch, mx_true):
+        called = []
+        monkeypatch.setitem(
+            pf.found_email.SOURCE_FUNCS, "github",
+            lambda *_a, **_k: called.append("github") or [])
+        candidate = {
+            "id": "c1", "role": "Software Engineer",
+            "identity_anchor": True, "channels": [], "evidence": [],
+            "found_emails": [],
+        }
+        stats = self._svc(db)._run_found_sources(
+            [candidate], name="Jane Doe", company_name="Acme",
+            website_domain="acme.com", notes="",
+            budget=pf.found_email.GetBudget(), should_stop=lambda: False)
+        assert called == []
+        assert stats["routed"]["c1"] == []
+
 
 class TestApproval:
     @pytest.fixture
@@ -705,6 +871,23 @@ class TestApproval:
         assert "Possible email pattern jdoe@acme.com" in notes
         assert "Found via person search" in notes
         assert "Github: https://github.com/janedoe" in notes
+
+    def test_custom_slug_supplied_profile_can_be_saved(self, db, wired):
+        exact = "https://www.linkedin.com/in/profile-4821"
+        job_id = _staged_job(
+            db,
+            linkedin=exact,
+            candidate_over={
+                "identity_anchor": True,
+                "identity_anchor_conflict": False,
+                "linkedin_source": "user_provided",
+            },
+            query_over={"linkedin_url": exact},
+        )
+        out = self._approve(wired, job_id)
+        assert out["contact"]["linkedin_url"] == exact
+        assert out["contact"]["linkedin_verified"] == 1
+        assert "supplied directly by you" in (out["contact"]["notes"] or "")
 
     def test_approval_marks_the_staged_candidate(self, db, wired):
         job_id = _staged_job(db)
