@@ -65,13 +65,15 @@ Both are local user data and are gitignored.
 - `enrichment.py`, `web_scraper.py`, `text_cleaner.py`, `ddg_search.py`: untrusted
   web acquisition, cleanup, identity checks, evidence extraction.
 - `found_email.py`, `mailbox_verify.py`, `address_corroborate.py`: pure adapters
-  with no `Database`, no FastAPI and no `WebScraper`. `person_finder` calls all
-  three and `address_corroborate` reuses `found_email.guarded_get_*`; every
-  caller injects the HTTP getter / SMTP connector, which is what makes them
-  testable offline. The last two answer different questions about the same
-  address and neither subsumes the other: `mailbox_verify` asks a mail server
-  whether the mailbox accepts mail, `address_corroborate` asks public corpora
-  whether the address has ever been used and by whom.
+  with no `Database`, no FastAPI and no `WebScraper` instance. `person_finder`
+  calls all three and `address_corroborate` reuses `found_email.guarded_get_*`;
+  their HTTP and SMTP seams remain injectable for offline tests. The last two
+  answer different questions about the same address and neither subsumes the
+  other: `mailbox_verify` asks a mail server whether the mailbox accepts mail,
+  `address_corroborate` asks public corpora whether the address has ever been
+  used and by whom. The production mailbox connector resolves public MX socket
+  addresses through the shared SSRF guard, tries direct port 25 first, and
+  spends a provider lookup only when SMTP is unavailable or inconclusive.
 - `contact_ingest.py`, `contact_verify.py`, `contact_enrich.py`: the contact
   boundary. Every scraped or imported contact converges here before persistence,
   and `attach_candidate()` is the one place that decides which scraped channels
@@ -79,7 +81,9 @@ Both are local user data and are gitignored.
 - `email_composer.py`, `email_sender.py`, `response_checker.py`, `thread_reader.py`:
   draft, send, reply, and thread duties. Sending and Gmail reads are live I/O.
 - `campaigns.py`, `pipeline.py`, `analytics.py`, `suppression.py`, `send_window.py`,
-  `research_digest.py`: focused domain calculations; keep them framework-independent.
+  `research_digest.py`, `mail_domain.py`: focused domain calculations; keep them
+  framework-independent. `mail_domain.py` is the one shared path that may
+  distinguish a company's employee-mail domain from its website domain.
 - `domain_names.py`, `phrase_match.py`, `ttl_cache.py`: stdlib-only leaves that
   import nothing from this app, so anything may import them. They exist because
   the rule each holds had been written out three or four times and had drifted —
@@ -114,6 +118,9 @@ read as bugs is in [`decisions.md`](decisions.md).
   into localhost or cloud metadata endpoints. `found_email.guarded_get_*` is the
   second place that re-checks every hop; it exists because `fetch_json` pins
   same-origin and cannot carry an auth header.
+- Direct SMTP uses the same public-address rule and connects to the already
+  checked socket address, so an MX record cannot redirect a mailbox probe into
+  localhost, a private LAN, or cloud metadata.
 - The mailbox probe never issues `DATA`/`BDAT` — `mailbox_verify.ALLOWED_VERBS`
   makes it structurally impossible.
 - Neither the mailbox probe nor corroboration writes `email_verified` or changes
@@ -127,10 +134,19 @@ read as bugs is in [`decisions.md`](decisions.md).
   and the caller sent `confirm_email_ownership`. `name_match` is tri-state —
   `None` (no source gave a name) never qualifies, and is not `False` (a source
   gave someone else's name).
-- The placeholder-address filter applies to the found path only. The
-  mail-domain harvest is fed by a separate, unfiltered query pool
-  (`search(..., pool=False)`) — see decisions.md for the measurement that
-  forbids merging them.
+- Missing named-person addresses try ten bounded company patterns over
+  direct SMTP before Hunter. Before constructing them, normal company
+  enrichment and person finder both resolve a separate `mail_domain`; the
+  website `domain` remains unchanged for identity, crawling, and persistence.
+  Definitive rejections advance to the next pattern;
+  the first deliverable result stops without spending Hunter, while blocked,
+  greylisted, or catch-all SMTP stops pattern probing and permits the provider
+  fallback. A live guessed mailbox remains a guess and gains no verified flag.
+- The placeholder-address filter applies to the found path only. Mail-domain
+  discovery consumes template-dense search evidence through `mail_domain.py`;
+  person finder additionally keeps those SERPs out of its found-address pool
+  with `search(..., pool=False)`. See decisions.md for the measurement that
+  forbids merging the two evidence paths.
 - Contact addresses are validated at ingest and again before send, so a comma or
   newline can never add a recipient or a `Bcc:` header.
 - State-changing requests from a non-allowlisted `Origin` are rejected, so another

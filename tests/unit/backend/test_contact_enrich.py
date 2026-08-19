@@ -1,10 +1,13 @@
 """Offline unit tests for LinkedIn search + free email enrichment."""
+from types import SimpleNamespace
+
 from contact_enrich import (
     email_patterns_for,
     enrich_contacts_outreach,
     extract_linkedin_urls,
     find_linkedin_via_search,
     hunter_find_email,
+    probe_pattern_guesses,
 )
 
 
@@ -74,9 +77,65 @@ class TestLinkedInSearch:
 class TestEmailLookup:
     def test_patterns_are_person_shaped(self):
         patterns = email_patterns_for("Jane Doe", "acme.com")
-        assert "jane.doe@acme.com" in patterns
-        assert "jdoe@acme.com" in patterns
+        assert patterns == [
+            "jane.doe@acme.com",
+            "janedoe@acme.com",
+            "jdoe@acme.com",
+            "jane_doe@acme.com",
+            "jane-doe@acme.com",
+            "j.doe@acme.com",
+            "jane.d@acme.com",
+            "doe.jane@acme.com",
+            "doejane@acme.com",
+            "doe.j@acme.com",
+        ]
         assert "hello@acme.com" not in patterns
+
+    def test_patterns_probe_until_first_direct_smtp_success(self):
+        attempted = []
+
+        def verify(address, *, backend):
+            attempted.append(address)
+            status = "deliverable" if address == "jdoe@acme.com" \
+                else "undeliverable"
+            return SimpleNamespace(
+                verdict=SimpleNamespace(value=status), reason="test")
+
+        got = probe_pattern_guesses(
+            "Jane Doe", "acme.com", check_mx=False, verify_fn=verify)
+        assert got["email"] == "jdoe@acme.com"
+        assert got["smtp_status"] == "deliverable"
+        assert attempted == [
+            "jane.doe@acme.com", "janedoe@acme.com", "jdoe@acme.com"]
+
+    def test_inconclusive_smtp_stops_after_one_pattern(self):
+        attempted = []
+
+        def verify(address, *, backend):
+            attempted.append(address)
+            return SimpleNamespace(
+                verdict=SimpleNamespace(value="accept_all"),
+                reason="catch_all")
+
+        got = probe_pattern_guesses(
+            "Jane Doe", "acme.com", check_mx=False, verify_fn=verify)
+        assert got["smtp_status"] == "accept_all"
+        assert attempted == ["jane.doe@acme.com"]
+
+    def test_all_ten_patterns_may_be_rejected(self):
+        attempted = []
+
+        def verify(address, *, backend):
+            attempted.append(address)
+            return SimpleNamespace(
+                verdict=SimpleNamespace(value="undeliverable"),
+                reason="rejected")
+
+        got = probe_pattern_guesses(
+            "Jane Doe", "acme.com", check_mx=False, verify_fn=verify)
+        assert got["email"] is None
+        assert got["all_rejected"] is True
+        assert len(attempted) == 10
 
     def test_hunter_uses_api_and_validates_name(self):
         class Resp:
@@ -165,3 +224,46 @@ class TestEmailLookup:
         assert not enriched[0].get("email")
         assert not enriched[0].get("email_guess")
         assert not enriched[0].get("linkedin_verified")
+
+    def test_smtp_deliverable_guess_skips_hunter(self, monkeypatch):
+        import contact_enrich
+
+        def hunter_must_not_run(*_a, **_k):
+            raise AssertionError("Hunter ran before a direct SMTP success")
+
+        monkeypatch.setattr(
+            contact_enrich, "hunter_find_email", hunter_must_not_run)
+        enriched = enrich_contacts_outreach(
+            [{"name": "Jane Doe", "email": "", "on_domain": True,
+              "name_from_email": False}],
+            company_name="Acme", domain="acme.com",
+            search_fn=lambda *_a, **_k: [], hunter_key="test-key",
+            check_mx=False, allow_pattern_guesses=True,
+            mailbox_verify_fn=lambda *_a, **_k: SimpleNamespace(
+                verdict=SimpleNamespace(value="deliverable"), reason="ok"))
+        assert enriched[0]["email_guess"] == "jane.doe@acme.com"
+        assert enriched[0]["email_guess_smtp_status"] == "deliverable"
+        assert not enriched[0].get("email")
+
+    def test_hunter_runs_after_direct_patterns_fail(self, monkeypatch):
+        import contact_enrich
+
+        calls = []
+
+        def hunter(name, domain, *, api_key=None, http_get=None):
+            calls.append((name, domain))
+            return {"email": "jane.doe@acme.com", "hunter_score": 91}
+
+        monkeypatch.setattr(contact_enrich, "hunter_find_email", hunter)
+        enriched = enrich_contacts_outreach(
+            [{"name": "Jane Doe", "email": "", "on_domain": True,
+              "name_from_email": False}],
+            company_name="Acme", domain="acme.com",
+            search_fn=lambda *_a, **_k: [], hunter_key="test-key",
+            check_mx=False, allow_pattern_guesses=True,
+            mailbox_verify_fn=lambda *_a, **_k: SimpleNamespace(
+                verdict=SimpleNamespace(value="undeliverable"),
+                reason="rejected"))
+        assert len(calls) == 1
+        assert enriched[0]["email"] == "jane.doe@acme.com"
+        assert enriched[0]["email_source"] == "hunter"

@@ -134,6 +134,50 @@ def _address_is_public(ip: ipaddress._BaseAddress) -> bool:
     return bool(ip.is_global)
 
 
+def resolve_public_tcp_addresses(host: str, port: int) -> List[tuple]:
+    """Resolve a TCP destination once, rejecting any non-public answer.
+
+    Callers connect to the returned socket addresses instead of resolving the
+    hostname a second time.  Besides keeping the SSRF rule in one place, that
+    closes the check/connect gap for non-HTTP transports such as direct SMTP.
+    """
+    if not host or not isinstance(port, int) or not 1 <= port <= 65535:
+        return []
+
+    # Judge literals as written.  DNS64 can otherwise dress a private IPv4
+    # literal in a globally routable IPv6 address before we inspect it.
+    try:
+        literal = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not _address_is_public(literal):
+            return []
+        if isinstance(literal, ipaddress.IPv6Address):
+            sockaddr = (str(literal), port, 0, 0)
+            family = socket.AF_INET6
+        else:
+            sockaddr = (str(literal), port)
+            family = socket.AF_INET
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr)]
+
+    try:
+        infos = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError, UnicodeError):
+        return []
+    if not infos:
+        return []
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return []
+        if not _address_is_public(ip):
+            return []
+    return infos
+
+
 def is_safe_public_url(url: str) -> bool:
     """True only for http(s) URLs on standard ports whose host resolves
     exclusively to public IP addresses. Blocks SSRF against loopback,
@@ -153,33 +197,8 @@ def is_safe_public_url(url: str) -> bool:
     if not host:
         return False
 
-    # A literal is judged as written, never handed to the resolver. On a
-    # DNS64/NAT64 network getaddrinfo answers "10.0.0.1" with a synthesized
-    # global IPv6 address (measured here: 2607:7700:0:2:0:2:a00:1), which
-    # sails through the is_global check below and defeats the whole guard.
-    try:
-        literal = ipaddress.ip_address(host.strip("[]"))
-    except ValueError:
-        literal = None
-    if literal is not None:
-        return _address_is_public(literal)
-
-    try:
-        infos = socket.getaddrinfo(
-            host, port or (443 if parsed.scheme == "https" else 80),
-            proto=socket.IPPROTO_TCP)
-    except (socket.gaierror, OSError, UnicodeError):
-        return False
-    if not infos:
-        return False
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False
-        if not _address_is_public(ip):
-            return False
-    return True
+    return bool(resolve_public_tcp_addresses(
+        host, port or (443 if parsed.scheme == "https" else 80)))
 
 
 @dataclass

@@ -877,7 +877,8 @@ def _enrich_company_async(company_id: str, mode: str = "full"):
         contacts_added = 0
         for candidate in select_outreach_contacts(
                 enriched.get("contacts") or [],
-                enriched.get("emails") or [], domain,
+                enriched.get("emails") or [],
+                enriched.get("mail_domain") or domain,
                 limit=3, person_only=True):
             addr, linkedin_url = verified_channels(candidate)
             if not addr and not linkedin_url:

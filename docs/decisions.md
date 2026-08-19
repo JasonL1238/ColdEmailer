@@ -169,7 +169,10 @@ worse than the bug it fixes: on the same corpus it picks `camping-arize.com`
 (a French campsite) for Arize AI, `cranium.eu` for Cranium, and
 `exyntechnologies.com` for Exyn. Adversarial review measured an ungated
 format-page reader at 72.2% vs 88.9% for simply keeping the website domain —
-i.e. worse than doing nothing. `infer_email_domain()` therefore requires all
+i.e. worse than doing nothing. The shared `mail_domain.py` resolver is now used
+by both ordinary company enrichment and person finder before any address
+patterns are constructed. It preserves the website domain separately and
+requires all
 of: the rival is company-anchored (exact name token, a stem built forward from
 one, or the acronym — `gs` ← Goldman Sachs), seen ≥4 times, ≥2x the website
 domain, has MX, **and** `shares_mail_tenancy()` proves both domains publish an
@@ -205,14 +208,27 @@ and they attach to real people: two different contacts each "had"
 `john.smith@gs.com`. But filtering the *harvest* input flips Goldman from
 `gs.com` 16 / `goldmansachs.com` 8 to `goldmansachs.com` 4 / `gs.com` 1,
 destroying the one domain inference that works. The two mechanisms are mutually
-destructive, so they are separated structurally rather than by comment:
-`search(..., pool=False)` keeps stage 1's template-dense results out of the
-found path entirely.
+destructive, so they are separated structurally rather than by comment.
+`mail_domain.py` owns the template-dense evidence path, while person finder uses
+`search(..., pool=False)` to keep those results out of its found-address pool.
 
 **A template address and a real one can be the same string, so provenance
 decides.** `jane@acme.com` is a documentation example on a format page and a
 real mailbox in a commit header. The filter therefore applies only to
 unattributed text; an address printed in a commit or an author block skips it.
+
+**Pattern probing precedes Hunter, but "aggressive" means ten and no more.**
+For a named person and company mail domain, the app tries `first.last`,
+`firstlast`, `flast`, `first_last`, `first-last`, `f.last`, `first.l`,
+`last.first`, `lastfirst`, and `last.f` over direct SMTP. A rejection advances;
+the first deliverable mailbox stops the sequence without disclosing the address
+to Hunter or spending a credit. An inconclusive transport result, greylisting,
+or catch-all stops immediately because nine more addresses cannot make that
+server policy informative; Hunter may then run.
+The negative catch-all result is cached for the domain so later patterns skip
+the redundant random-canary RCPT. None of this proves ownership: the surviving
+address stays `origin="guessed"`, never receives `email_verified`, and still
+requires the user-confirmation approval gate.
 
 **Team and leadership pages are identity evidence, not an email source.** 0
 emails from 862KB of measured HTML (exyn.com/about, goldmansachs.com
@@ -233,16 +249,17 @@ recent papers vs 1/5 on 2020 ones), and the API needs
 `sortBy=submittedDate&sortOrder=descending` or it returns old papers with no
 HTML to read.
 
-**Outbound TCP/25 is blocked here, so mailbox verification runs over HTTPS.**
-Measured 2026-08-16: `smtp.gmail.com:587` opened in 0.26s with a real ESMTP
-banner, while port 25 timed out to Google, OVH, Zoho, Fastmail and Proofpoint
-alike. Proofpoint *refused* 465/587 in 70ms while 25 hung — proof the route is
-healthy and the filter is port-25-specific, i.e. the standard consumer-ISP
-anti-spam block. There is no alternate port: MX hosts accept mail only on 25,
-and 465/587 are authenticated submission ports on your own provider. So
-`mailbox_verify` keeps a direct-SMTP transport for networks where 25 is open and
-otherwise asks a provider over 443. Re-check with
-`scripts/probe_smtp_feasibility.py` from any new network.
+**Outbound TCP/25 depends on the active network; direct SMTP is primary and
+Hunter is the fallback.** Measured 2026-08-16 on the developer's home network:
+`smtp.gmail.com:587` opened in 0.26s while port 25 timed out to Google, OVH,
+Zoho, Fastmail and Proofpoint. Measured again 2026-08-19 through an iPhone
+hotspot: Google, Zoho and Proofpoint all answered on port 25 in 0.18–0.38s.
+There is no alternate direct-delivery port: 465/587 are authenticated submission
+ports on your own provider. In `auto` mode, `mailbox_verify` therefore tries the
+real MX on port 25 first and calls Hunter over 443 only when SMTP is unavailable
+or inconclusive (including greylisting and catch-all). A definitive SMTP accept
+or reject spends no Hunter credit and does not disclose that address to Hunter.
+Re-check with `scripts/probe_smtp_feasibility.py` from any new network.
 
 **What a mailbox check can and cannot prove.** A `deliverable` verdict means a
 mailbox exists at that address on that server, once, for that sender. It does

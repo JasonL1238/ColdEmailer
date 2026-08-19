@@ -358,6 +358,58 @@ class TestPagePrefetch:
 
 
 class TestEndToEndCompanyCrawl:
+    def test_mail_domain_is_resolved_before_outreach_patterns(
+            self, monkeypatch):
+        import enrichment
+
+        pages = {
+            "https://goldmansachs.com": """
+              <html><body><h1>Goldman Sachs</h1>
+              <p>Goldman Sachs advises institutions and companies around the
+              world through its investment banking and markets businesses.</p>
+              <section><h2>Jane Doe — Managing Director</h2>
+                <p>Jane advises Goldman Sachs clients around the world.</p>
+                <a href="https://www.linkedin.com/in/jane-doe">LinkedIn</a>
+              </section>
+              </body></html>
+            """,
+        }
+        service = EnrichmentService()
+        service.scraper = _FixtureScraper(pages)
+        monkeypatch.setattr(service, "_school_research_pages",
+                            lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(enrichment, "llm_metadata", lambda *_args: None)
+        monkeypatch.setattr(
+            enrichment,
+            "extract_contact_candidates",
+            lambda *_args, **_kwargs: [{
+                "name": "Jane Doe", "name_from_email": False,
+                "email": "", "linkedin_url": None, "on_domain": True,
+                "school_match": False, "seniority_rank": 8,
+            }],
+        )
+        monkeypatch.setattr(
+            enrichment,
+            "discover_mail_domain",
+            lambda *_args, **_kwargs: (
+                "gs.com", "shared mail tenancy", {"gs.com": 8}),
+        )
+        used = []
+
+        def outreach(contacts, **kwargs):
+            used.append(kwargs["domain"])
+            return contacts
+
+        monkeypatch.setattr(enrichment, "enrich_contacts_outreach", outreach)
+
+        result = service.enrich(
+            "Goldman Sachs", "https://goldmansachs.com", mode="full")
+
+        assert result["domain"] == "goldmansachs.com"
+        assert result["mail_domain"] == "gs.com"
+        assert result["mail_domain_reason"] == "shared mail tenancy"
+        assert used == ["gs.com"]
+
     def test_crawls_discovered_pages_and_reports_auditable_coverage(self, monkeypatch):
         import enrichment
 

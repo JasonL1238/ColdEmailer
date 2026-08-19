@@ -17,9 +17,6 @@ class FakeTransport:
         self.commands = []
         self.tls = False
 
-    def connect(self, host, port, timeout):  # pragma: no cover - unused
-        pass
-
     def read_reply(self, timeout):
         return self.replies.pop(0) if self.replies else (421, "closed")
 
@@ -52,7 +49,8 @@ def _script(canary_code, target_code=None, *, greeting=220, ehlo=250):
     replies = [(greeting, "hello"), (ehlo, "SIZE"), (250, "sender ok"),
                (canary_code, "canary")]
     if target_code is not None:
-        replies += [(250, "rset"), (target_code, "target")]
+        replies += [(250, "rset"), (250, "sender ok"),
+                    (target_code, "target")]
     return replies
 
 
@@ -93,6 +91,21 @@ class TestVerdicts:
         assert got.verdict is not MailboxVerdict.UNDELIVERABLE
         assert got.reason == "greylisted"
 
+    def test_sequence_error_is_unknown_not_undeliverable(self):
+        t = FakeTransport(_script(550, 503))
+        got = mv.verify_mailbox("jane.doe@acme.com", backend="smtp",
+                                connector=connector_for(t))
+        assert got.verdict is MailboxVerdict.UNKNOWN
+        assert got.reason == "target_inconclusive"
+
+    def test_inconclusive_canary_never_reaches_the_target(self):
+        t = FakeTransport(_script(503))
+        got = mv.verify_mailbox("jane.doe@acme.com", backend="smtp",
+                                connector=connector_for(t))
+        assert got.verdict is MailboxVerdict.UNKNOWN
+        assert got.reason == "canary_inconclusive"
+        assert t.commands.count("RCPT") == 1
+
     @pytest.mark.parametrize("script,reason", [
         ([(421, "go away")], "bad_greeting"),
         ([(220, "hi"), (500, "no ehlo")], "ehlo_refused"),
@@ -120,7 +133,8 @@ class TestNeverSendsMail:
         t = FakeTransport(_script(550, 250))
         mv.verify_mailbox("jane.doe@acme.com", backend="smtp",
                           connector=connector_for(t))
-        assert t.commands == ["EHLO", "MAIL", "RCPT", "RSET", "RCPT", "QUIT"]
+        assert t.commands == [
+            "EHLO", "MAIL", "RCPT", "RSET", "MAIL", "RCPT", "QUIT"]
 
     def test_a_transport_asked_to_send_data_would_raise(self):
         t = FakeTransport(_script(550, 250))
@@ -165,6 +179,40 @@ class TestHttpsProviderFallback:
         assert got.verdict is MailboxVerdict.DELIVERABLE
         assert got.provider == "hunter"
 
+    def test_auto_uses_the_production_smtp_connector_first(self, monkeypatch):
+        t = FakeTransport(_script(550, 250))
+        monkeypatch.setattr(mv, "smtp_connector", connector_for(t))
+
+        def provider_must_not_run(*_a, **_k):
+            raise AssertionError("definitive SMTP result must not spend Hunter")
+
+        got = mv.verify_mailbox(
+            "jane.doe@acme.com", backend="auto", api_key="k",
+            http_get=provider_must_not_run)
+        assert got.verdict is MailboxVerdict.DELIVERABLE
+        assert got.provider == "smtp"
+
+    def test_auto_falls_back_when_smtp_is_inconclusive(self):
+        t = FakeTransport(_script(250))  # catch-all cannot answer per mailbox
+        got = mv.verify_mailbox(
+            "jane.doe@acme.com", backend="auto", connector=connector_for(t),
+            api_key="k",
+            http_get=lambda *_a, **_k: self._Resp(
+                {"data": {"status": "valid"}}))
+        assert got.verdict is MailboxVerdict.DELIVERABLE
+        assert got.provider == "hunter"
+
+    def test_failed_provider_preserves_the_smtp_reason(self):
+        class FailedResp:
+            status_code = 503
+
+        got = mv.verify_mailbox(
+            "jane.doe@acme.com", backend="auto", connector=lambda _d: None,
+            api_key="k",
+            http_get=lambda *_a, **_k: FailedResp())
+        assert got.verdict is MailboxVerdict.UNKNOWN
+        assert got.reason == "port_25_blocked"
+
     @pytest.mark.parametrize("status,expected", [
         ("invalid", MailboxVerdict.UNDELIVERABLE),
         ("accept_all", MailboxVerdict.ACCEPT_ALL),
@@ -181,7 +229,32 @@ class TestHttpsProviderFallback:
         got = mv.verify_mailbox("jane.doe@acme.com", backend="auto",
                                 connector=lambda _d: None, api_key="")
         assert got.verdict is MailboxVerdict.UNKNOWN
-        assert got.reason == "no_transport"
+        assert got.reason == "port_25_blocked"
+
+
+class TestProductionConnector:
+    def test_tries_mx_hosts_in_priority_order(self, monkeypatch):
+        monkeypatch.setattr(mv, "_mx_hosts", lambda _domain: ["mx1", "mx2"])
+        expected = FakeTransport([])
+        attempted = []
+
+        def connect(host, timeout):
+            attempted.append((host, timeout))
+            return expected if host == "mx2" else None
+
+        monkeypatch.setattr(mv, "_connect_smtp_host", connect)
+        assert mv.smtp_connector("acme.com") is expected
+        assert [host for host, _ in attempted] == ["mx1", "mx2"]
+
+    def test_private_mx_is_never_connected(self, monkeypatch):
+        monkeypatch.setattr(
+            mv, "resolve_public_tcp_addresses", lambda *_a, **_k: [])
+
+        def socket_must_not_open(*_a, **_k):
+            raise AssertionError("private destination reached socket layer")
+
+        monkeypatch.setattr(mv.socket, "socket", socket_must_not_open)
+        assert mv._connect_smtp_host("mx.internal", 1.0) is None
 
 
 class TestCaching:
@@ -195,6 +268,33 @@ class TestCaching:
         got = mv.verify_mailbox("b.person@acme.com", backend="smtp",
                                 connector=boom)
         assert got.verdict is MailboxVerdict.ACCEPT_ALL
+
+    def test_a_known_discriminating_domain_skips_repeat_canaries(self):
+        first = FakeTransport(_script(550, 550))
+        mv.verify_mailbox("a.person@acme.com", backend="smtp",
+                          connector=connector_for(first))
+        second = FakeTransport([
+            (220, "hello"), (250, "SIZE"), (250, "sender ok"),
+            (250, "target"),
+        ])
+        got = mv.verify_mailbox("b.person@acme.com", backend="smtp",
+                                connector=connector_for(second))
+        assert got.verdict is MailboxVerdict.DELIVERABLE
+        assert second.commands == ["EHLO", "MAIL", "RCPT", "QUIT"]
+
+    def test_provider_and_smtp_results_have_separate_cache_entries(self):
+        got = mv.verify_mailbox(
+            "jane.doe@acme.com", backend="api", api_key="k",
+            http_get=lambda *_a, **_k: TestHttpsProviderFallback._Resp(
+                {"data": {"status": "valid"}}))
+        assert got.provider == "hunter"
+
+        direct = FakeTransport(_script(550, 550))
+        got = mv.verify_mailbox(
+            "jane.doe@acme.com", backend="smtp",
+            connector=connector_for(direct), api_key="")
+        assert got.provider == "smtp"
+        assert got.verdict is MailboxVerdict.UNDELIVERABLE
 
     def test_overflow_clears_rather_than_grows(self):
         for i in range(mv._RESULT_MAX + 5):

@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+import mail_domain as md
 import person_finder as pf
 from _person_fixtures import FakeEnrichment, _staged_job
 from person_finder import (
@@ -28,6 +29,7 @@ def mx_true(monkeypatch):
     fake = lambda domain, timeout=2.0: True
     monkeypatch.setattr("contact_verify.domain_has_mx", fake)
     monkeypatch.setattr("contact_enrich.domain_has_mx", fake)
+    monkeypatch.setattr("mail_domain.domain_has_mx", fake)
     monkeypatch.setattr("person_finder.domain_has_mx", fake)
 
 
@@ -292,9 +294,9 @@ class TestServiceRun:
         assert found["email_verified"] is True
         assert found["domain_kind"] == "company"
         assert found["source_url"] == "https://acme.com/team"
-        guessed = by_origin["guessed"]
-        assert guessed["email"] == "jane.doe@acme.com"
-        assert guessed["email_verified"] is False
+        # A verified public address is stronger than every fallback, so the
+        # finder does not probe patterns or spend Hunter after finding it.
+        assert "guessed" not in by_origin
 
     def test_guessed_never_carries_verified(self, db, mx_true):
         svc = PersonFinderService(db, FakeEnrichment())
@@ -302,6 +304,52 @@ class TestServiceRun:
             {"found_emails": []}, "Jane Doe", "acme.com")
         assert [e["origin"] for e in emails] == ["guessed"]
         assert emails[0]["email_verified"] is False
+
+    def test_smtp_pattern_success_precedes_and_skips_hunter(
+            self, db, monkeypatch, mx_true):
+        monkeypatch.setattr(pf, "probe_pattern_guesses", lambda *_a, **_k: {
+            "email": "jdoe@acme.com", "smtp_status": "deliverable",
+            "reason": "ok", "attempts": [{"email": "jane.doe@acme.com"},
+                                            {"email": "jdoe@acme.com"}],
+            "all_rejected": False,
+        })
+
+        def hunter_must_not_run(*_a, **_k):
+            raise AssertionError("Hunter ran after direct SMTP succeeded")
+
+        monkeypatch.setattr(pf, "hunter_find_email", hunter_must_not_run)
+        svc = PersonFinderService(db, FakeEnrichment())
+        emails = svc._discover_emails(
+            {"found_emails": []}, "Jane Doe", "acme.com")
+        assert [entry["origin"] for entry in emails] == ["guessed"]
+        assert emails[0]["email"] == "jdoe@acme.com"
+        assert emails[0]["smtp_status"] == "deliverable"
+        assert emails[0]["pattern_attempts"] == 2
+        assert emails[0]["email_verified"] is False
+
+    def test_hunter_runs_only_after_patterns_fail(
+            self, db, monkeypatch, mx_true):
+        order = []
+
+        def patterns(*_a, **_k):
+            order.append("patterns")
+            return {
+                "email": None, "smtp_status": "undeliverable",
+                "reason": "all_patterns_rejected", "attempts": [{}] * 10,
+                "all_rejected": True,
+            }
+
+        def hunter(*_a, **_k):
+            order.append("hunter")
+            return {"email": "jdoe@acme.com", "hunter_score": 90}
+
+        monkeypatch.setattr(pf, "probe_pattern_guesses", patterns)
+        monkeypatch.setattr(pf, "hunter_find_email", hunter)
+        svc = PersonFinderService(db, FakeEnrichment())
+        emails = svc._discover_emails(
+            {"found_emails": []}, "Jane Doe", "acme.com")
+        assert order == ["patterns", "hunter"]
+        assert [entry["origin"] for entry in emails] == ["hunter"]
 
     def test_handle_style_personal_email_stays_unverified(
             self, db, mx_true):
@@ -451,22 +499,22 @@ def fake_mx(monkeypatch):
         "shared-a.com": {"aspmx.l.google.com"},
         "shared-b.com": {"aspmx.l.google.com"},
     }
-    monkeypatch.setattr(pf, "_mx_hosts", lambda d: table.get(d, set()))
+    monkeypatch.setattr(md, "_mx_hosts", lambda d: table.get(d, set()))
 
 
 class TestMailTenancy:
     def test_identical_tenant_specific_host_proves_one_estate(self, fake_mx):
-        assert pf.shares_mail_tenancy("goldmansachs.com", "gs.com") is True
+        assert md.shares_mail_tenancy("goldmansachs.com", "gs.com") is True
 
     def test_a_shared_commodity_provider_proves_nothing(self, fake_mx):
         # Millions of unrelated orgs answer aspmx.l.google.com.
-        assert pf.shares_mail_tenancy("shared-a.com", "shared-b.com") is False
+        assert md.shares_mail_tenancy("shared-a.com", "shared-b.com") is False
 
     def test_same_provider_different_tenant_is_not_shared(self, fake_mx):
-        assert pf.shares_mail_tenancy("cranium.ai", "cranium.eu") is False
+        assert md.shares_mail_tenancy("cranium.ai", "cranium.eu") is False
 
     def test_unrelated_providers_are_not_shared(self, fake_mx):
-        assert pf.shares_mail_tenancy(
+        assert md.shares_mail_tenancy(
             "arize.com", "camping-arize.com") is False
 
 
@@ -477,7 +525,7 @@ class TestEmailDomainInference:
     def test_company_linked_evidence_plus_shared_tenancy_overrides(
             self, mx_true, fake_mx):
         counts = {"gs.com": 16, "goldmansachs.com": 8}
-        got, why = pf.infer_email_domain(
+        got, why = md.infer_email_domain(
             "Goldman Sachs", "goldmansachs.com", counts)
         assert got == "gs.com"
         assert "mail tenancy" in why
@@ -485,36 +533,36 @@ class TestEmailDomainInference:
     def test_unrelated_lookalike_never_overrides(self, mx_true, fake_mx):
         # Arize AI's most-harvested domain is a French campsite.
         counts = {"camping-arize.com": 9, "arize.com": 0}
-        got, _ = pf.infer_email_domain("Arize AI", "arize.com", counts)
+        got, _ = md.infer_email_domain("Arize AI", "arize.com", counts)
         assert got == "arize.com"
 
     def test_shared_token_alone_is_not_enough(self, mx_true, fake_mx):
         # cranium.eu / cranium.me are different companies that share a word.
         counts = {"cranium.eu": 9, "cranium.me": 3, "cranium.ai": 1}
-        got, _ = pf.infer_email_domain("Cranium", "cranium.ai", counts)
+        got, _ = md.infer_email_domain("Cranium", "cranium.ai", counts)
         assert got == "cranium.ai"
 
     def test_frequency_without_tenancy_proof_is_refused(self, mx_true,
                                                         monkeypatch):
         # The gate adversarial review demanded: text popularity alone must
         # never authorize building addresses on another domain.
-        monkeypatch.setattr(pf, "_mx_hosts", lambda d: set())
+        monkeypatch.setattr(md, "_mx_hosts", lambda d: set())
         counts = {"gs.com": 99, "goldmansachs.com": 1}
-        got, _ = pf.infer_email_domain(
+        got, _ = md.infer_email_domain(
             "Goldman Sachs", "goldmansachs.com", counts)
         assert got == "goldmansachs.com"
 
     def test_a_couple_of_sightings_never_overrides(self, mx_true, fake_mx):
         counts = {"gs.com": 2, "goldmansachs.com": 0}
-        got, _ = pf.infer_email_domain(
+        got, _ = md.infer_email_domain(
             "Goldman Sachs", "goldmansachs.com", counts)
         assert got == "goldmansachs.com"
 
     def test_domain_without_mx_is_refused(self, monkeypatch, fake_mx):
-        monkeypatch.setattr(pf, "domain_has_mx",
+        monkeypatch.setattr(md, "domain_has_mx",
                             lambda d, timeout=2.0: d != "gs.com")
         counts = {"gs.com": 16, "goldmansachs.com": 2}
-        got, _ = pf.infer_email_domain(
+        got, _ = md.infer_email_domain(
             "Goldman Sachs", "goldmansachs.com", counts)
         assert got == "goldmansachs.com"
 
@@ -522,7 +570,7 @@ class TestEmailDomainInference:
         results = [{"title": "Find emails",
                     "body": "contact a@rocketreach.co b@zoominfo.com "
                             "real.person@acme.com"}]
-        counts = pf.harvest_email_domains(results)
+        counts = md.harvest_email_domains(results)
         assert counts == {"acme.com": 1}
 
 
@@ -538,9 +586,9 @@ class TestFoundPathAndHarvestStaySeparate:
         results = [{"title": "Goldman Sachs email format",
                     "body": "john.smith@gs.com jane.doe@gs.com "
                             "janedoe@gs.com contact@goldmansachs.com"}]
-        counts = pf.harvest_email_domains(results)
+        counts = md.harvest_email_domains(results)
         assert counts.get("gs.com", 0) >= 3
-        got, _ = pf.infer_email_domain(
+        got, _ = md.infer_email_domain(
             "Goldman Sachs", "goldmansachs.com",
             {"gs.com": 16, "goldmansachs.com": 8})
         assert got == "gs.com"

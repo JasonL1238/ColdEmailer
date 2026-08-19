@@ -1,5 +1,5 @@
 """The contact boundary: inbound sanitization, and attaching scraped people."""
-from contact_ingest import (attach_candidate, find_existing,
+from contact_ingest import (attach_candidate, contact_notes, find_existing,
                             owned_elsewhere_note, sanitize_inbound_contact,
                             verified_channels)
 
@@ -97,6 +97,14 @@ class TestVerifiedChannels:
     def test_keeps_both_channels_when_both_verified(self):
         assert verified_channels(_candidate()) == (
             "jane@newco.com", "https://www.linkedin.com/in/jane-doe")
+
+    def test_deliverable_guess_note_does_not_claim_ownership(self):
+        note = contact_notes(_candidate(
+            email="", email_verified=False, email_person_match=False,
+            email_guess="jane.doe@newco.com",
+            email_guess_smtp_status="deliverable"))
+        assert "accepts mail" in note
+        assert "ownership is not proven" in note
 
     def test_drops_linkedin_that_failed_slug_verification(self):
         email, linkedin = verified_channels(

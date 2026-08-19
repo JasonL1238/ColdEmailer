@@ -187,9 +187,14 @@ def contact_notes(candidate: Dict) -> Optional[str]:
     if candidate.get("email_source") == "hunter":
         notes.append("Email from Hunter.io finder — confirm before sending.")
     if candidate.get("email_guess"):
-        notes.append(
-            f"Possible email pattern {candidate['email_guess']} "
-            f"(not verified — confirm before using).")
+        if candidate.get("email_guess_smtp_status") == "deliverable":
+            notes.append(
+                f"Possible email pattern {candidate['email_guess']} accepts "
+                "mail, but ownership is not proven — confirm before using.")
+        else:
+            notes.append(
+                f"Possible email pattern {candidate['email_guess']} "
+                f"(not verified — confirm before using).")
     if candidate.get("source_url"):
         notes.append(f"Source: {candidate['source_url']}")
     if candidate.get("evidence"):

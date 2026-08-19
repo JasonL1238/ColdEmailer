@@ -38,6 +38,7 @@ from db import Database, normalize_linkedin_url
 from discovery import discovery_scrape_status
 import jobs
 from enrichment import EnrichmentService, select_outreach_contacts
+from mail_domain import contacts_need_mail_domain, discover_mail_domain
 from research_digest import append_run
 
 try:
@@ -1196,11 +1197,32 @@ class DeepResearchService(jobs.SingleSlotJob):
                     should_stop=should_stop,
                 )
 
+            mail_domain = (enriched.get("mail_domain")
+                           or enriched.get("domain"))
+            needs_email = contacts_need_mail_domain(contacts)
+            # Contacts-only continuation skips the site crawl, so it has no
+            # enrichment-time mail-domain result. Resolve it here before the
+            # newly found names reach pattern probing.
+            if (needs_email and enriched.get("domain")
+                    and not enriched.get("mail_domain_reason")):
+                try:
+                    from ddg_search import ddg_text_search
+                    mail_domain, reason, _ = discover_mail_domain(
+                        name,
+                        enriched["domain"],
+                        search_fn=ddg_text_search,
+                        observed_emails=enriched.get("emails") or [],
+                    )
+                    enriched["mail_domain"] = mail_domain
+                    enriched["mail_domain_reason"] = reason
+                except Exception:
+                    mail_domain = enriched.get("domain")
+
             if budget_left():
                 contacts = enrich_contacts_outreach(
                     contacts,
                     company_name=name,
-                    domain=enriched.get("domain"),
+                    domain=mail_domain,
                     check_mx=True,
                     max_linkedin_lookups=MAX_OUTREACH_LOOKUPS,
                     max_email_lookups=MAX_OUTREACH_LOOKUPS,
@@ -1214,6 +1236,7 @@ class DeepResearchService(jobs.SingleSlotJob):
                     contacts,
                     company_name=name,
                     domain=enriched.get("domain"),
+                    mail_domain=mail_domain,
                     criteria_terms=criteria_terms,
                     min_contacts=min_contacts,
                     require_floor=require_floor,
@@ -1241,7 +1264,8 @@ class DeepResearchService(jobs.SingleSlotJob):
             ))
 
             selected = self._select_persistable(
-                scored, enriched.get("emails") or [], enriched.get("domain"),
+                scored, enriched.get("emails") or [],
+                mail_domain,
                 min_contacts=(
                     min_contacts if require_floor
                     else min(min_contacts, len(scored))
@@ -1624,6 +1648,7 @@ class DeepResearchService(jobs.SingleSlotJob):
             *,
             company_name: str,
             domain: Optional[str],
+            mail_domain: Optional[str] = None,
             criteria_terms: List[str],
             min_contacts: int,
             require_floor: bool,
@@ -1796,7 +1821,7 @@ class DeepResearchService(jobs.SingleSlotJob):
             filled = enrich_contacts_outreach(
                 need_fill,
                 company_name=company_name,
-                domain=domain,
+                domain=mail_domain or domain,
                 check_mx=True,
                 max_linkedin_lookups=MAX_OUTREACH_LOOKUPS,
                 max_email_lookups=MAX_OUTREACH_LOOKUPS,

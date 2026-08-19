@@ -26,6 +26,10 @@ class TestEmailMatchesPerson:
         assert email_matches_person("jdoe@acme.com", "Jane Doe")
         assert email_matches_person("janedoe@acme.com", "Jane Doe")
         assert email_matches_person("doe.jane@acme.com", "Jane Doe")
+        assert email_matches_person("j.doe@acme.com", "Jane Doe")
+        assert email_matches_person("jane.d@acme.com", "Jane Doe")
+        assert email_matches_person("doejane@acme.com", "Jane Doe")
+        assert email_matches_person("doe.j@acme.com", "Jane Doe")
 
     def test_rejects_generic_even_with_name(self):
         assert not email_matches_person("hello@acme.com", "Jane Doe")

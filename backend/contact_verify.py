@@ -108,11 +108,18 @@ def email_matches_person(email: str, name: Optional[str],
     first, last = tokens[0], tokens[-1]
 
     if len(tokens) >= 2:
-        # first.last / first_last / last.first (exact part membership)
+        # first.last / first_last / last.first (exact part membership), plus
+        # the common initial-separated forms j.doe / jane.d / doe.j.
         if len(local_parts) >= 2:
             if local_parts[0] == first and local_parts[-1] == last:
                 return True
             if local_parts[0] == last and local_parts[-1] == first:
+                return True
+            if local_parts == [first[0], last]:
+                return True
+            if local_parts == [first, last[0]]:
+                return True
+            if local_parts == [last, first[0]]:
                 return True
             # middle names allowed between first and last
             if first in local_parts and last in local_parts and local_parts[0] in {

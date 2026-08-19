@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 
 from contact_enrich import enrich_contacts_outreach
 from domain_names import name_tokens as _name_tokens, registered_domain
+from mail_domain import contacts_need_mail_domain, discover_mail_domain
 from contact_verify import (
     annotate_contact,
     canonical_linkedin_profile,
@@ -1097,6 +1098,8 @@ class EnrichmentService:
         result: Dict = {
             "url": url,
             "domain": registered_domain(url) if url else None,
+            "mail_domain": registered_domain(url) if url else None,
+            "mail_domain_reason": "website domain default",
             "emails": [],
             "contacts": [],
             "ok": False,
@@ -1157,10 +1160,44 @@ class EnrichmentService:
             for page in page_records:
                 all_emails.extend(
                     _parsed_page(page["url"], page["html"], page_cache)[2])
-            result["emails"] = rank_outreach_emails(all_emails, result["domain"])[:12]
             contacts = extract_contact_candidates(
                 page_records, result["domain"], preferred_school,
                 preferred_affiliations, cache=page_cache)
+
+            # Resolve the employee-mail domain before constructing any
+            # name-pattern guesses. Keep `domain` as the website domain for
+            # crawling and company identity; downstream email work uses the
+            # separate `mail_domain` value.
+            mail_domain = result.get("mail_domain") or result.get("domain")
+            needs_email = contacts_need_mail_domain(contacts)
+            if (do_outreach and (needs_email or deep)
+                    and result.get("domain")):
+                try:
+                    from ddg_search import ddg_text_search
+                    mail_domain, reason, _ = discover_mail_domain(
+                        company_name,
+                        result["domain"],
+                        search_fn=ddg_text_search,
+                        observed_emails=all_emails,
+                    )
+                    result["mail_domain"] = mail_domain
+                    result["mail_domain_reason"] = reason
+                except Exception:
+                    # Domain inference is an enhancement, never a reason to
+                    # discard otherwise valid crawl results.
+                    mail_domain = result.get("domain")
+                    result["mail_domain"] = mail_domain
+                    result["mail_domain_reason"] = "kept website domain"
+
+            result["emails"] = rank_outreach_emails(
+                all_emails, mail_domain)[:12]
+            for contact in contacts:
+                address = (contact.get("email") or "").strip()
+                if address and mail_domain:
+                    contact["on_domain"] = (
+                        registered_domain(address.rsplit("@", 1)[-1])
+                        == registered_domain(mail_domain)
+                    )
             if combined:
                 meta = None
                 llm_contacts = []
@@ -1216,7 +1253,7 @@ class EnrichmentService:
                 result["contacts"] = enrich_contacts_outreach(
                     result["contacts"],
                     company_name=company_name,
-                    domain=result.get("domain"),
+                    domain=mail_domain,
                     check_mx=True,
                     max_linkedin_lookups=10 if deep else 3,
                     max_email_lookups=10 if deep else 3,

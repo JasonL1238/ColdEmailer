@@ -4,17 +4,20 @@ LinkedIn is treated as a first-class outreach channel. When a company page
 names a person but omits their /in/ URL, we search the public web for a
 matching profile — only when the search snippet also mentions the company.
 
-When we have a named person + company domain but no email, optional Hunter.io
-(free-tier key) may supply an on-domain address. Name@domain pattern guesses
-are never auto-attached as sendable emails; they are recorded as guesses only.
+When we have a named person + company domain but no email, bounded name@domain
+patterns are checked over direct SMTP first. Optional Hunter.io supplies an
+on-domain address only after those checks fail or become inconclusive. Pattern
+guesses are never auto-attached as sendable emails; they remain guesses even
+when the mailbox accepts mail.
 """
 from __future__ import annotations
 
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
+import mailbox_verify
 from domain_names import registered_domain
 from phrase_match import all_tokens_in, phrase_in, token_in
 from contact_verify import (
@@ -141,7 +144,7 @@ def find_linkedin_via_search(
 
 
 def email_patterns_for(name: str, domain: str) -> List[str]:
-    """Common professional patterns — first.last@, flast@, etc."""
+    """Ten common, strongly person-shaped professional email patterns."""
     tokens = name_tokens(name)
     domain = (domain or "").strip().lower().lstrip("@")
     if len(tokens) < 2 or not domain or "." not in domain:
@@ -153,7 +156,11 @@ def email_patterns_for(name: str, domain: str) -> List[str]:
         f"{first[0]}{last}",
         f"{first}_{last}",
         f"{first}-{last}",
+        f"{first[0]}.{last}",
+        f"{first}.{last[0]}",
         f"{last}.{first}",
+        f"{last}{first}",
+        f"{last}.{first[0]}",
     ]
     out: List[str] = []
     seen = set()
@@ -224,14 +231,71 @@ def hunter_find_email(
         return None
 
 
-def pick_pattern_guess(name: str, domain: str,
-                       *, check_mx: bool = True) -> Optional[str]:
-    """Best pattern guess for notes only — never auto-attached as verified email."""
-    mx = domain_has_mx(domain) if check_mx else True
-    if mx is False:
-        return None
-    patterns = email_patterns_for(name, domain)
-    return patterns[0] if patterns else None
+def probe_pattern_guesses(
+        name: str,
+        domain: str,
+        *,
+        check_mx: bool = True,
+        verify_fn: Optional[Callable] = None,
+        exclude: Optional[Set[str]] = None) -> Dict:
+    """Try every bounded name pattern over direct SMTP, strongest first.
+
+    Stops at the first deliverable mailbox. An inconclusive result (blocked
+    port, greylisting, catch-all, disabled verification) stops the sequence as
+    well: asking nine more versions cannot make that transport/domain policy
+    informative. Hunter belongs after this function, never inside it.
+
+    The returned address remains a *guess*. SMTP proves only that a mailbox
+    accepts mail, not that it belongs to ``name``.
+    """
+    domain = (domain or "").strip().lower().lstrip("@")
+    if check_mx and domain_has_mx(domain) is False:
+        return {
+            "email": None, "smtp_status": None, "reason": "no_mx",
+            "attempts": [], "all_rejected": False,
+        }
+    patterns = [
+        address for address in email_patterns_for(name, domain)
+        if normalize_email(address) not in (exclude or set())
+    ]
+    if not patterns:
+        return {
+            "email": None, "smtp_status": None, "reason": "no_patterns",
+            "attempts": [], "all_rejected": False,
+        }
+
+    verifier = verify_fn or mailbox_verify.verify_mailbox
+    attempts = []
+    for address in patterns:
+        try:
+            probe = verifier(address, backend="smtp")
+            verdict = getattr(probe.verdict, "value", str(probe.verdict))
+            reason = probe.reason
+        except Exception:
+            verdict, reason = "unknown", "probe_error"
+        attempts.append({
+            "email": address, "smtp_status": verdict, "reason": reason,
+        })
+        if verdict == "deliverable":
+            return {
+                "email": address, "smtp_status": verdict, "reason": reason,
+                "attempts": attempts, "all_rejected": False,
+            }
+        if verdict == "undeliverable":
+            continue
+        return {
+            "email": address,
+            "smtp_status": None if reason in ("disabled", "no_transport")
+            else verdict,
+            "reason": reason,
+            "attempts": attempts,
+            "all_rejected": False,
+        }
+    return {
+        "email": None, "smtp_status": "undeliverable",
+        "reason": "all_patterns_rejected", "attempts": attempts,
+        "all_rejected": True,
+    }
 
 
 def enrich_contacts_outreach(
@@ -244,8 +308,9 @@ def enrich_contacts_outreach(
         check_mx: bool = True,
         max_linkedin_lookups: int = 3,
         max_email_lookups: int = 3,
-        allow_pattern_guesses: Optional[bool] = None) -> List[Dict]:
-    """Attach missing LinkedIn / Hunter emails onto named people from research.
+        allow_pattern_guesses: Optional[bool] = None,
+        mailbox_verify_fn: Optional[Callable] = None) -> List[Dict]:
+    """Attach missing LinkedIn and SMTP-first/Hunter-fallback email evidence.
 
     Pattern guesses (if enabled) are stored on `email_guess` only — they do not
     become sendable `email` fields and never receive email_verified.
@@ -278,8 +343,27 @@ def enrich_contacts_outreach(
         has_email = bool((contact.get("email") or "").strip())
         if (not has_email and domain and email_lookups < max_email_lookups):
             email_lookups += 1
-            hunter = hunter_find_email(
-                name, domain, api_key=hunter_key)
+            pattern = None
+            if allow_pattern_guesses:
+                pattern = probe_pattern_guesses(
+                    name, domain, check_mx=check_mx,
+                    verify_fn=mailbox_verify_fn)
+            if pattern and pattern.get("smtp_status") == "deliverable":
+                # A live mailbox is still only a guess about ownership. Keep it
+                # out of the sendable email field and skip Hunter entirely.
+                contact["email_guess"] = pattern["email"]
+                contact["email_guess_smtp_status"] = "deliverable"
+                contact["email_pattern_attempts"] = len(
+                    pattern.get("attempts") or [])
+                contact.setdefault(
+                    "warning",
+                    f"Possible email pattern {pattern['email']} accepts mail "
+                    "(ownership not proven — confirm before using).")
+                continue
+
+            # Direct SMTP exhausted or could not answer. Only now may the
+            # paid/provider path run.
+            hunter = hunter_find_email(name, domain, api_key=hunter_key)
             if hunter:
                 contact["email"] = hunter["email"]
                 contact["email_source"] = "hunter"
@@ -288,10 +372,13 @@ def enrich_contacts_outreach(
                     "warning",
                     "Email from Hunter.io finder — confirm before sending.")
             elif allow_pattern_guesses:
-                guess = pick_pattern_guess(
-                    name, domain, check_mx=check_mx)
+                guess = (pattern or {}).get("email")
                 if guess:
                     contact["email_guess"] = guess
+                    contact["email_guess_smtp_status"] = pattern.get(
+                        "smtp_status")
+                    contact["email_pattern_attempts"] = len(
+                        pattern.get("attempts") or [])
                     contact.setdefault(
                         "warning",
                         f"Possible email pattern {guess} (not verified — "

@@ -20,7 +20,6 @@ from __future__ import annotations
 import re
 import threading
 import time
-from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -29,12 +28,11 @@ import found_email
 import jobs
 from domain_names import registered_domain
 from phrase_match import all_tokens_in
-import mailbox_verify
 from contact_enrich import (
     _company_mentioned,
     extract_linkedin_urls,
     hunter_find_email,
-    pick_pattern_guess,
+    probe_pattern_guesses,
 )
 from contact_verify import (
     domain_has_mx,
@@ -45,6 +43,7 @@ from contact_verify import (
     normalize_email,
     verify_email,
 )
+from mail_domain import discover_mail_domain
 from db import Database, normalize_linkedin_url
 from ddg_search import ddg_text_search
 from deep_research import (
@@ -474,127 +473,6 @@ def rank_score(candidate: Dict) -> float:
     return float(candidate.get("score", 0.0)) + CORROBORATION_WEIGHT * extra
 
 
-# --------------------------------------------------------------------------
-# Email domain inference.
-#
-# The website domain is frequently NOT the mail domain: Goldman Sachs' site is
-# goldmansachs.com and its mailboxes are @gs.com, so every address built from
-# the website domain was wrong for all 26 Goldman contacts in the user's
-# database. But naive "most frequent harvested domain" is worse than useless:
-# on the same corpus it picks camping-arize.com (a French campsite) for Arize
-# AI and cranium.eu for Cranium. A wrong mail domain manufactures confident
-# nonsense, so the website domain is the prior and only overwhelming,
-# company-linked, MX-backed evidence may override it. Measured on 18
-# companies: exactly one override, the known-correct one.
-# --------------------------------------------------------------------------
-DOMAIN_MIN_ABSOLUTE = 4
-DOMAIN_MIN_RATIO = 2.0
-
-_HARVEST_RE = re.compile(
-    r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
-# People-data aggregators quote addresses from every company at once; their
-# own domains must never be mistaken for the employer's.
-_AGGREGATOR_DOMAINS = re.compile(
-    r"(rocketreach|zoominfo|signalhire|lusha|apollo\.io|contactout|wiza|"
-    r"muraena|leadiq|hunter\.io|snov\.io|clearbit|example\.|yourcompany|"
-    r"sentry\.io|wixpress)", re.I)
-
-
-def harvest_email_domains(results: List[Dict]) -> Dict[str, int]:
-    """Count plausible employer mail domains across SERP text."""
-    counts: Dict[str, int] = {}
-    for result in results or []:
-        blob = f"{result.get('title') or ''} {result.get('body') or ''}"
-        for domain in _HARVEST_RE.findall(blob):
-            domain = domain.lower().strip(".")
-            if _AGGREGATOR_DOMAINS.search(domain) or "." not in domain:
-                continue
-            counts[domain] = counts.get(domain, 0) + 1
-    return counts
-
-
-def _company_acronym(name: str) -> str:
-    bits = [b for b in re.split(r"[^A-Za-z0-9]+", name or "") if b]
-    return "".join(b[0] for b in bits).lower()
-
-
-# Multi-tenant MX hosts shared by millions of unrelated organisations. Two
-# domains both pointing at aspmx.l.google.com proves only that both bought
-# Google Workspace. A tenant-specific host (mx0a-0014b501.pphosted.com,
-# contoso.mail.protection.outlook.com) is real evidence of shared tenancy.
-_GENERIC_MX = re.compile(
-    r"^(?:alt\d+\.)?aspmx[0-9]*\.l\.google\.com$|"
-    r"^aspmx\d*\.googlemail\.com$|"
-    r"^mx\.zoho\.(?:com|eu)$|^mail\.protonmail\.ch$|^mailsec\.protonmail\.ch$|"
-    r"^(?:in\d?-smtp|mx)\.mail\.icloud\.com$|^smtp\.secureserver\.net$|"
-    r"^mailstore\d*\.secureserver\.net$|^mx\.yandex\.net$",
-    re.I)
-
-
-def _mx_hosts(domain: str) -> set:
-    try:
-        import dns.resolver
-        return {str(r.exchange).lower().rstrip(".")
-                for r in dns.resolver.resolve(domain, "MX")}
-    except Exception:
-        return set()
-
-
-def shares_mail_tenancy(domain_a: str, domain_b: str) -> bool:
-    """True when both domains publish an identical, tenant-specific MX host.
-
-    goldmansachs.com and gs.com both answer mx0a-0014b501.pphosted.com — the
-    embedded customer id makes that proof they are one mail estate. Arize AI
-    (Google) and camping-arize.com (OVH) share nothing; cranium.ai and
-    cranium.eu are both on Outlook but carry different tenant prefixes, so
-    exact-host comparison correctly separates them.
-    """
-    if not domain_a or not domain_b or domain_a == domain_b:
-        return False
-    shared = _mx_hosts(domain_a) & _mx_hosts(domain_b)
-    return any(not _GENERIC_MX.match(host) for host in shared)
-
-
-def infer_email_domain(
-        company_name: str, website_domain: Optional[str],
-        counts: Dict[str, int], *,
-        check_mx: bool = True) -> Tuple[Optional[str], str]:
-    """(mail_domain, why). Returns the website domain unless overridden."""
-    if not website_domain:
-        return website_domain, "no website domain"
-    web_n = counts.get(website_domain, 0)
-    name_tokens_ = [t for t in re.split(r"[^a-z0-9]+", (company_name or "").lower())
-                    if len(t) >= 3]
-    acronym = _company_acronym(company_name)
-    web_stem = website_domain.split(".")[0]
-    for domain, n in sorted(counts.items(), key=lambda kv: -kv[1]):
-        if domain == website_domain:
-            continue
-        stem = domain.split(".")[0]
-        # Must be recognisably the same company, and anchored: a bare
-        # substring match makes "camping-arize.com" look like Arize AI's mail
-        # domain. Only an exact token, a token the stem is built forward from
-        # (exyntechnologies.com), or the company acronym (gs -> Goldman Sachs)
-        # counts.
-        if not (any(stem == t or stem.startswith(t) for t in name_tokens_)
-                or stem == acronym
-                or web_stem.startswith(stem)):
-            continue
-        if n < DOMAIN_MIN_ABSOLUTE or n < DOMAIN_MIN_RATIO * max(web_n, 1):
-            continue
-        if check_mx and domain_has_mx(domain) is False:
-            continue
-        # Text frequency alone is a weak gate — adversarial review showed a
-        # popular-mention rule picks the wrong domain for small companies. DNS
-        # is the proof: the two domains must demonstrably share one mail
-        # estate before an address is ever built on the rival.
-        if check_mx and not shares_mail_tenancy(website_domain, domain):
-            continue
-        return domain, (f"{domain} seen {n}x vs {website_domain} {web_n}x, "
-                        f"and both share mail tenancy (MX)")
-    return website_domain, f"kept website domain ({web_n} sightings)"
-
-
 def _domain_from_url(url: Optional[str]) -> Optional[str]:
     try:
         host = (urlparse(url or "").hostname or "").lower()
@@ -729,14 +607,14 @@ class PersonFinderService(jobs.SingleSlotJob):
         # Goldman contact (goldmansachs.com vs the real gs.com).
         domain = website_domain
         if website_domain and company_name and not should_stop():
-            harvested: Counter = Counter()
-            for q in (f'"@{website_domain}" email contact',
-                      f"{company_name} email address format"):
-                # pool=False: these SERPs are template-dense by design.
-                harvested.update(harvest_email_domains(
-                    search(q, max_results=8, pool=False)))
-            domain, why = infer_email_domain(
-                company_name, website_domain, harvested)
+            # pool=False: these SERPs are template-dense by design and must
+            # stay separate from the person-evidence result pool.
+            domain, why, _ = discover_mail_domain(
+                company_name,
+                website_domain,
+                search_fn=lambda q, max_results=8: search(
+                    q, max_results=max_results, pool=False),
+            )
             company_info["mail_domain"] = domain
             company_info["mail_domain_reason"] = why
         # Stays the WEBSITE domain — the mail domain lives in
@@ -1004,8 +882,11 @@ class PersonFinderService(jobs.SingleSlotJob):
     def _discover_emails(
             self, cand: Dict, name: str, domain: Optional[str],
             *, budget=None) -> List[Dict]:
-        """Labeled email list: found addresses verified, then Hunter, then
-        one pattern guess. Guesses never carry email_verified."""
+        """Found evidence, then SMTP-checked patterns, then Hunter fallback.
+
+        Guesses never carry ``email_verified`` even when SMTP says the mailbox
+        exists: a live mailbox does not prove who owns it.
+        """
         emails: List[Dict] = []
         seen = set()
 
@@ -1035,59 +916,72 @@ class PersonFinderService(jobs.SingleSlotJob):
                 "email_verified": verdict["email_verified"],
             })
 
-        if domain and len(emails) < MAX_EMAILS_PER_CANDIDATE:
-            hunter = hunter_find_email(name, domain)
-            if hunter:
-                verdict = verify_email(hunter["email"], name, check_mx=True)
-                add({
-                    "email": verdict["email"],
-                    "origin": "hunter",
-                    "source_url": None,
-                    "hunter_score": hunter.get("hunter_score"),
-                    "email_kind": verdict["email_kind"],
-                    "email_person_match": verdict["email_person_match"],
-                    "email_mx_ok": verdict["email_mx_ok"],
-                    "email_verified": verdict["email_verified"],
-                })
+        def add_guess(pattern: Dict) -> None:
+            guess = pattern.get("email")
+            if not guess or normalize_email(guess) in seen:
+                return
+            # Ask the free corpora whether anyone has actually used the one
+            # surviving guess. Never spend corroboration budget on all ten.
+            import os as _os
+            corroboration = address_corroborate.corroborate_address(
+                guess, name=name,
+                token=_os.getenv("GITHUB_TOKEN", "").strip() or None,
+                http_get=self._http_get, budget=budget)
+            add({
+                "email": guess,
+                "origin": "guessed",
+                "source_url": None,
+                "email_kind": "pattern_guess",
+                "email_person_match": True,
+                "email_mx_ok": domain_has_mx(
+                    guess.split("@", 1)[-1]),
+                "email_verified": False,
+                "smtp_status": pattern.get("smtp_status"),
+                "pattern_attempts": len(pattern.get("attempts") or []),
+                "corroboration": (
+                    corroboration.as_dict()
+                    if corroboration.reason != "disabled" else None),
+            })
 
-        if domain:
-            guess = pick_pattern_guess(name, domain, check_mx=True)
-            if guess and normalize_email(guess) not in seen:
+        # A verified address backed by a public source is already stronger than
+        # any pattern or provider answer, so fallback work stops there.
+        has_verified_found = any(
+            entry.get("origin") == "found" and entry.get("email_verified")
+            for entry in emails)
+        if (domain and not has_verified_found
+                and len(emails) < MAX_EMAILS_PER_CANDIDATE):
+            pattern = probe_pattern_guesses(
+                name, domain, check_mx=True, exclude=seen)
+            if pattern.get("smtp_status") == "deliverable":
                 # Deliberately NOT verify_email'd into a verified flag: the
                 # local part matching is true by construction and MX on the
                 # domain says nothing about a mailbox we invented.
-                # A guess is worth asking a mail server about — it is the
-                # only way an inferred address ever becomes usable. The answer
-                # is recorded separately from `origin`, which stays "guessed":
-                # a mailbox existing says nothing about who owns it.
-                probe = mailbox_verify.verify_mailbox(guess)
-                # And ask the free corpora whether anyone has ever actually
-                # used this address. Independent of the mailbox probe and
-                # strictly more informative when it fires: a mail server can
-                # only say a mailbox exists, while a commit or a profile says
-                # whose it is. Runs even when no verification transport is
-                # configured, which is the normal case here.
-                import os as _os
-                corroboration = address_corroborate.corroborate_address(
-                    guess, name=name,
-                    token=_os.getenv("GITHUB_TOKEN", "").strip() or None,
-                    http_get=self._http_get, budget=budget)
-                add({
-                    "email": guess,
-                    "origin": "guessed",
-                    "source_url": None,
-                    "email_kind": "pattern_guess",
-                    "email_person_match": True,
-                    "email_mx_ok": domain_has_mx(
-                        guess.split("@", 1)[-1]),
-                    "email_verified": False,
-                    "smtp_status": (
-                        None if probe.reason in ("disabled", "no_transport")
-                        else probe.verdict.value),
-                    "corroboration": (
-                        corroboration.as_dict()
-                        if corroboration.reason != "disabled" else None),
-                })
+                # A live mailbox is still a guess about ownership, but it is
+                # enough to avoid spending a Hunter lookup.
+                add_guess(pattern)
+            else:
+                # All patterns were rejected, or SMTP could not distinguish
+                # them. Hunter is the last resort, not the first guesser.
+                hunter = hunter_find_email(name, domain)
+                if hunter:
+                    verdict = verify_email(
+                        hunter["email"], name, check_mx=True)
+                    add({
+                        "email": verdict["email"],
+                        "origin": "hunter",
+                        "source_url": None,
+                        "hunter_score": hunter.get("hunter_score"),
+                        "email_kind": verdict["email_kind"],
+                        "email_person_match": verdict[
+                            "email_person_match"],
+                        "email_mx_ok": verdict["email_mx_ok"],
+                        "email_verified": verdict["email_verified"],
+                    })
+                else:
+                    # Preserve one visibly labeled guess only when SMTP was
+                    # inconclusive/disabled. Never show a pattern the server
+                    # definitively rejected.
+                    add_guess(pattern)
         return emails[:MAX_EMAILS_PER_CANDIDATE]
 
 
