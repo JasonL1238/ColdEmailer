@@ -78,6 +78,8 @@ Both are local user data and are gitignored.
   boundary. Every scraped or imported contact converges here before persistence,
   and `attach_candidate()` is the one place that decides which scraped channels
   survive, how a cross-company collision is reported, and what actually landed.
+  `contact_verify.py` also owns the shared LinkedIn SERP-title split and short-role
+  rule used by company-first and person-first matching.
 - `email_composer.py`, `email_sender.py`, `response_checker.py`, `thread_reader.py`:
   draft, send, reply, and thread duties. Sending and Gmail reads are live I/O.
 - `campaigns.py`, `pipeline.py`, `analytics.py`, `suppression.py`, `send_window.py`,

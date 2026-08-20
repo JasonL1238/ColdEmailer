@@ -4,7 +4,9 @@ from contact_verify import (
     email_matches_person,
     is_generic_inbox,
     linkedin_matches_person,
+    linkedin_title_role,
     select_verified_person_contacts,
+    split_linkedin_title,
     verify_email,
     verify_linkedin,
 )
@@ -18,6 +20,22 @@ class TestGenericInbox:
         assert is_generic_inbox("founders")
         assert not is_generic_inbox("jane.doe@acme.com")
         assert not is_generic_inbox("jdoe@acme.com")
+
+
+class TestLinkedInTitle:
+    def test_splits_all_observed_separator_shapes(self):
+        for separator in (" - ", " – ", " — ", " | "):
+            assert split_linkedin_title(
+                f"Jane Doe{separator}VP Engineering{separator}LinkedIn"
+            ) == ["Jane Doe", "VP Engineering", "LinkedIn"]
+
+    def test_extracts_only_a_short_non_linkedin_role(self):
+        assert linkedin_title_role("Jane Doe - VP Engineering | LinkedIn") == \
+            "VP Engineering"
+        assert linkedin_title_role("Jane Doe | LinkedIn") is None
+        assert linkedin_title_role(
+            "Jane Doe - Vice President of Global Software Engineering Operations"
+        ) is None
 
 
 class TestEmailMatchesPerson:

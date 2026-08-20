@@ -42,8 +42,10 @@ from contact_verify import (
     name_appears_in,
     is_generic_inbox,
     linkedin_matches_person,
+    linkedin_title_role,
     name_tokens,
     normalize_email,
+    split_linkedin_title,
     verify_email,
 )
 from mail_domain import discover_mail_domain
@@ -239,17 +241,12 @@ def extract_person_candidates(
             if linkedin_matches_person(url, target_name):
                 linkedin = url
                 break
-        head = re.split(r"\s*[|\-–—]\s*", title)[0].strip()
+        head = split_linkedin_title(title)[0].strip()
         head_match = name_appears_in(target_name, head)
         if not linkedin and not head_match:
             continue
         # Role from the snippet only — never from the query we searched with.
-        role = None
-        parts = re.split(r"\s*[-–—|]\s*", title)
-        if len(parts) >= 2 and len(parts[1].split()) <= 6:
-            maybe = parts[1].strip()[:80]
-            if maybe and not re.search(r"linkedin", maybe, re.I):
-                role = maybe
+        role = linkedin_title_role(title)
         evidence = person_scoped_evidence(target_name, title, body)
         out.append({
             "name": (" ".join(w.capitalize() for w in head.split()[:3])
@@ -504,7 +501,7 @@ def _company_from_linkedin_results(
     for result in results or []:
         title = result.get("title") or ""
         body = result.get("body") or ""
-        head = re.split(r"\s*[-–—|]\s*", title)[0].strip()
+        head = split_linkedin_title(title)[0].strip()
         if not _names_near(name, head):
             continue
         for blob in (title, body):
@@ -536,7 +533,7 @@ def _linkedin_name_conflict(name: str, results: List[Dict]) -> Optional[Dict]:
     """Return explicit exact-profile evidence that names a different person."""
     for result in results or []:
         title = (result.get("title") or "").strip()
-        head = re.split(r"\s*[-–—|]\s*", title)[0].strip()
+        head = split_linkedin_title(title)[0].strip()
         head_tokens = name_tokens(head)
         if (len(head_tokens) >= 2
                 and not _names_near(name, head)
@@ -558,10 +555,10 @@ def _linkedin_anchor_candidate(
     for result in results or []:
         title = (result.get("title") or "").strip()
         body = (result.get("body") or "").strip()
-        head = re.split(r"\s*[-–—|]\s*", title)[0].strip()
+        parts = split_linkedin_title(title)
+        head = parts[0].strip()
         if not _names_near(name, head):
             continue
-        parts = re.split(r"\s*[-–—|]\s*", title)
         if len(parts) >= 2:
             segment = parts[1].strip()
             at_match = re.match(r"(.+?)\s+at\s+(.+)$", segment, re.I)

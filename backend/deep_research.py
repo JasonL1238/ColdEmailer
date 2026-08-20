@@ -26,7 +26,9 @@ from phrase_match import all_tokens_in, phrase_in
 from contact_verify import (
     annotate_contact,
     linkedin_matches_person,
+    linkedin_title_role,
     name_tokens,
+    split_linkedin_title,
 )
 from contact_ingest import (
     attach_candidate,
@@ -513,7 +515,7 @@ def _looks_like_employee_snippet(
         if not strong:
             return False
         # Reject titles that look like a different company name.
-        head = re.split(r"\s*[|\-–—]\s*", title or "")
+        head = split_linkedin_title(title)
         if len(head) >= 2:
             mid = head[1].strip().lower()
             if (
@@ -640,7 +642,7 @@ def extract_people_from_snippets(
             continue
         # "Jane Doe - VP Engineering - Acme | LinkedIn"
         name = ""
-        head = re.split(r"\s*[|\-–—]\s*", title)[0].strip()
+        head = split_linkedin_title(title)[0].strip()
         tokens = name_tokens(head)
         if len(tokens) >= 2 and len(head.split()) <= 4:
             name = " ".join(w.capitalize() for w in head.split()[:3])
@@ -651,12 +653,7 @@ def extract_people_from_snippets(
         if not name or len(name_tokens(name)) < 2:
             continue
         # Role must come from the snippet — never from the search query.
-        title_role = None
-        parts = re.split(r"\s*[-–—|]\s*", title)
-        if len(parts) >= 2 and len(parts[1].split()) <= 6:
-            maybe = parts[1].strip()[:80]
-            if maybe and not re.search(r"linkedin", maybe, re.I):
-                title_role = maybe
+        title_role = linkedin_title_role(title)
         evidence = person_scoped_evidence(name, title, body)
         # Prefer an employment role from scoped evidence when the title
         # segment is a school name ("Jane Doe - Northwestern University - …").
@@ -1927,9 +1924,7 @@ class DeepResearchService(jobs.SingleSlotJob):
         linkedin = (contact.get("linkedin_url") or "").strip()
         email_ok = False
         if email and contact.get("email_kind") != "generic":
-            if contact.get("email_verified"):
-                email_ok = True
-            elif (
+            if contact.get("email_verified") or (
                 contact.get("email_person_match")
                 and contact.get("on_domain")
                 and contact.get("email_mx_ok") is True

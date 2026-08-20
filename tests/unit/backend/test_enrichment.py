@@ -1,9 +1,9 @@
 """Tests for email extraction, domain parsing, and outreach ranking."""
+from domain_names import registered_domain
 from enrichment import (
     extract_emails_from_html,
     heuristic_metadata,
     rank_outreach_emails,
-    registered_domain,
 )
 
 

@@ -814,9 +814,8 @@ def select_outreach_contacts(candidates: List[Dict], emails: List[str],
         selected_keys.add(key)
 
     if person_only:
-        verified = select_verified_person_contacts(
+        return select_verified_person_contacts(
             pool, limit=limit, require_person=True, check_mx=check_mx)
-        return verified
 
     annotated = [annotate_contact(c, check_mx=check_mx) for c in pool]
     annotated.sort(key=lambda c: (

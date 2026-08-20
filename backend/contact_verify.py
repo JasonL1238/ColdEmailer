@@ -67,6 +67,22 @@ def name_tokens(name: Optional[str]) -> List[str]:
     return [t for t in tokens if len(t) >= 2 and t not in _NAME_STOP]
 
 
+def split_linkedin_title(title: Optional[str]) -> List[str]:
+    """Split a LinkedIn SERP title on the separators its snippets use."""
+    return re.split(r"\s*[-–—|]\s*", title or "")
+
+
+def linkedin_title_role(title: Optional[str]) -> Optional[str]:
+    """Return a short role-shaped second segment from a LinkedIn title."""
+    parts = split_linkedin_title(title)
+    if len(parts) < 2 or len(parts[1].split()) > 6:
+        return None
+    role = parts[1].strip()[:80]
+    if not role or re.search(r"linkedin", role, re.I):
+        return None
+    return role
+
+
 def name_appears_in(name: Optional[str], text: Optional[str]) -> bool:
     """True when both the first and last name token appear in `text`.
 

@@ -15,7 +15,8 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from domain_names import company_name_key as _company_name_key
+from domain_names import (company_name_key as _company_name_key,
+                          registered_domain)
 from send_window import SEND_WINDOW_DEFAULT, normalize_send_window
 
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1962,7 +1963,7 @@ def repair_mismatched_company_sites(db: "Database") -> int:
       written by enrichment (never by the user), so every row carrying one is
       fair game.
     """
-    from enrichment import domain_matches_name, registered_domain
+    from enrichment import domain_matches_name
 
     rows = db.query(
         "SELECT id, name, domain, scrape_status FROM companies "
@@ -2022,7 +2023,7 @@ def repair_offdomain_contact_warnings(db: "Database") -> int:
     * Someone who already replied, or who has been mailed, has proved the
       address reaches them. "Verify before sending" is noise there.
     """
-    from enrichment import domain_matches_name, registered_domain
+    from enrichment import domain_matches_name
 
     rows = db.query(
         """SELECT ct.id, ct.email, ct.status, ct.notes,

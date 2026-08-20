@@ -40,8 +40,7 @@ def extract_pdf_text(path: str) -> str:
         text = "\n".join(parts).strip()
         # Collapse excessive whitespace from PDF extraction
         text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text
+        return re.sub(r"\n{3,}", "\n\n", text)
     except Exception as e:
         print(f"[resume] PDF text extraction failed for {path}: {e}")
         return ""

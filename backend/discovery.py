@@ -13,10 +13,11 @@ from typing import Dict, List, Optional
 from contact_ingest import (attach_candidate, find_existing,
                             owned_elsewhere_note, verified_channels)
 from db import Database
+from domain_names import registered_domain
 import jobs
 from ddg_search import ddg_text_search
-from enrichment import (EnrichmentService, registered_domain,
-                        scrape_status_for, select_outreach_contacts)
+from enrichment import (EnrichmentService, scrape_status_for,
+                        select_outreach_contacts)
 
 try:
     from llm_client import complete_json, get_cloud_llm_provider

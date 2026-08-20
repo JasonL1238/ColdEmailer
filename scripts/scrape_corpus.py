@@ -139,7 +139,7 @@ def capture_site(name: str, url: str, archetype: str = "unknown",
                  max_pages: int = DEFAULT_MAX_PAGES) -> CorpusSite:
     """Breadth-first mirror of one site. Runs once; polite by construction."""
     import httpx
-    from enrichment import registered_domain
+    from domain_names import registered_domain
     from web_scraper import is_safe_public_url
 
     domain = registered_domain(url)

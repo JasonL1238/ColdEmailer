@@ -166,7 +166,7 @@ class TestSitemapPeopleRanking:
         "https://www.airtable.com/solutions/project-management",
     ])
     def test_rejects_urls_that_merely_contain_the_word(self, url):
-        from enrichment import registered_domain
+        from domain_names import registered_domain
         assert rank_sitemap_pages([url], registered_domain(url)) == []
 
     def test_index_pages_outrank_the_bios_beneath_them(self):
